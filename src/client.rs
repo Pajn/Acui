@@ -9,6 +9,8 @@ use serde::Deserialize;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
+use std::sync::mpsc as std_mpsc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -73,29 +75,46 @@ impl AcpController {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let client_impl = GpuiAcpClient { event_tx };
-
-        let incoming_compat = incoming.compat();
-        let outgoing_compat = outgoing.compat_write();
-
-        let (connection, handle_io) =
-            ClientSideConnection::new(client_impl, outgoing_compat, incoming_compat, move |fut| {
-                tokio::task::spawn_local(fut);
-            });
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
 
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("failed to build tokio runtime");
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    let _ =
+                        ready_tx.send(Err(anyhow::anyhow!("failed to build tokio runtime: {err}")));
+                    return;
+                }
+            };
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
+                let client_impl = GpuiAcpClient { event_tx };
+                let incoming_compat = incoming.compat();
+                let outgoing_compat = outgoing.compat_write();
+                let (connection, handle_io) = ClientSideConnection::new(
+                    client_impl,
+                    outgoing_compat,
+                    incoming_compat,
+                    |fut| {
+                        tokio::task::spawn_local(fut);
+                    },
+                );
+
+                if ready_tx.send(Ok(connection)).is_err() {
+                    return;
+                }
                 if handle_io.await.is_err() {
-                    let _ = rt;
+                    // I/O task ended; AppState receives disconnection through protocol behavior.
                 }
             });
         });
 
+        let connection = ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|err| anyhow::anyhow!("timed out waiting for ACP runtime startup: {err}"))??;
         Ok(Self { connection })
     }
 
@@ -375,7 +394,7 @@ pub mod mock {
     }
 
     #[test]
-    fn process_spawn_from_config_does_not_require_tokio_reactor() {
+    fn connect_from_config_does_not_require_callsite_localset() {
         let test_dir =
             std::env::temp_dir().join(format!("acui-config-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&test_dir).expect("should create temp test dir");
@@ -383,20 +402,37 @@ pub mod mock {
         std::fs::write(&config_path, "command = \"cat\"\nargs = []\n")
             .expect("should write test config");
 
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let config = AgentProcessConfig::from_path(&config_path).expect("config should parse");
-            spawn_agent_process(&config)
+            futures::executor::block_on(AcpController::connect_from_config(&config_path, event_tx))
         }));
 
         assert!(
             result.is_ok(),
-            "process spawn should not panic without a Tokio runtime"
+            "connect_from_config should not panic without a Tokio LocalSet context"
         );
-        if let Ok(Ok((mut child, _, _))) = result {
+        if let Ok(Ok((_controller, mut child))) = result {
             let _ = child.kill();
             let _ = child.wait();
         }
 
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn connect_does_not_require_callsite_localset() {
+        let (stream_a, _stream_b) = tokio::io::duplex(1024);
+        let (read, write) = tokio::io::split(stream_a);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            futures::executor::block_on(AcpController::connect(read, write, event_tx))
+        }));
+
+        assert!(
+            result.is_ok(),
+            "connect should not panic when called outside LocalSet"
+        );
+        assert!(matches!(result, Ok(Ok(_))), "connect should initialize");
     }
 }

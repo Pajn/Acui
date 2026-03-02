@@ -10,6 +10,7 @@ mod ui;
 use config::AppConfig;
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
 use state::AppState;
+use std::time::Duration;
 use ui::layout::WorkspaceLayout;
 
 #[derive(Clone)]
@@ -30,7 +31,16 @@ fn open_main_window(cx: &mut App, app_state: gpui::Entity<AppState>) {
 }
 
 fn main() {
-    let application = Application::new();
+    let e2e_duration_secs = std::env::var("ACUI_E2E_DURATION_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let headless =
+        std::env::var("ACUI_HEADLESS").as_deref() == Ok("1") || e2e_duration_secs.is_some();
+    let application = if headless {
+        Application::headless()
+    } else {
+        Application::new()
+    };
     application.on_reopen(|cx: &mut App| {
         if cx.windows().is_empty()
             && let Some(global_state) = cx.try_global::<GlobalAppState>()
@@ -40,7 +50,7 @@ fn main() {
         cx.activate(true);
     });
 
-    application.run(|cx: &mut App| {
+    application.run(move |cx: &mut App| {
         let app_state = cx.new(|cx| {
             let config = AppConfig::load().unwrap_or_else(|err| {
                 eprintln!("failed to load acui.toml, using defaults: {err}");
@@ -62,7 +72,22 @@ fn main() {
         });
         cx.set_global(GlobalAppState(app_state.clone()));
 
-        open_main_window(cx, app_state.clone());
+        if !headless {
+            open_main_window(cx, app_state.clone());
+        }
+
+        if let Some(duration_secs) = e2e_duration_secs {
+            let background = cx.background_executor().clone();
+            cx.spawn(move |cx: &mut gpui::AsyncApp| {
+                let cx = cx.clone();
+                async move {
+                    background.timer(Duration::from_secs(duration_secs)).await;
+                    let _ = cx.update(|cx: &mut App| cx.quit());
+                }
+            })
+            .detach();
+        }
+
         cx.activate(true);
     });
 }
