@@ -1,20 +1,26 @@
 use agent_client_protocol::{
     self as acp, Agent, ClientSideConnection, ContentBlock, InitializeRequest, LoadSessionRequest,
     NewSessionRequest, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
-    StopReason,
+    RequestPermissionResponse, SessionId, SessionNotification, StopReason,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+pub struct PermissionRequestEvent {
+    pub options: Vec<acp::PermissionOption>,
+    pub response_tx: oneshot::Sender<RequestPermissionOutcome>,
+}
+
+#[derive(Debug)]
 pub enum AgentEvent {
     Notification(SessionNotification),
+    PermissionRequest(PermissionRequestEvent),
     Disconnected,
 }
 
@@ -29,14 +35,15 @@ impl acp::Client for GpuiAcpClient {
         &self,
         args: RequestPermissionRequest,
     ) -> acp::Result<RequestPermissionResponse> {
-        let outcome = args
-            .options
-            .first()
-            .map(|option| {
-                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
-                    option.option_id.clone(),
-                ))
-            })
+        let (response_tx, response_rx) = oneshot::channel();
+        let _ = self
+            .event_tx
+            .send(AgentEvent::PermissionRequest(PermissionRequestEvent {
+                options: args.options,
+                response_tx,
+            }));
+        let outcome = response_rx
+            .await
             .unwrap_or(RequestPermissionOutcome::Cancelled);
 
         Ok(RequestPermissionResponse::new(outcome))
@@ -281,6 +288,7 @@ pub mod mock {
                     AgentEvent::Notification(received) => {
                         assert_eq!(received.session_id, notification.session_id);
                     }
+                    AgentEvent::PermissionRequest(_) => panic!("expected notification event"),
                     AgentEvent::Disconnected => panic!("expected notification event"),
                 }
             })

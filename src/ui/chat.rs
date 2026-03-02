@@ -89,9 +89,13 @@ impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_scroll_lock();
 
-        let (active_thread_id, messages) = {
+        let (active_thread_id, messages, permission_options) = {
             let state = self.app_state.read(cx);
-            (state.active_thread_id, state.active_thread_messages())
+            (
+                state.active_thread_id,
+                state.active_thread_messages(),
+                state.active_thread_permission_options(),
+            )
         };
 
         let chat_content = if active_thread_id.is_some() {
@@ -189,12 +193,63 @@ impl Render for ChatView {
                     })),
             );
 
+        let permission_panel = match (active_thread_id, permission_options) {
+            (Some(thread_id), Some(options)) if !options.is_empty() => {
+                let option_buttons = options.into_iter().enumerate().map(|(index, option)| {
+                    let option_id = option.option_id.to_string();
+                    div()
+                        .id(("permission-option", index))
+                        .bg(rgb(0x0e639c))
+                        .text_color(white())
+                        .rounded_md()
+                        .px_3()
+                        .py_1()
+                        .cursor_pointer()
+                        .child(option.name)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.app_state.update(cx, |state, cx| {
+                                state.resolve_permission(cx, thread_id, Some(option_id.clone()));
+                            });
+                        }))
+                });
+                div()
+                    .w_full()
+                    .p_2()
+                    .bg(rgb(0x2d2d30))
+                    .border_t_1()
+                    .border_color(rgb(0x3c3c3c))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().text_color(rgb(0xdddddd)).child("Permission required"))
+                    .children(option_buttons)
+                    .child(
+                        div()
+                            .id("permission-cancel-button")
+                            .bg(rgb(0x6b2f2f))
+                            .text_color(white())
+                            .rounded_md()
+                            .px_3()
+                            .py_1()
+                            .cursor_pointer()
+                            .child("Cancel")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.app_state.update(cx, |state, cx| {
+                                    state.resolve_permission(cx, thread_id, None);
+                                });
+                            })),
+                    )
+            }
+            _ => div(),
+        };
+
         div()
             .flex()
             .flex_col()
             .flex_1()
             .h_full()
             .child(chat_content)
+            .child(permission_panel)
             .child(input_box)
     }
 }

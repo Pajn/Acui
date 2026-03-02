@@ -5,12 +5,13 @@ use std::rc::Rc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::client::{AcpController, AgentEvent};
+use crate::client::{AcpController, AgentEvent, PermissionRequestEvent};
 use crate::config::AppConfig;
 use crate::domain::{Message, Role, Thread, Workspace};
 use crate::persistence::AppPersistence;
 use agent_client_protocol::{
-    ContentBlock, ContentChunk, SessionId, SessionNotification, SessionUpdate, StopReason,
+    ContentBlock, ContentChunk, PermissionOption, PermissionOptionId, RequestPermissionOutcome,
+    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, StopReason,
 };
 
 struct ThreadAgentConnection {
@@ -25,6 +26,7 @@ pub struct AppState {
     agent_tasks: HashMap<Uuid, Task<()>>,
     mock_event_senders: HashMap<Uuid, mpsc::UnboundedSender<AgentEvent>>,
     agent_connections: HashMap<Uuid, ThreadAgentConnection>,
+    pending_permissions: HashMap<Uuid, PermissionRequestEvent>,
     persistence: Option<AppPersistence>,
     agent_config_path: Option<PathBuf>,
 }
@@ -48,6 +50,7 @@ impl AppState {
             agent_tasks: HashMap::new(),
             mock_event_senders: HashMap::new(),
             agent_connections: HashMap::new(),
+            pending_permissions: HashMap::new(),
             persistence,
             agent_config_path,
         }
@@ -128,6 +131,24 @@ impl AppState {
                 .any(|thread| thread.id == thread_id)
                 .then(|| workspace.path.clone())
         })
+    }
+
+    pub fn active_thread_permission_options(&self) -> Option<Vec<PermissionOption>> {
+        let thread_id = self.active_thread_id?;
+        self.pending_permissions
+            .get(&thread_id)
+            .map(|request| request.options.clone())
+    }
+
+    pub fn resolve_permission(
+        &mut self,
+        cx: &mut Context<Self>,
+        thread_id: Uuid,
+        option_id: Option<String>,
+    ) {
+        if self.resolve_permission_choice(thread_id, option_id) {
+            cx.notify();
+        }
     }
 
     pub fn send_user_message(&mut self, cx: &mut Context<Self>, thread_id: Uuid, content: &str) {
@@ -340,6 +361,14 @@ impl AppState {
                     self.append_agent_chunk(thread_id, &chunk);
                 }
             }
+            AgentEvent::PermissionRequest(request) => {
+                if let Some(existing) = self.pending_permissions.remove(&thread_id) {
+                    let _ = existing
+                        .response_tx
+                        .send(RequestPermissionOutcome::Cancelled);
+                }
+                self.pending_permissions.insert(thread_id, request);
+            }
             AgentEvent::Disconnected => {
                 self.finalize_agent_message(thread_id);
             }
@@ -417,6 +446,21 @@ impl AppState {
             eprintln!("failed to persist app state: {err}");
         }
     }
+
+    fn resolve_permission_choice(&mut self, thread_id: Uuid, option_id: Option<String>) -> bool {
+        let Some(request) = self.pending_permissions.remove(&thread_id) else {
+            return false;
+        };
+        let outcome = option_id
+            .map(|selected| {
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                    PermissionOptionId::new(selected),
+                ))
+            })
+            .unwrap_or(RequestPermissionOutcome::Cancelled);
+        let _ = request.response_tx.send(outcome);
+        true
+    }
 }
 
 pub fn extract_text_from_notification(notification: &SessionNotification) -> Option<String> {
@@ -443,6 +487,7 @@ fn stop_reason_label(stop_reason: StopReason) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::PermissionOptionKind;
 
     #[test]
     fn incoming_agent_events_update_state() {
@@ -492,5 +537,46 @@ mod tests {
     fn stop_reason_label_covers_known_values() {
         assert_eq!(stop_reason_label(StopReason::EndTurn), "end_turn");
         assert_eq!(stop_reason_label(StopReason::Cancelled), "cancelled");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn permission_request_round_trip_uses_selected_option() {
+        let mut state = AppState::new();
+        let workspace_id = Uuid::new_v4();
+        let thread = Thread::new(workspace_id, "Thread");
+        let thread_id = thread.id;
+        let mut workspace = Workspace::new("Workspace");
+        workspace.id = workspace_id;
+        workspace.add_thread(thread);
+        state.workspaces.push(workspace);
+        state.active_thread_id = Some(thread_id);
+
+        let option =
+            PermissionOption::new("allow_once", "Allow once", PermissionOptionKind::AllowOnce);
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        state.apply_agent_event(
+            thread_id,
+            AgentEvent::PermissionRequest(PermissionRequestEvent {
+                options: vec![option],
+                response_tx,
+            }),
+        );
+        assert_eq!(
+            state
+                .active_thread_permission_options()
+                .expect("request should be active")
+                .len(),
+            1
+        );
+
+        assert!(state.resolve_permission_choice(thread_id, Some("allow_once".to_string())));
+        let outcome = response_rx.await.expect("selection should be returned");
+        match outcome {
+            RequestPermissionOutcome::Selected(selected) => {
+                assert_eq!(selected.option_id.to_string(), "allow_once");
+            }
+            RequestPermissionOutcome::Cancelled => panic!("expected selected outcome"),
+            _ => panic!("expected selected outcome"),
+        }
     }
 }
