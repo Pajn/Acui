@@ -1,6 +1,6 @@
 use gpui::{Context, Task};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -15,6 +15,7 @@ use agent_client_protocol::{
     SessionConfigValueId, SessionId, SessionNotification, SessionUpdate, StopReason, ToolCall,
     ToolCallContent, ToolCallStatus, ToolCallUpdate,
 };
+use ignore::WalkBuilder;
 
 struct ThreadAgentConnection {
     controller: Rc<AcpController>,
@@ -149,9 +150,7 @@ impl AppState {
         let Some(root) = self.workspace_cwd_for_thread(thread_id) else {
             return Vec::new();
         };
-        let mut files = Vec::new();
-        collect_workspace_files(&root, &root, limit, &mut files);
-        files
+        collect_workspace_files(&root, limit)
     }
 
     pub fn active_thread_permission_options(&self) -> Option<Vec<PermissionOption>> {
@@ -685,34 +684,29 @@ fn render_diff_text(old: Option<&str>, new: &str) -> String {
     lines.join("\n")
 }
 
-fn collect_workspace_files(root: &Path, dir: &Path, limit: usize, output: &mut Vec<String>) {
-    if output.len() >= limit {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn collect_workspace_files(root: &PathBuf, limit: usize) -> Vec<String> {
+    let mut output = Vec::new();
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .require_git(false)
+        .parents(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+    for entry in walker.flatten() {
         if output.len() >= limit {
             break;
         }
-        let path = entry.path();
-        let Ok(relative) = path.strip_prefix(root) else {
-            continue;
-        };
-        if path.is_dir() {
-            if relative
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with('.'))
-            {
-                continue;
-            }
-            collect_workspace_files(root, &path, limit, output);
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
+        let Ok(relative) = entry.path().strip_prefix(root) else {
+            continue;
+        };
         output.push(relative.to_string_lossy().to_string());
     }
+    output
 }
 
 fn stop_reason_label(stop_reason: StopReason) -> &'static str {
@@ -947,6 +941,33 @@ mod tests {
 
         let files = state.workspace_relative_files_for_thread(thread_id, 20);
         assert!(files.iter().any(|entry| entry.ends_with("src/main.rs")));
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn workspace_relative_files_respect_gitignore() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("acui-gitignore-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(temp_dir.join("src")).expect("should create dir");
+        std::fs::create_dir_all(temp_dir.join("ignored_dir")).expect("should create ignored dir");
+        std::fs::write(temp_dir.join(".gitignore"), "ignored.txt\nignored_dir/\n")
+            .expect("should write gitignore");
+        std::fs::write(temp_dir.join("src/main.rs"), "fn main() {}").expect("should write file");
+        std::fs::write(temp_dir.join("ignored.txt"), "nope").expect("should write ignored file");
+        std::fs::write(temp_dir.join("ignored_dir/file.rs"), "nope")
+            .expect("should write ignored dir file");
+
+        let mut state = AppState::new();
+        let mut workspace = Workspace::from_path(temp_dir.clone());
+        let thread = Thread::new(workspace.id, "Thread");
+        let thread_id = thread.id;
+        workspace.add_thread(thread);
+        state.workspaces.push(workspace);
+
+        let files = state.workspace_relative_files_for_thread(thread_id, 100);
+        assert!(files.iter().any(|entry| entry.ends_with("src/main.rs")));
+        assert!(!files.iter().any(|entry| entry.ends_with("ignored.txt")));
+        assert!(!files.iter().any(|entry| entry.contains("ignored_dir")));
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

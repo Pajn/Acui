@@ -29,6 +29,7 @@ struct SuggestionState {
 pub struct ChatView {
     app_state: Entity<AppState>,
     scroll_handle: ScrollHandle,
+    suggestion_scroll_handle: ScrollHandle,
     input_buffer: String,
     input_cursor: usize,
     input_selection: Option<Range<usize>>,
@@ -151,6 +152,7 @@ impl ChatView {
         Self {
             app_state,
             scroll_handle: ScrollHandle::new(),
+            suggestion_scroll_handle: ScrollHandle::new(),
             input_buffer: String::new(),
             input_cursor: 0,
             input_selection: None,
@@ -496,6 +498,8 @@ impl Render for ChatView {
             );
 
         let suggestion_panel = if let Some(suggestions) = self.compute_suggestions(cx) {
+            self.suggestion_scroll_handle
+                .scroll_to_item(suggestions.selected);
             let rows: Vec<AnyElement> = suggestions
                 .items
                 .iter()
@@ -520,6 +524,7 @@ impl Render for ChatView {
                 .id("chat-suggestion-list")
                 .w_full()
                 .overflow_y_scroll()
+                .track_scroll(&self.suggestion_scroll_handle)
                 .max_h(px(180.0))
                 .p_2()
                 .bg(rgb(0x252526))
@@ -703,6 +708,7 @@ fn slash_suggestion_items(commands: &[AvailableCommand], query: &str) -> Vec<Sug
             display: format!("/{} — {}", command.name, command.description),
             replacement: format!("/{} ", command.name),
         })
+        .take(100)
         .collect()
 }
 
@@ -715,5 +721,6 @@ fn file_suggestion_items(files: &[String], query: &str) -> Vec<SuggestionItem> {
             display: path.clone(),
             replacement: format!("@{} ", path),
         })
+        .take(100)
         .collect()
 }
