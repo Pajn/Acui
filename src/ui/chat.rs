@@ -5,6 +5,7 @@ use agent_client_protocol::{
 };
 use gpui::prelude::*;
 use gpui::*;
+use std::ops::Range;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SuggestionKind {
@@ -29,6 +30,8 @@ pub struct ChatView {
     app_state: Entity<AppState>,
     scroll_handle: ScrollHandle,
     input_buffer: String,
+    input_cursor: usize,
+    input_selection: Option<Range<usize>>,
     locked_to_bottom: bool,
     suggestion_anchor: Option<(SuggestionKind, usize)>,
     suggestion_selected: usize,
@@ -46,8 +49,15 @@ impl ChatView {
         .detach();
 
         cx.observe_keystrokes(|this, event, _window, cx| {
+            let key = event.keystroke.key.as_str();
+            let command = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
+            if command && key == "a" {
+                this.select_all_input();
+                cx.notify();
+                return;
+            }
+
             if let Some(suggestions) = this.compute_suggestions(cx) {
-                let key = event.keystroke.key.as_str();
                 if key == "escape" {
                     this.dismissed_suggestion = Some((suggestions.kind, suggestions.start));
                     cx.notify();
@@ -74,10 +84,46 @@ impl ChatView {
                 }
             }
 
-            if event.keystroke.key == "backspace" {
-                this.input_buffer.pop();
+            if key == "left" {
+                this.move_cursor_left();
                 this.reconcile_suggestion_visibility();
                 cx.notify();
+                return;
+            }
+            if key == "right" {
+                this.move_cursor_right();
+                this.reconcile_suggestion_visibility();
+                cx.notify();
+                return;
+            }
+            if key == "home" {
+                this.clear_selection();
+                this.input_cursor = 0;
+                this.reconcile_suggestion_visibility();
+                cx.notify();
+                return;
+            }
+            if key == "end" {
+                this.clear_selection();
+                this.input_cursor = this.input_len_chars();
+                this.reconcile_suggestion_visibility();
+                cx.notify();
+                return;
+            }
+            if key == "backspace" {
+                this.backspace();
+                this.reconcile_suggestion_visibility();
+                cx.notify();
+                return;
+            }
+            if key == "delete" {
+                this.delete_forward();
+                this.reconcile_suggestion_visibility();
+                cx.notify();
+                return;
+            }
+            if key == "enter" {
+                this.submit_input(cx);
                 return;
             }
 
@@ -94,7 +140,7 @@ impl ChatView {
                     return;
                 }
                 if input.chars().any(|ch| !ch.is_control()) {
-                    this.input_buffer.push_str(input);
+                    this.insert_text(input);
                     this.reconcile_suggestion_visibility();
                     cx.notify();
                 }
@@ -106,6 +152,8 @@ impl ChatView {
             app_state,
             scroll_handle: ScrollHandle::new(),
             input_buffer: String::new(),
+            input_cursor: 0,
+            input_selection: None,
             locked_to_bottom: true,
             suggestion_anchor: None,
             suggestion_selected: 0,
@@ -125,6 +173,8 @@ impl ChatView {
                 state.send_user_message(cx, thread_id, &content);
             });
             self.input_buffer.clear();
+            self.input_cursor = 0;
+            self.input_selection = None;
             self.locked_to_bottom = true;
             cx.notify();
         }
@@ -235,8 +285,105 @@ impl ChatView {
         };
         self.input_buffer
             .replace_range(state.start..self.input_buffer.len(), &item.replacement);
+        self.input_cursor = self.input_buffer.chars().count();
+        self.input_selection = None;
         self.suggestion_anchor = None;
         self.dismissed_suggestion = None;
+    }
+
+    fn input_len_chars(&self) -> usize {
+        self.input_buffer.chars().count()
+    }
+
+    fn char_to_byte_index(&self, char_index: usize) -> usize {
+        self.input_buffer
+            .char_indices()
+            .nth(char_index)
+            .map_or(self.input_buffer.len(), |(index, _)| index)
+    }
+
+    fn clear_selection(&mut self) {
+        self.input_selection = None;
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let Some(selection) = self.input_selection.clone() else {
+            return false;
+        };
+        let start = selection.start.min(selection.end);
+        let end = selection.start.max(selection.end);
+        let start_byte = self.char_to_byte_index(start);
+        let end_byte = self.char_to_byte_index(end);
+        self.input_buffer.replace_range(start_byte..end_byte, "");
+        self.input_cursor = start;
+        self.input_selection = None;
+        true
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        let _ = self.delete_selection();
+        let index = self.char_to_byte_index(self.input_cursor);
+        self.input_buffer.insert_str(index, text);
+        self.input_cursor += text.chars().count();
+        self.clear_selection();
+    }
+
+    fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        if self.input_cursor == 0 {
+            return;
+        }
+        let start = self.char_to_byte_index(self.input_cursor - 1);
+        let end = self.char_to_byte_index(self.input_cursor);
+        self.input_buffer.replace_range(start..end, "");
+        self.input_cursor -= 1;
+    }
+
+    fn delete_forward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        if self.input_cursor >= self.input_len_chars() {
+            return;
+        }
+        let start = self.char_to_byte_index(self.input_cursor);
+        let end = self.char_to_byte_index(self.input_cursor + 1);
+        self.input_buffer.replace_range(start..end, "");
+    }
+
+    fn move_cursor_left(&mut self) {
+        self.clear_selection();
+        self.input_cursor = self.input_cursor.saturating_sub(1);
+    }
+
+    fn move_cursor_right(&mut self) {
+        self.clear_selection();
+        self.input_cursor = (self.input_cursor + 1).min(self.input_len_chars());
+    }
+
+    fn select_all_input(&mut self) {
+        let len = self.input_len_chars();
+        self.input_selection = Some(0..len);
+        self.input_cursor = len;
+    }
+
+    fn input_display_text(&self) -> String {
+        if self.input_buffer.is_empty() {
+            return "|".to_string();
+        }
+        let mut rendered = String::new();
+        for (index, ch) in self.input_buffer.chars().enumerate() {
+            if index == self.input_cursor {
+                rendered.push('|');
+            }
+            rendered.push(ch);
+        }
+        if self.input_cursor >= self.input_len_chars() {
+            rendered.push('|');
+        }
+        rendered
     }
 }
 
@@ -303,9 +450,9 @@ impl Render for ChatView {
         };
 
         let input_hint = if self.input_buffer.is_empty() {
-            "Type and press Enter...".to_string()
+            "| Type and press Enter...".to_string()
         } else {
-            self.input_buffer.clone()
+            self.input_display_text()
         };
 
         let input_box = div()
