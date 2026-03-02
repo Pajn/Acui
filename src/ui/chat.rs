@@ -422,15 +422,24 @@ impl Render for ChatView {
                         Role::Agent => rgb(0x3c3c3c),
                         Role::System => rgb(0x6b2f2f),
                     };
+                    let content = msg.content;
+                    let copy_content = content.clone();
 
-                    div().id(("chat-message", index)).p_2().child(
-                        div()
-                            .p_2()
-                            .rounded_md()
-                            .bg(bg)
-                            .text_color(white())
-                            .child(msg.content),
-                    )
+                    div()
+                        .id(("chat-message", index))
+                        .p_2()
+                        .cursor_text()
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copy_content.clone()));
+                        }))
+                        .child(
+                            div()
+                                .p_2()
+                                .rounded_md()
+                                .bg(bg)
+                                .text_color(white())
+                                .child(content.clone()),
+                        )
                 });
 
                 div()
