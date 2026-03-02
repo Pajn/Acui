@@ -9,6 +9,39 @@ pub struct SidebarView {
     collapsed_workspaces: HashSet<uuid::Uuid>,
 }
 
+#[derive(Clone)]
+enum SidebarDragItem {
+    Workspace(uuid::Uuid),
+    Thread {
+        workspace_id: uuid::Uuid,
+        thread_id: uuid::Uuid,
+    },
+}
+
+struct DragPreview {
+    label: SharedString,
+}
+
+impl DragPreview {
+    fn new(label: impl Into<SharedString>) -> Self {
+        Self {
+            label: label.into(),
+        }
+    }
+}
+
+impl Render for DragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0x0e639c))
+            .text_color(white())
+            .child(self.label.clone())
+    }
+}
+
 impl SidebarView {
     pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         cx.observe(&app_state, |_, _, cx| cx.notify()).detach();
@@ -85,6 +118,7 @@ impl Render for SidebarView {
                     .enumerate()
                     .map(|(ws_index, workspace)| {
                         let ws_id = workspace.id;
+                        let workspace_name = workspace.name.clone();
                         let is_collapsed = self.collapsed_workspaces.contains(&ws_id);
 
                         let header = div()
@@ -107,7 +141,25 @@ impl Render for SidebarView {
                                     this.collapsed_workspaces.insert(ws_id);
                                 }
                                 cx.notify();
-                            }));
+                            }))
+                            .on_drag(
+                                SidebarDragItem::Workspace(ws_id),
+                                move |_dragged, _, _, cx| {
+                                    cx.new(|_| {
+                                        DragPreview::new(format!("Workspace: {workspace_name}"))
+                                    })
+                                },
+                            )
+                            .on_drop(cx.listener(move |this, dragged: &SidebarDragItem, _, cx| {
+                                if let SidebarDragItem::Workspace(dragged_ws_id) = dragged {
+                                    this.app_state.update(cx, |state, cx| {
+                                        state.reorder_workspaces(cx, *dragged_ws_id, ws_id);
+                                    });
+                                }
+                            }))
+                            .drag_over::<SidebarDragItem>(|style, _, _, _| {
+                                style.bg(rgb(0x3a3a40))
+                            });
 
                         if is_collapsed {
                             return div().child(header);
@@ -140,6 +192,7 @@ impl Render for SidebarView {
                                 let has_unread_stop = !is_active
                                     && self.app_state.read(cx).thread_has_unread_stop(thread_id);
                                 let thread_dom_id = ws_index * 1000 + thread_index;
+                                let thread_name = thread.name.clone();
                                 let trailing = if has_unread_stop {
                                     div()
                                         .w(px(8.0))
@@ -168,6 +221,40 @@ impl Render for SidebarView {
                                     })
                                     .text_color(rgb(0xcccccc))
                                     .cursor_pointer()
+                                    .on_drag(
+                                        SidebarDragItem::Thread {
+                                            workspace_id: ws_id,
+                                            thread_id,
+                                        },
+                                        move |_dragged, _, _, cx| {
+                                            cx.new(|_| DragPreview::new(format!("Thread: {thread_name}")))
+                                        },
+                                    )
+                                    .on_drop(cx.listener(
+                                        move |this, dragged: &SidebarDragItem, _, cx| {
+                                            if let SidebarDragItem::Thread {
+                                                workspace_id,
+                                                thread_id: dragged_thread_id,
+                                            } = dragged
+                                                && *workspace_id == ws_id
+                                            {
+                                                this.app_state.update(cx, |state, cx| {
+                                                    state.reorder_threads(
+                                                        cx,
+                                                        *workspace_id,
+                                                        *dragged_thread_id,
+                                                        thread_id,
+                                                    );
+                                                });
+                                            }
+                                        },
+                                    ))
+                                    .drag_over::<SidebarDragItem>(move |style, dragged, _, _| match dragged {
+                                        SidebarDragItem::Thread { workspace_id, .. } if *workspace_id == ws_id => {
+                                            style.bg(rgb(0x42424a))
+                                        }
+                                        _ => style,
+                                    })
                                     .child(
                                         div()
                                             .flex()

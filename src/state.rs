@@ -122,6 +122,66 @@ impl AppState {
         id
     }
 
+    pub fn reorder_workspaces(
+        &mut self,
+        cx: &mut Context<Self>,
+        dragged_workspace_id: Uuid,
+        target_workspace_id: Uuid,
+    ) {
+        let Some(from_index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == dragged_workspace_id)
+        else {
+            return;
+        };
+        let Some(to_index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == target_workspace_id)
+        else {
+            return;
+        };
+        if from_index == to_index {
+            return;
+        }
+        move_vec_item(&mut self.workspaces, from_index, to_index);
+        self.persist_state();
+        cx.notify();
+    }
+
+    pub fn reorder_threads(
+        &mut self,
+        cx: &mut Context<Self>,
+        workspace_id: Uuid,
+        dragged_thread_id: Uuid,
+        target_thread_id: Uuid,
+    ) {
+        let Some(workspace) = self.workspaces.iter_mut().find(|item| item.id == workspace_id) else {
+            return;
+        };
+        let Some(from_index) = workspace
+            .threads
+            .iter()
+            .position(|thread| thread.id == dragged_thread_id)
+        else {
+            return;
+        };
+        let Some(to_index) = workspace
+            .threads
+            .iter()
+            .position(|thread| thread.id == target_thread_id)
+        else {
+            return;
+        };
+        if from_index == to_index {
+            return;
+        }
+        move_vec_item(&mut workspace.threads, from_index, to_index);
+        self.persist_state();
+        cx.notify();
+    }
+
     pub fn add_thread(
         &mut self,
         cx: &mut Context<Self>,
@@ -915,6 +975,16 @@ fn format_duration_short(duration: std::time::Duration) -> String {
     format!("{minutes}m {rem_seconds}s")
 }
 
+fn move_vec_item<T>(items: &mut Vec<T>, from_index: usize, to_index: usize) {
+    let item = items.remove(from_index);
+    let adjusted_index = if from_index < to_index {
+        to_index.saturating_sub(1)
+    } else {
+        to_index
+    };
+    items.insert(adjusted_index, item);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1193,5 +1263,12 @@ mod tests {
         assert!(raw.contains("\"direction\":\"to_agent\""));
         assert!(raw.contains("\"direction\":\"from_agent\""));
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn move_vec_item_reorders_items_before_target() {
+        let mut values = vec!["a", "b", "c"];
+        move_vec_item(&mut values, 2, 0);
+        assert_eq!(values, vec!["c", "a", "b"]);
     }
 }
