@@ -1,6 +1,6 @@
 use gpui::{Context, Task};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -10,9 +10,10 @@ use crate::config::AppConfig;
 use crate::domain::{Message, Role, Thread, Workspace};
 use crate::persistence::AppPersistence;
 use agent_client_protocol::{
-    ContentBlock, ContentChunk, PermissionOption, PermissionOptionId, RequestPermissionOutcome,
-    SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigValueId,
-    SessionId, SessionNotification, SessionUpdate, StopReason,
+    AvailableCommand, ContentBlock, ContentChunk, PermissionOption, PermissionOptionId,
+    RequestPermissionOutcome, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
+    SessionConfigValueId, SessionId, SessionNotification, SessionUpdate, StopReason, ToolCall,
+    ToolCallContent, ToolCallStatus, ToolCallUpdate,
 };
 
 struct ThreadAgentConnection {
@@ -29,6 +30,8 @@ pub struct AppState {
     agent_connections: HashMap<Uuid, ThreadAgentConnection>,
     pending_permissions: HashMap<Uuid, PermissionRequestEvent>,
     thread_config_options: HashMap<Uuid, Vec<SessionConfigOption>>,
+    thread_available_commands: HashMap<Uuid, Vec<AvailableCommand>>,
+    thread_tool_calls: HashMap<Uuid, HashMap<String, ToolCall>>,
     persistence: Option<AppPersistence>,
     agent_config_path: Option<PathBuf>,
 }
@@ -54,6 +57,8 @@ impl AppState {
             agent_connections: HashMap::new(),
             pending_permissions: HashMap::new(),
             thread_config_options: HashMap::new(),
+            thread_available_commands: HashMap::new(),
+            thread_tool_calls: HashMap::new(),
             persistence,
             agent_config_path,
         }
@@ -136,6 +141,19 @@ impl AppState {
         })
     }
 
+    pub fn workspace_relative_files_for_thread(
+        &self,
+        thread_id: Uuid,
+        limit: usize,
+    ) -> Vec<String> {
+        let Some(root) = self.workspace_cwd_for_thread(thread_id) else {
+            return Vec::new();
+        };
+        let mut files = Vec::new();
+        collect_workspace_files(&root, &root, limit, &mut files);
+        files
+    }
+
     pub fn active_thread_permission_options(&self) -> Option<Vec<PermissionOption>> {
         let thread_id = self.active_thread_id?;
         self.pending_permissions
@@ -146,6 +164,11 @@ impl AppState {
     pub fn active_thread_config_options(&self) -> Option<Vec<SessionConfigOption>> {
         let thread_id = self.active_thread_id?;
         self.thread_config_options.get(&thread_id).cloned()
+    }
+
+    pub fn active_thread_available_commands(&self) -> Option<Vec<AvailableCommand>> {
+        let thread_id = self.active_thread_id?;
+        self.thread_available_commands.get(&thread_id).cloned()
     }
 
     pub fn resolve_permission(
@@ -413,14 +436,7 @@ impl AppState {
     pub fn apply_agent_event(&mut self, thread_id: Uuid, event: AgentEvent) {
         match event {
             AgentEvent::Notification(notification) => {
-                if let Some(chunk) = extract_text_from_notification(&notification) {
-                    self.append_agent_chunk(thread_id, &chunk);
-                }
-                if let Some(config_options) =
-                    extract_config_options_from_notification(&notification)
-                {
-                    self.thread_config_options.insert(thread_id, config_options);
-                }
+                self.apply_session_update(thread_id, notification.update);
             }
             AgentEvent::PermissionRequest(request) => {
                 if let Some(existing) = self.pending_permissions.remove(&thread_id) {
@@ -475,7 +491,64 @@ impl AppState {
     }
 
     fn finalize_agent_message(&mut self, thread_id: Uuid) {
+        if let Some(thread) = self.find_thread_mut(thread_id)
+            && let Some(active_message) = thread.get_active_agent_message_mut()
+        {
+            active_message.finalize();
+        }
+    }
+
+    fn apply_session_update(&mut self, thread_id: Uuid, update: SessionUpdate) {
+        match update {
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(text),
+                ..
+            }) => {
+                self.append_agent_chunk(thread_id, &text.text);
+            }
+            SessionUpdate::ConfigOptionUpdate(update) => {
+                self.thread_config_options
+                    .insert(thread_id, update.config_options);
+            }
+            SessionUpdate::AvailableCommandsUpdate(update) => {
+                self.thread_available_commands
+                    .insert(thread_id, update.available_commands);
+            }
+            SessionUpdate::ToolCall(tool_call) => {
+                self.record_tool_call(thread_id, tool_call);
+            }
+            SessionUpdate::ToolCallUpdate(update) => {
+                self.apply_tool_call_update(thread_id, update);
+            }
+            _ => {}
+        }
+    }
+
+    fn record_tool_call(&mut self, thread_id: Uuid, tool_call: ToolCall) {
+        self.thread_tool_calls
+            .entry(thread_id)
+            .or_default()
+            .insert(tool_call.tool_call_id.to_string(), tool_call.clone());
+        let rendered = render_tool_call_message(&tool_call);
         if let Some(thread) = self.find_thread_mut(thread_id) {
+            thread.add_message(Message::new(thread_id, Role::Agent, rendered));
+            if let Some(active_message) = thread.get_active_agent_message_mut() {
+                active_message.finalize();
+            }
+        }
+    }
+
+    fn apply_tool_call_update(&mut self, thread_id: Uuid, update: ToolCallUpdate) {
+        let entry = self
+            .thread_tool_calls
+            .entry(thread_id)
+            .or_default()
+            .entry(update.tool_call_id.to_string())
+            .or_insert_with(|| ToolCall::new(update.tool_call_id.clone(), "Tool call"));
+        entry.update(update.fields);
+        let rendered = render_tool_call_message(entry);
+        if let Some(thread) = self.find_thread_mut(thread_id) {
+            thread.add_message(Message::new(thread_id, Role::Agent, rendered));
             if let Some(active_message) = thread.get_active_agent_message_mut() {
                 active_message.finalize();
             }
@@ -543,6 +616,105 @@ pub fn extract_config_options_from_notification(
     }
 }
 
+fn render_tool_call_message(tool_call: &ToolCall) -> String {
+    let mut lines = vec![
+        format!("Tool: {}", tool_call.title),
+        format!(
+            "Status: {}",
+            match tool_call.status {
+                ToolCallStatus::Pending => "pending",
+                ToolCallStatus::InProgress => "in_progress",
+                ToolCallStatus::Completed => "completed",
+                ToolCallStatus::Failed => "failed",
+                _ => "unknown",
+            }
+        ),
+    ];
+    if !tool_call.content.is_empty() {
+        for content in &tool_call.content {
+            lines.push(render_tool_call_content(content));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_tool_call_content(content: &ToolCallContent) -> String {
+    match content {
+        ToolCallContent::Content(content) => match &content.content {
+            ContentBlock::Text(text) => text.text.clone(),
+            _ => "[non-text content]".to_string(),
+        },
+        ToolCallContent::Diff(diff) => {
+            let mut out = vec![format!("Diff: {}", diff.path.display())];
+            out.push(render_diff_text(diff.old_text.as_deref(), &diff.new_text));
+            out.join("\n")
+        }
+        ToolCallContent::Terminal(terminal) => {
+            format!("Terminal: {}", terminal.terminal_id)
+        }
+        _ => "[unsupported tool content]".to_string(),
+    }
+}
+
+fn render_diff_text(old: Option<&str>, new: &str) -> String {
+    let mut lines = vec!["--- before".to_string(), "+++ after".to_string()];
+    let old_lines = old.map(|text| text.lines().collect::<Vec<_>>());
+    let new_lines = new.lines().collect::<Vec<_>>();
+    let max_len = old_lines
+        .as_ref()
+        .map_or(new_lines.len(), |values| values.len().max(new_lines.len()));
+    for index in 0..max_len {
+        let before = old_lines
+            .as_ref()
+            .and_then(|values| values.get(index))
+            .copied();
+        let after = new_lines.get(index).copied();
+        if before == after {
+            continue;
+        }
+        if let Some(before) = before {
+            lines.push(format!("-{before}"));
+        }
+        if let Some(after) = after {
+            lines.push(format!("+{after}"));
+        }
+    }
+    if lines.len() == 2 {
+        lines.push("(no changes)".to_string());
+    }
+    lines.join("\n")
+}
+
+fn collect_workspace_files(root: &Path, dir: &Path, limit: usize, output: &mut Vec<String>) {
+    if output.len() >= limit {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if output.len() >= limit {
+            break;
+        }
+        let path = entry.path();
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        if path.is_dir() {
+            if relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with('.'))
+            {
+                continue;
+            }
+            collect_workspace_files(root, &path, limit, output);
+            continue;
+        }
+        output.push(relative.to_string_lossy().to_string());
+    }
+}
+
 fn stop_reason_label(stop_reason: StopReason) -> &'static str {
     match stop_reason {
         StopReason::EndTurn => "end_turn",
@@ -557,7 +729,11 @@ fn stop_reason_label(stop_reason: StopReason) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::{ConfigOptionUpdate, PermissionOptionKind, SessionConfigOption};
+    use agent_client_protocol::{
+        AvailableCommand, AvailableCommandsUpdate, ConfigOptionUpdate, Diff, PermissionOptionKind,
+        SessionConfigOption, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
+        ToolCallUpdateFields,
+    };
 
     #[test]
     fn incoming_agent_events_update_state() {
@@ -669,5 +845,108 @@ mod tests {
             .expect("config option update should be extracted");
         assert_eq!(extracted.len(), 1);
         assert_eq!(extracted[0].id.to_string(), "mode");
+    }
+
+    #[test]
+    fn available_commands_update_is_stored_for_active_thread() {
+        let mut state = AppState::new();
+        let workspace_id = Uuid::new_v4();
+        let thread = Thread::new(workspace_id, "Thread");
+        let thread_id = thread.id;
+        let mut workspace = Workspace::new("Workspace");
+        workspace.id = workspace_id;
+        workspace.add_thread(thread);
+        state.workspaces.push(workspace);
+        state.active_thread_id = Some(thread_id);
+
+        let notification = SessionNotification::new(
+            SessionId::new("session-1"),
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+                AvailableCommand::new("build", "Run build"),
+                AvailableCommand::new("test", "Run tests"),
+            ])),
+        );
+        state.apply_agent_event(thread_id, AgentEvent::Notification(notification));
+
+        let commands = state
+            .active_thread_available_commands()
+            .expect("commands should be present");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].name, "build");
+    }
+
+    #[test]
+    fn tool_call_updates_render_content_and_diffs() {
+        let mut state = AppState::new();
+        let workspace_id = Uuid::new_v4();
+        let thread = Thread::new(workspace_id, "Thread");
+        let thread_id = thread.id;
+        let mut workspace = Workspace::new("Workspace");
+        workspace.id = workspace_id;
+        workspace.add_thread(thread);
+        state.workspaces.push(workspace);
+        state.active_thread_id = Some(thread_id);
+
+        let tool_call = ToolCall::new("tool-1", "Read file")
+            .status(ToolCallStatus::InProgress)
+            .content(vec![ToolCallContent::from("Reading content")]);
+        state.apply_agent_event(
+            thread_id,
+            AgentEvent::Notification(SessionNotification::new(
+                SessionId::new("session-1"),
+                SessionUpdate::ToolCall(tool_call),
+            )),
+        );
+
+        let update = ToolCallUpdate::new(
+            "tool-1",
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Completed)
+                .content(vec![ToolCallContent::Diff(
+                    Diff::new("src/main.rs", "new line").old_text("old line"),
+                )]),
+        );
+        state.apply_agent_event(
+            thread_id,
+            AgentEvent::Notification(SessionNotification::new(
+                SessionId::new("session-1"),
+                SessionUpdate::ToolCallUpdate(update),
+            )),
+        );
+
+        let thread = state
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.get_thread(thread_id))
+            .expect("thread should exist");
+        let rendered = thread
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Tool: Read file"));
+        assert!(rendered.contains("Diff: src/main.rs"));
+        assert!(rendered.contains("-old line"));
+        assert!(rendered.contains("+new line"));
+    }
+
+    #[test]
+    fn workspace_relative_files_are_listed_for_thread() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("acui-files-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(temp_dir.join("src")).expect("should create dir");
+        std::fs::write(temp_dir.join("src/main.rs"), "fn main() {}").expect("should write file");
+
+        let mut state = AppState::new();
+        let mut workspace = Workspace::from_path(temp_dir.clone());
+        let thread = Thread::new(workspace.id, "Thread");
+        let thread_id = thread.id;
+        workspace.add_thread(thread);
+        state.workspaces.push(workspace);
+
+        let files = state.workspace_relative_files_for_thread(thread_id, 20);
+        assert!(files.iter().any(|entry| entry.ends_with("src/main.rs")));
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

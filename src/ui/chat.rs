@@ -1,14 +1,38 @@
 use crate::domain::Role;
 use crate::state::AppState;
-use agent_client_protocol::{SessionConfigKind, SessionConfigOption, SessionConfigSelectOptions};
+use agent_client_protocol::{
+    AvailableCommand, SessionConfigKind, SessionConfigOption, SessionConfigSelectOptions,
+};
 use gpui::prelude::*;
 use gpui::*;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SuggestionKind {
+    Slash,
+    File,
+}
+
+#[derive(Clone)]
+struct SuggestionItem {
+    display: String,
+    replacement: String,
+}
+
+struct SuggestionState {
+    kind: SuggestionKind,
+    start: usize,
+    items: Vec<SuggestionItem>,
+    selected: usize,
+}
 
 pub struct ChatView {
     app_state: Entity<AppState>,
     scroll_handle: UniformListScrollHandle,
     input_buffer: String,
     locked_to_bottom: bool,
+    suggestion_anchor: Option<(SuggestionKind, usize)>,
+    suggestion_selected: usize,
+    dismissed_suggestion: Option<(SuggestionKind, usize)>,
 }
 
 impl ChatView {
@@ -26,15 +50,37 @@ impl ChatView {
         .detach();
 
         cx.observe_keystrokes(|this, event, _window, cx| {
-            if event.keystroke.modifiers.control
-                || event.keystroke.modifiers.alt
-                || event.keystroke.modifiers.platform
-            {
-                return;
+            if let Some(suggestions) = this.compute_suggestions(cx) {
+                let key = event.keystroke.key.as_str();
+                if key == "escape" {
+                    this.dismissed_suggestion = Some((suggestions.kind, suggestions.start));
+                    cx.notify();
+                    return;
+                }
+                if key == "up" || (event.keystroke.modifiers.control && event.keystroke.key == "k")
+                {
+                    this.select_previous_suggestion(suggestions.items.len());
+                    cx.notify();
+                    return;
+                }
+                if key == "down"
+                    || (event.keystroke.modifiers.control && event.keystroke.key == "j")
+                {
+                    this.select_next_suggestion(suggestions.items.len());
+                    cx.notify();
+                    return;
+                }
+                if key == "tab" || (event.keystroke.modifiers.control && event.keystroke.key == "y")
+                {
+                    this.apply_suggestion(&suggestions);
+                    cx.notify();
+                    return;
+                }
             }
 
             if event.keystroke.key == "backspace" {
                 this.input_buffer.pop();
+                this.reconcile_suggestion_visibility();
                 cx.notify();
                 return;
             }
@@ -45,8 +91,15 @@ impl ChatView {
                     return;
                 }
 
+                if event.keystroke.modifiers.control {
+                    return;
+                }
+                if event.keystroke.modifiers.alt || event.keystroke.modifiers.platform {
+                    return;
+                }
                 if input.chars().any(|ch| !ch.is_control()) {
                     this.input_buffer.push_str(input);
+                    this.reconcile_suggestion_visibility();
                     cx.notify();
                 }
             }
@@ -58,6 +111,9 @@ impl ChatView {
             scroll_handle: UniformListScrollHandle::new(),
             input_buffer: String::new(),
             locked_to_bottom: true,
+            suggestion_anchor: None,
+            suggestion_selected: 0,
+            dismissed_suggestion: None,
         }
     }
 
@@ -83,6 +139,109 @@ impl ChatView {
         let max_y = base.max_offset().height;
         let y = base.offset().y;
         self.locked_to_bottom = (max_y - y).abs() <= px(2.0);
+    }
+
+    fn suggestion_anchor(&self) -> Option<(SuggestionKind, usize, String)> {
+        if self.input_buffer.starts_with('/') && !self.input_buffer.contains(char::is_whitespace) {
+            return Some((SuggestionKind::Slash, 0, self.input_buffer[1..].to_string()));
+        }
+
+        let token_start = self
+            .input_buffer
+            .rfind(char::is_whitespace)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let token = &self.input_buffer[token_start..];
+        token
+            .strip_prefix('@')
+            .map(|query| (SuggestionKind::File, token_start, query.to_string()))
+    }
+
+    fn reconcile_suggestion_visibility(&mut self) {
+        if self.dismissed_suggestion.is_some()
+            && self
+                .suggestion_anchor()
+                .map(|(kind, start, _)| (kind, start))
+                != self.dismissed_suggestion
+        {
+            self.dismissed_suggestion = None;
+        }
+    }
+
+    fn compute_suggestions(&mut self, cx: &Context<Self>) -> Option<SuggestionState> {
+        self.reconcile_suggestion_visibility();
+        let (kind, start, query) = self.suggestion_anchor()?;
+        if self.dismissed_suggestion == Some((kind, start)) {
+            return None;
+        }
+
+        let items = match kind {
+            SuggestionKind::Slash => {
+                let commands = self
+                    .app_state
+                    .read(cx)
+                    .active_thread_available_commands()
+                    .unwrap_or_default();
+                slash_suggestion_items(&commands, &query)
+            }
+            SuggestionKind::File => {
+                let Some(thread_id) = self.app_state.read(cx).active_thread_id else {
+                    return None;
+                };
+                let files = self
+                    .app_state
+                    .read(cx)
+                    .workspace_relative_files_for_thread(thread_id, 1024);
+                file_suggestion_items(&files, &query)
+            }
+        };
+        if items.is_empty() {
+            self.suggestion_anchor = None;
+            return None;
+        }
+
+        let anchor = (kind, start);
+        if self.suggestion_anchor != Some(anchor) {
+            self.suggestion_anchor = Some(anchor);
+            self.suggestion_selected = items.len().saturating_sub(1);
+        } else if self.suggestion_selected >= items.len() {
+            self.suggestion_selected = items.len().saturating_sub(1);
+        }
+
+        Some(SuggestionState {
+            kind,
+            start,
+            selected: self.suggestion_selected,
+            items,
+        })
+    }
+
+    fn select_previous_suggestion(&mut self, total: usize) {
+        if total == 0 {
+            return;
+        }
+        self.suggestion_selected = if self.suggestion_selected == 0 {
+            total - 1
+        } else {
+            self.suggestion_selected - 1
+        };
+    }
+
+    fn select_next_suggestion(&mut self, total: usize) {
+        if total == 0 {
+            return;
+        }
+        self.suggestion_selected = (self.suggestion_selected + 1) % total;
+    }
+
+    fn apply_suggestion(&mut self, state: &SuggestionState) {
+        let Some(item) = state.items.get(state.selected) else {
+            return;
+        };
+        self.input_buffer
+            .replace_range(state.start..self.input_buffer.len(), &item.replacement);
+        self.suggestion_anchor = None;
+        self.dismissed_suggestion = None;
     }
 }
 
@@ -195,6 +354,41 @@ impl Render for ChatView {
                     })),
             );
 
+        let suggestion_panel = if let Some(suggestions) = self.compute_suggestions(cx) {
+            let rows: Vec<AnyElement> = suggestions
+                .items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    div()
+                        .id(("suggestion-item", index))
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(if index == suggestions.selected {
+                            rgb(0x0e639c)
+                        } else {
+                            rgba(0x00000000)
+                        })
+                        .text_color(white())
+                        .child(item.display.clone())
+                        .into_any_element()
+                })
+                .collect();
+            div()
+                .id("chat-suggestion-list")
+                .w_full()
+                .overflow_y_scroll()
+                .max_h(px(180.0))
+                .p_2()
+                .bg(rgb(0x252526))
+                .border_t_1()
+                .border_color(rgb(0x3c3c3c))
+                .children(rows)
+        } else {
+            div().id("chat-suggestion-empty")
+        };
+
         let permission_panel = match (active_thread_id, permission_options) {
             (Some(thread_id), Some(options)) if !options.is_empty() => {
                 let option_buttons = options.into_iter().enumerate().map(|(index, option)| {
@@ -275,6 +469,7 @@ impl Render for ChatView {
             .h_full()
             .child(chat_content)
             .child(permission_panel)
+            .child(suggestion_panel)
             .child(input_box)
             .child(config_panel)
     }
@@ -352,4 +547,32 @@ fn render_config_option_row(
         }
         _ => div().w_full().child(title),
     }
+}
+
+fn slash_suggestion_items(commands: &[AvailableCommand], query: &str) -> Vec<SuggestionItem> {
+    let query = query.to_lowercase();
+    commands
+        .iter()
+        .filter(|command| {
+            query.is_empty()
+                || command.name.to_lowercase().contains(&query)
+                || command.description.to_lowercase().contains(&query)
+        })
+        .map(|command| SuggestionItem {
+            display: format!("/{} — {}", command.name, command.description),
+            replacement: format!("/{} ", command.name),
+        })
+        .collect()
+}
+
+fn file_suggestion_items(files: &[String], query: &str) -> Vec<SuggestionItem> {
+    let query = query.to_lowercase();
+    files
+        .iter()
+        .filter(|path| query.is_empty() || path.to_lowercase().contains(&query))
+        .map(|path| SuggestionItem {
+            display: path.clone(),
+            replacement: format!("@{} ", path),
+        })
+        .collect()
 }
