@@ -1,4 +1,5 @@
 use crate::state::AppState;
+use chrono::{DateTime, Utc};
 use gpui::prelude::*;
 use gpui::*;
 use std::collections::HashSet;
@@ -136,7 +137,23 @@ impl Render for SidebarView {
                             |(thread_index, thread)| {
                                 let thread_id = thread.id;
                                 let is_active = active_thread_id == Some(thread_id);
+                                let has_unread_stop = !is_active
+                                    && self.app_state.read(cx).thread_has_unread_stop(thread_id);
                                 let thread_dom_id = ws_index * 1000 + thread_index;
+                                let trailing = if has_unread_stop {
+                                    div()
+                                        .w(px(8.0))
+                                        .h(px(8.0))
+                                        .rounded_full()
+                                        .bg(rgb(0xff9d00))
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x8f8f8f))
+                                        .child(relative_time_short(thread.updated_at))
+                                        .into_any_element()
+                                };
 
                                 div()
                                     .id(("thread-item", thread_dom_id))
@@ -151,7 +168,15 @@ impl Render for SidebarView {
                                     })
                                     .text_color(rgb(0xcccccc))
                                     .cursor_pointer()
-                                    .child(thread.name)
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap_2()
+                                            .child(div().flex_1().child(thread.name))
+                                            .child(trailing),
+                                    )
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.app_state.update(cx, |state, cx| {
                                             state.set_active_thread(cx, thread_id);
@@ -166,5 +191,35 @@ impl Render for SidebarView {
                             .children(thread_list)
                     }),
             )
+    }
+}
+
+fn relative_time_short(timestamp: DateTime<Utc>) -> String {
+    let delta = (Utc::now() - timestamp).num_seconds().max(0);
+    if delta < 60 {
+        return format!("{delta}s");
+    }
+    if delta < 3_600 {
+        return format!("{}m", delta / 60);
+    }
+    if delta < 86_400 {
+        return format!("{}h", delta / 3_600);
+    }
+    if delta < 604_800 {
+        return format!("{}d", delta / 86_400);
+    }
+    format!("{}w", delta / 604_800)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relative_time_short;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn relative_time_short_formats_units() {
+        assert_eq!(relative_time_short(Utc::now() - Duration::seconds(12)), "12s");
+        assert_eq!(relative_time_short(Utc::now() - Duration::minutes(5)), "5m");
+        assert_eq!(relative_time_short(Utc::now() - Duration::hours(3)), "3h");
     }
 }
