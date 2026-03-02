@@ -6,9 +6,10 @@ use agent_client_protocol::{
 };
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -78,7 +79,7 @@ impl AcpController {
         let outgoing_compat = outgoing.compat_write();
 
         let (connection, handle_io) =
-            ClientSideConnection::new(client_impl, outgoing_compat, incoming_compat, |fut| {
+            ClientSideConnection::new(client_impl, outgoing_compat, incoming_compat, move |fut| {
                 tokio::task::spawn_local(fut);
             });
 
@@ -162,32 +163,88 @@ impl AcpController {
     pub async fn connect_from_config(
         config_path: impl AsRef<Path>,
         event_tx: mpsc::UnboundedSender<AgentEvent>,
-    ) -> anyhow::Result<(Self, tokio::process::Child)> {
+    ) -> anyhow::Result<(Self, Child)> {
         let config = AgentProcessConfig::from_path(config_path)?;
+        let (child, stdout, stdin) = spawn_agent_process(&config)?;
 
-        let mut cmd = tokio::process::Command::new(&config.command);
-        cmd.args(&config.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-
-        if let Some(cwd) = config.cwd {
-            cmd.current_dir(cwd);
-        }
-
-        let mut child = cmd.spawn()?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("agent process did not provide stdout"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("agent process did not provide stdin"))?;
-
-        let controller = Self::connect(stdout, stdin, event_tx).await?;
+        let (incoming, outgoing) = bridge_stdio(stdout, stdin);
+        let controller = Self::connect(incoming, outgoing, event_tx).await?;
         Ok((controller, child))
     }
+}
+
+fn spawn_agent_process(
+    config: &AgentProcessConfig,
+) -> anyhow::Result<(Child, ChildStdout, ChildStdin)> {
+    let mut cmd = std::process::Command::new(&config.command);
+    cmd.args(&config.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    if let Some(cwd) = &config.cwd {
+        cmd.current_dir(cwd);
+    }
+
+    let mut child = cmd.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("agent process did not provide stdout"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("agent process did not provide stdin"))?;
+    Ok((child, stdout, stdin))
+}
+
+fn bridge_stdio(
+    mut child_stdout: ChildStdout,
+    mut child_stdin: ChildStdin,
+) -> (DuplexStream, DuplexStream) {
+    let (incoming_read, mut incoming_write) = tokio::io::duplex(1024 * 1024);
+    let (mut outgoing_read, outgoing_write) = tokio::io::duplex(1024 * 1024);
+
+    std::thread::spawn(move || {
+        let mut buf = [0_u8; 8192];
+        loop {
+            match child_stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if futures::executor::block_on(async {
+                        incoming_write.write_all(&buf[..n]).await
+                    })
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = futures::executor::block_on(async { incoming_write.shutdown().await });
+    });
+
+    std::thread::spawn(move || {
+        let mut buf = [0_u8; 8192];
+        loop {
+            let read = futures::executor::block_on(async { outgoing_read.read(&mut buf).await });
+            let Ok(n) = read else {
+                break;
+            };
+            if n == 0 {
+                break;
+            }
+            if child_stdin.write_all(&buf[..n]).is_err() {
+                break;
+            }
+            if child_stdin.flush().is_err() {
+                break;
+            }
+        }
+    });
+
+    (incoming_read, outgoing_write)
 }
 
 #[derive(Debug, Deserialize)]
@@ -315,5 +372,31 @@ pub mod mock {
                 }
             })
             .await;
+    }
+
+    #[test]
+    fn process_spawn_from_config_does_not_require_tokio_reactor() {
+        let test_dir =
+            std::env::temp_dir().join(format!("acui-config-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).expect("should create temp test dir");
+        let config_path = test_dir.join("agent.toml");
+        std::fs::write(&config_path, "command = \"cat\"\nargs = []\n")
+            .expect("should write test config");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let config = AgentProcessConfig::from_path(&config_path).expect("config should parse");
+            spawn_agent_process(&config)
+        }));
+
+        assert!(
+            result.is_ok(),
+            "process spawn should not panic without a Tokio runtime"
+        );
+        if let Ok(Ok((mut child, _, _))) = result {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 }

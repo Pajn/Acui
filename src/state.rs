@@ -18,7 +18,7 @@ use agent_client_protocol::{
 struct ThreadAgentConnection {
     controller: Rc<AcpController>,
     session_id: SessionId,
-    _process: Option<tokio::process::Child>,
+    _process: Option<std::process::Child>,
 }
 
 pub struct AppState {
@@ -352,7 +352,7 @@ impl AppState {
         controller: AcpController,
         session_id: SessionId,
         config_options: Vec<SessionConfigOption>,
-        process: Option<tokio::process::Child>,
+        process: Option<std::process::Child>,
         rx: mpsc::UnboundedReceiver<AgentEvent>,
     ) {
         self.listen_to_agent_events(cx, thread_id, rx);
