@@ -1,16 +1,18 @@
 use agent_client_protocol::{
     self as acp, Agent, AgentSideConnection, AuthenticateRequest, AuthenticateResponse,
     AvailableCommand, AvailableCommandsUpdate, CancelNotification, Client, ContentBlock,
-    ContentChunk, Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest,
-    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, PromptRequest, PromptResponse, ReadTextFileRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionConfigOption,
-    SessionConfigSelectOption, SessionNotification, SessionUpdate, StopReason, ToolCall,
-    ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ContentChunk, CurrentModeUpdate, Implementation, InitializeRequest, InitializeResponse,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
+    PromptResponse, ReadTextFileRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    SessionConfigOption, SessionConfigSelectOption, SessionMode, SessionModeId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use async_trait::async_trait;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -18,6 +20,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 struct MockAgent {
     client: Rc<RefCell<Option<Rc<AgentSideConnection>>>>,
     cwd: PathBuf,
+    session_modes: Rc<RefCell<HashMap<String, String>>>,
 }
 
 impl MockAgent {
@@ -51,6 +54,7 @@ impl MockAgent {
             AvailableCommand::new("terminal", "Run a terminal command and report output"),
             AvailableCommand::new("read", "Read a file (usage: read <path>)"),
             AvailableCommand::new("write", "Write a file (usage: write <path> <content>)"),
+            AvailableCommand::new("plan", "Emit a sample execution plan"),
         ];
         self.client()?
             .session_notification(SessionNotification::new(
@@ -216,13 +220,42 @@ impl Agent for MockAgent {
 
     async fn new_session(&self, _args: NewSessionRequest) -> acp::Result<NewSessionResponse> {
         let session_id = acp::SessionId::new(format!("mock-session-{}", uuid::Uuid::new_v4()));
+        self.session_modes
+            .borrow_mut()
+            .insert(session_id.to_string(), "ask".to_string());
         self.send_available_commands(&session_id).await?;
-        Ok(NewSessionResponse::new(session_id).config_options(session_config_options("new")))
+        Ok(NewSessionResponse::new(session_id.clone())
+            .modes(mode_state("ask"))
+            .config_options(session_config_options("new")))
     }
 
     async fn load_session(&self, args: LoadSessionRequest) -> acp::Result<LoadSessionResponse> {
+        let current_mode = self
+            .session_modes
+            .borrow()
+            .get(&args.session_id.to_string())
+            .cloned()
+            .unwrap_or_else(|| "ask".to_string());
         self.send_available_commands(&args.session_id).await?;
-        Ok(LoadSessionResponse::new().config_options(session_config_options("loaded")))
+        Ok(LoadSessionResponse::new()
+            .modes(mode_state(current_mode))
+            .config_options(session_config_options("loaded")))
+    }
+
+    async fn set_session_mode(
+        &self,
+        args: SetSessionModeRequest,
+    ) -> acp::Result<SetSessionModeResponse> {
+        self.session_modes
+            .borrow_mut()
+            .insert(args.session_id.to_string(), args.mode_id.to_string());
+        self.client()?
+            .session_notification(SessionNotification::new(
+                args.session_id,
+                SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(args.mode_id)),
+            ))
+            .await?;
+        Ok(SetSessionModeResponse::new())
     }
 
     async fn prompt(&self, args: PromptRequest) -> acp::Result<PromptResponse> {
@@ -248,6 +281,26 @@ impl Agent for MockAgent {
                 self.handle_write_prompt(&args.session_id, path, content)
                     .await?;
             }
+        } else if trimmed == "plan" {
+            let plan = Plan::new(vec![
+                PlanEntry::new(
+                    "Inspect workspace files",
+                    PlanEntryPriority::High,
+                    PlanEntryStatus::Completed,
+                ),
+                PlanEntry::new(
+                    "Patch implementation",
+                    PlanEntryPriority::High,
+                    PlanEntryStatus::InProgress,
+                ),
+            ]);
+            self.client()?
+                .session_notification(SessionNotification::new(
+                    args.session_id.clone(),
+                    SessionUpdate::Plan(plan),
+                ))
+                .await?;
+            self.send_text(&args.session_id, "plan updated").await?;
         } else {
             self.send_text(&args.session_id, format!("echo: {trimmed}"))
                 .await?;
@@ -293,12 +346,23 @@ fn session_config_options(current: &str) -> Vec<SessionConfigOption> {
     )]
 }
 
+fn mode_state(current_mode: impl Into<SessionModeId>) -> SessionModeState {
+    SessionModeState::new(
+        current_mode,
+        vec![
+            SessionMode::new("ask", "Ask"),
+            SessionMode::new("code", "Code"),
+        ],
+    )
+}
+
 fn main() {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let client = Rc::new(RefCell::new(None));
     let agent = MockAgent {
         client: client.clone(),
         cwd,
+        session_modes: Rc::new(RefCell::new(HashMap::new())),
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()

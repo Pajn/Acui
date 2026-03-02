@@ -177,3 +177,48 @@ fn wait_for_state(
     }
     panic!("timed out waiting for expected state");
 }
+
+#[gpui::test]
+async fn mock_agent_exposes_modes_and_plan_updates(cx: &mut TestAppContext) {
+    let temp_dir = std::env::temp_dir().join(format!("acui-mock-plan-{}", uuid::Uuid::new_v4()));
+    let workspace = temp_dir.join("workspace");
+    let data_dir = temp_dir.join("data");
+    fs::create_dir_all(&workspace).expect("should create workspace");
+    fs::create_dir_all(&data_dir).expect("should create data dir");
+    let agent_config_path = temp_dir.join("acui_agent.toml");
+    write_agent_config(&agent_config_path, &workspace);
+
+    let state = create_state_entity(cx, data_dir.clone(), agent_config_path.clone());
+    let thread_id = state.update(cx, |state, cx| {
+        let workspace_id = state.add_workspace_from_path(cx, workspace.clone());
+        state
+            .add_thread(cx, workspace_id, "Thread 1")
+            .expect("thread should be created")
+    });
+
+    wait_for_state(cx, &state, |state| {
+        state
+            .active_thread_modes()
+            .is_some_and(|modes| modes.current_mode_id.to_string() == "ask")
+    });
+
+    state.update(cx, |state, cx| {
+        state.set_session_mode(cx, thread_id, "code".to_string());
+    });
+    wait_for_state(cx, &state, |state| {
+        state
+            .active_thread_modes()
+            .is_some_and(|modes| modes.current_mode_id.to_string() == "code")
+    });
+
+    state.update(cx, |state, cx| {
+        state.send_user_message(cx, thread_id, "plan");
+    });
+    wait_for_state(cx, &state, |state| {
+        state
+            .active_thread_plan()
+            .is_some_and(|plan| !plan.entries.is_empty())
+    });
+
+    let _ = fs::remove_dir_all(temp_dir);
+}

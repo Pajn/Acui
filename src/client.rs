@@ -4,10 +4,11 @@ use agent_client_protocol::{
     KillTerminalCommandResponse, LoadSessionRequest, NewSessionRequest, PromptRequest,
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionConfigId,
-    SessionConfigOption, SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, StopReason, TerminalExitStatus, TerminalOutputRequest,
-    TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
-    WriteTextFileRequest, WriteTextFileResponse,
+    SessionConfigOption, SessionConfigValueId, SessionId, SessionModeId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    StopReason, TerminalExitStatus, TerminalOutputRequest, TerminalOutputResponse,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -556,7 +557,7 @@ impl AcpController {
     pub async fn initialize_session(
         &self,
         cwd: impl Into<PathBuf>,
-    ) -> anyhow::Result<(SessionId, Vec<SessionConfigOption>)> {
+    ) -> anyhow::Result<(SessionId, Vec<SessionConfigOption>, Option<SessionModeState>)> {
         let _ = self.connection.initialize(acp_initialize_request()).await?;
 
         let response = self
@@ -567,6 +568,7 @@ impl AcpController {
         Ok((
             response.session_id,
             response.config_options.unwrap_or_default(),
+            response.modes,
         ))
     }
 
@@ -574,13 +576,13 @@ impl AcpController {
         &self,
         session_id: SessionId,
         cwd: impl Into<PathBuf>,
-    ) -> anyhow::Result<Vec<SessionConfigOption>> {
+    ) -> anyhow::Result<(Vec<SessionConfigOption>, Option<SessionModeState>)> {
         let _ = self.connection.initialize(acp_initialize_request()).await?;
         let response = self
             .connection
             .load_session(LoadSessionRequest::new(session_id, cwd.into()))
             .await?;
-        Ok(response.config_options.unwrap_or_default())
+        Ok((response.config_options.unwrap_or_default(), response.modes))
     }
 
     pub async fn set_session_config_option(
@@ -606,6 +608,18 @@ impl AcpController {
         let prompt = PromptRequest::new(session_id, vec![ContentBlock::from(content)]);
         let response = self.connection.prompt(prompt).await?;
         Ok(response.stop_reason)
+    }
+
+    pub async fn set_session_mode(
+        &self,
+        session_id: SessionId,
+        mode_id: SessionModeId,
+    ) -> anyhow::Result<()> {
+        let _ = self
+            .connection
+            .set_session_mode(SetSessionModeRequest::new(session_id, mode_id))
+            .await?;
+        Ok(())
     }
 
     pub async fn connect_from_config(

@@ -2,6 +2,7 @@ use crate::domain::Role;
 use crate::state::AppState;
 use agent_client_protocol::{
     AvailableCommand, SessionConfigKind, SessionConfigOption, SessionConfigSelectOptions,
+    SessionModeState,
 };
 use gpui::prelude::*;
 use gpui::*;
@@ -393,13 +394,14 @@ impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_scroll_lock();
 
-        let (active_thread_id, messages, permission_options, config_options) = {
+        let (active_thread_id, messages, permission_options, config_options, modes) = {
             let state = self.app_state.read(cx);
             (
                 state.active_thread_id,
                 state.active_thread_messages(),
                 state.active_thread_permission_options(),
                 state.active_thread_config_options(),
+                state.active_thread_modes(),
             )
         };
 
@@ -608,6 +610,43 @@ impl Render for ChatView {
             _ => div(),
         };
 
+        let mode_panel = match (active_thread_id, modes) {
+            (Some(thread_id), Some(SessionModeState { current_mode_id, available_modes, .. }))
+                if !available_modes.is_empty() =>
+            {
+                let buttons = available_modes.into_iter().enumerate().map(|(index, mode)| {
+                    let mode_id = mode.id.to_string();
+                    let is_current = mode_id == current_mode_id.to_string();
+                    div()
+                        .id(("session-mode", index))
+                        .bg(if is_current { rgb(0x0e639c) } else { rgb(0x3c3c3c) })
+                        .text_color(white())
+                        .rounded_md()
+                        .px_2()
+                        .py_1()
+                        .cursor_pointer()
+                        .child(mode.name)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.app_state.update(cx, |state, cx| {
+                                state.set_session_mode(cx, thread_id, mode_id.clone());
+                            });
+                        }))
+                });
+                div()
+                    .w_full()
+                    .p_2()
+                    .bg(rgb(0x1f2933))
+                    .border_t_1()
+                    .border_color(rgb(0x3c3c3c))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().text_color(rgb(0xdddddd)).child("Session mode"))
+                    .child(div().flex().gap_1().flex_wrap().children(buttons))
+            }
+            _ => div(),
+        };
+
         div()
             .flex()
             .flex_col()
@@ -617,6 +656,7 @@ impl Render for ChatView {
             .child(permission_panel)
             .child(suggestion_panel)
             .child(input_box)
+            .child(mode_panel)
             .child(config_panel)
     }
 }

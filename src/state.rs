@@ -14,8 +14,9 @@ use crate::persistence::AppPersistence;
 use agent_client_protocol::{
     AvailableCommand, ContentBlock, ContentChunk, PermissionOption, PermissionOptionId,
     RequestPermissionOutcome, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-    SessionConfigValueId, SessionId, SessionModeState, SessionNotification, SessionUpdate,
-    StopReason, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind, Plan,
+    SessionConfigValueId, SessionId, SessionModeId, SessionModeState, SessionNotification,
+    SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind,
+    Plan,
 };
 use ignore::WalkBuilder;
 
@@ -265,6 +266,36 @@ impl AppState {
         .detach();
     }
 
+    pub fn set_session_mode(
+        &mut self,
+        cx: &mut Context<Self>,
+        thread_id: Uuid,
+        mode_id: String,
+    ) {
+        let Some(connection) = self.agent_connections.get(&thread_id) else {
+            return;
+        };
+        let controller = Rc::clone(&connection.controller);
+        let session_id = connection.session_id.clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let result = controller
+                        .set_session_mode(session_id, SessionModeId::new(mode_id.clone()))
+                        .await;
+                    if let Err(err) = result {
+                        let message = format!("Failed to set session mode: {err}");
+                        let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                            state.push_system_message(cx, thread_id, message);
+                        });
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
     pub fn send_user_message(&mut self, cx: &mut Context<Self>, thread_id: Uuid, content: &str) {
         if content.trim().is_empty() {
             return;
@@ -354,7 +385,9 @@ impl AppState {
                                     .load_session(session_id.clone(), cwd.clone())
                                     .await
                                 {
-                                    Ok(config_options) => Some((session_id, config_options)),
+                                    Ok((config_options, modes)) => {
+                                        Some((session_id, config_options, modes))
+                                    }
                                     Err(err) => {
                                         let message = format!("Failed to load ACP session: {err}");
                                         let _ = this.update(&mut cx, |state: &mut AppState, cx| {
@@ -374,7 +407,7 @@ impl AppState {
                             };
 
                             match session_result {
-                                Ok((session_id, config_options)) => {
+                                Ok((session_id, config_options, modes)) => {
                                     let _ = this.update(&mut cx, |state: &mut AppState, cx| {
                                         state.attach_connection(
                                             cx,
@@ -382,6 +415,7 @@ impl AppState {
                                             controller,
                                             session_id,
                                             config_options,
+                                            modes,
                                             Some(process),
                                             event_rx,
                                         );
@@ -416,6 +450,7 @@ impl AppState {
         controller: AcpController,
         session_id: SessionId,
         config_options: Vec<SessionConfigOption>,
+        modes: Option<SessionModeState>,
         process: Option<std::process::Child>,
         rx: mpsc::UnboundedReceiver<AgentEvent>,
     ) {
@@ -432,6 +467,9 @@ impl AppState {
             },
         );
         self.thread_config_options.insert(thread_id, config_options);
+        if let Some(modes) = modes {
+            self.thread_modes.insert(thread_id, modes);
+        }
         self.persist_state();
         cx.notify();
     }
@@ -568,6 +606,11 @@ impl AppState {
             SessionUpdate::CurrentModeUpdate(update) => {
                 if let Some(modes) = self.thread_modes.get_mut(&thread_id) {
                     modes.current_mode_id = update.current_mode_id;
+                } else {
+                    self.thread_modes.insert(
+                        thread_id,
+                        SessionModeState::new(update.current_mode_id, Vec::new()),
+                    );
                 }
             }
             _ => {}
