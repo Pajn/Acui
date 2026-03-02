@@ -1,7 +1,8 @@
 use agent_client_protocol::{
     self as acp, Agent, ClientSideConnection, ContentBlock, InitializeRequest, LoadSessionRequest,
     NewSessionRequest, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SessionId, SessionNotification, StopReason,
+    RequestPermissionResponse, SessionConfigId, SessionConfigOption, SessionConfigValueId,
+    SessionId, SessionNotification, SetSessionConfigOptionRequest, StopReason,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -97,7 +98,10 @@ impl AcpController {
         Ok(Self { connection })
     }
 
-    pub async fn initialize_session(&self, cwd: impl Into<PathBuf>) -> anyhow::Result<SessionId> {
+    pub async fn initialize_session(
+        &self,
+        cwd: impl Into<PathBuf>,
+    ) -> anyhow::Result<(SessionId, Vec<SessionConfigOption>)> {
         let _ = self
             .connection
             .initialize(InitializeRequest::new(acp::ProtocolVersion::V1))
@@ -108,23 +112,41 @@ impl AcpController {
             .new_session(NewSessionRequest::new(cwd.into()))
             .await?;
 
-        Ok(response.session_id)
+        Ok((
+            response.session_id,
+            response.config_options.unwrap_or_default(),
+        ))
     }
 
     pub async fn load_session(
         &self,
         session_id: SessionId,
         cwd: impl Into<PathBuf>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<SessionConfigOption>> {
         let _ = self
             .connection
             .initialize(InitializeRequest::new(acp::ProtocolVersion::V1))
             .await?;
-        let _ = self
+        let response = self
             .connection
             .load_session(LoadSessionRequest::new(session_id, cwd.into()))
             .await?;
-        Ok(())
+        Ok(response.config_options.unwrap_or_default())
+    }
+
+    pub async fn set_session_config_option(
+        &self,
+        session_id: SessionId,
+        config_id: SessionConfigId,
+        value: SessionConfigValueId,
+    ) -> anyhow::Result<Vec<SessionConfigOption>> {
+        let response = self
+            .connection
+            .set_session_config_option(SetSessionConfigOptionRequest::new(
+                session_id, config_id, value,
+            ))
+            .await?;
+        Ok(response.config_options)
     }
 
     pub async fn send_prompt(

@@ -1,5 +1,6 @@
 use crate::domain::Role;
 use crate::state::AppState;
+use agent_client_protocol::{SessionConfigKind, SessionConfigOption, SessionConfigSelectOptions};
 use gpui::prelude::*;
 use gpui::*;
 
@@ -89,12 +90,13 @@ impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_scroll_lock();
 
-        let (active_thread_id, messages, permission_options) = {
+        let (active_thread_id, messages, permission_options, config_options) = {
             let state = self.app_state.read(cx);
             (
                 state.active_thread_id,
                 state.active_thread_messages(),
                 state.active_thread_permission_options(),
+                state.active_thread_config_options(),
             )
         };
 
@@ -243,6 +245,29 @@ impl Render for ChatView {
             _ => div(),
         };
 
+        let config_panel = match (active_thread_id, config_options) {
+            (Some(thread_id), Some(options)) if !options.is_empty() => {
+                let option_rows = options
+                    .into_iter()
+                    .enumerate()
+                    .map(|(option_index, option)| {
+                        render_config_option_row(cx, thread_id, option_index, option)
+                    });
+                div()
+                    .w_full()
+                    .p_2()
+                    .bg(rgb(0x1f2933))
+                    .border_t_1()
+                    .border_color(rgb(0x3c3c3c))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().text_color(rgb(0xdddddd)).child("Session options"))
+                    .children(option_rows)
+            }
+            _ => div(),
+        };
+
         div()
             .flex()
             .flex_col()
@@ -251,5 +276,80 @@ impl Render for ChatView {
             .child(chat_content)
             .child(permission_panel)
             .child(input_box)
+            .child(config_panel)
+    }
+}
+
+fn render_config_option_row(
+    cx: &Context<ChatView>,
+    thread_id: uuid::Uuid,
+    option_index: usize,
+    option: SessionConfigOption,
+) -> impl IntoElement {
+    let option_id = option.id.to_string();
+    let title = div().text_color(rgb(0xdddddd)).child(option.name);
+    match option.kind {
+        SessionConfigKind::Select(select) => {
+            let entries = match select.options {
+                SessionConfigSelectOptions::Ungrouped(values) => values
+                    .into_iter()
+                    .map(|entry| (entry.value.to_string(), entry.name))
+                    .collect::<Vec<_>>(),
+                SessionConfigSelectOptions::Grouped(groups) => groups
+                    .into_iter()
+                    .flat_map(|group| {
+                        group.options.into_iter().map(move |entry| {
+                            (
+                                entry.value.to_string(),
+                                format!("{} / {}", group.group, entry.name),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            let current_value = select.current_value.to_string();
+            let value_buttons =
+                entries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(value_index, (value_id, name))| {
+                        let is_active = value_id == current_value;
+                        div()
+                            .id(("session-config-value", option_index * 100 + value_index))
+                            .bg(if is_active {
+                                rgb(0x0e639c)
+                            } else {
+                                rgb(0x3c3c3c)
+                            })
+                            .text_color(white())
+                            .rounded_md()
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .child(name)
+                            .on_click(cx.listener({
+                                let option_id = option_id.clone();
+                                move |this, _, _, cx| {
+                                    this.app_state.update(cx, |state, cx| {
+                                        state.set_session_config_option(
+                                            cx,
+                                            thread_id,
+                                            option_id.clone(),
+                                            value_id.clone(),
+                                        );
+                                    });
+                                }
+                            }))
+                    });
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(title)
+                .child(div().flex().gap_1().flex_wrap().children(value_buttons))
+        }
+        _ => div().w_full().child(title),
     }
 }

@@ -11,7 +11,8 @@ use crate::domain::{Message, Role, Thread, Workspace};
 use crate::persistence::AppPersistence;
 use agent_client_protocol::{
     ContentBlock, ContentChunk, PermissionOption, PermissionOptionId, RequestPermissionOutcome,
-    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, StopReason,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigValueId,
+    SessionId, SessionNotification, SessionUpdate, StopReason,
 };
 
 struct ThreadAgentConnection {
@@ -27,6 +28,7 @@ pub struct AppState {
     mock_event_senders: HashMap<Uuid, mpsc::UnboundedSender<AgentEvent>>,
     agent_connections: HashMap<Uuid, ThreadAgentConnection>,
     pending_permissions: HashMap<Uuid, PermissionRequestEvent>,
+    thread_config_options: HashMap<Uuid, Vec<SessionConfigOption>>,
     persistence: Option<AppPersistence>,
     agent_config_path: Option<PathBuf>,
 }
@@ -51,6 +53,7 @@ impl AppState {
             mock_event_senders: HashMap::new(),
             agent_connections: HashMap::new(),
             pending_permissions: HashMap::new(),
+            thread_config_options: HashMap::new(),
             persistence,
             agent_config_path,
         }
@@ -140,6 +143,11 @@ impl AppState {
             .map(|request| request.options.clone())
     }
 
+    pub fn active_thread_config_options(&self) -> Option<Vec<SessionConfigOption>> {
+        let thread_id = self.active_thread_id?;
+        self.thread_config_options.get(&thread_id).cloned()
+    }
+
     pub fn resolve_permission(
         &mut self,
         cx: &mut Context<Self>,
@@ -149,6 +157,51 @@ impl AppState {
         if self.resolve_permission_choice(thread_id, option_id) {
             cx.notify();
         }
+    }
+
+    pub fn set_session_config_option(
+        &mut self,
+        cx: &mut Context<Self>,
+        thread_id: Uuid,
+        config_id: String,
+        value: String,
+    ) {
+        let Some(connection) = self.agent_connections.get(&thread_id) else {
+            return;
+        };
+        let controller = Rc::clone(&connection.controller);
+        let session_id = connection.session_id.clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let result = controller
+                        .set_session_config_option(
+                            session_id,
+                            SessionConfigId::new(config_id),
+                            SessionConfigValueId::new(value),
+                        )
+                        .await;
+                    match result {
+                        Ok(config_options) => {
+                            let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                state
+                                    .thread_config_options
+                                    .insert(thread_id, config_options);
+                                cx.notify();
+                            });
+                        }
+                        Err(err) => {
+                            let message = format!("Failed to set session option: {err}");
+                            let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                state.push_system_message(cx, thread_id, message);
+                            });
+                        }
+                    }
+                }
+            },
+        )
+        .detach();
     }
 
     pub fn send_user_message(&mut self, cx: &mut Context<Self>, thread_id: Uuid, content: &str) {
@@ -237,7 +290,7 @@ impl AppState {
                                     .load_session(session_id.clone(), cwd.clone())
                                     .await
                                 {
-                                    Ok(()) => Some(session_id),
+                                    Ok(config_options) => Some((session_id, config_options)),
                                     Err(err) => {
                                         let message = format!("Failed to load ACP session: {err}");
                                         let _ = this.update(&mut cx, |state: &mut AppState, cx| {
@@ -250,20 +303,21 @@ impl AppState {
                                 None
                             };
 
-                            let session_result = if let Some(session_id) = loaded_session_id {
-                                Ok(session_id)
+                            let session_result = if let Some(session_data) = loaded_session_id {
+                                Ok(session_data)
                             } else {
                                 controller.initialize_session(cwd).await
                             };
 
                             match session_result {
-                                Ok(session_id) => {
+                                Ok((session_id, config_options)) => {
                                     let _ = this.update(&mut cx, |state: &mut AppState, cx| {
                                         state.attach_connection(
                                             cx,
                                             thread_id,
                                             controller,
                                             session_id,
+                                            config_options,
                                             Some(process),
                                             event_rx,
                                         );
@@ -297,6 +351,7 @@ impl AppState {
         thread_id: Uuid,
         controller: AcpController,
         session_id: SessionId,
+        config_options: Vec<SessionConfigOption>,
         process: Option<tokio::process::Child>,
         rx: mpsc::UnboundedReceiver<AgentEvent>,
     ) {
@@ -312,6 +367,7 @@ impl AppState {
                 _process: process,
             },
         );
+        self.thread_config_options.insert(thread_id, config_options);
         self.persist_state();
         cx.notify();
     }
@@ -359,6 +415,11 @@ impl AppState {
             AgentEvent::Notification(notification) => {
                 if let Some(chunk) = extract_text_from_notification(&notification) {
                     self.append_agent_chunk(thread_id, &chunk);
+                }
+                if let Some(config_options) =
+                    extract_config_options_from_notification(&notification)
+                {
+                    self.thread_config_options.insert(thread_id, config_options);
                 }
             }
             AgentEvent::PermissionRequest(request) => {
@@ -473,6 +534,15 @@ pub fn extract_text_from_notification(notification: &SessionNotification) -> Opt
     }
 }
 
+pub fn extract_config_options_from_notification(
+    notification: &SessionNotification,
+) -> Option<Vec<SessionConfigOption>> {
+    match &notification.update {
+        SessionUpdate::ConfigOptionUpdate(update) => Some(update.config_options.clone()),
+        _ => None,
+    }
+}
+
 fn stop_reason_label(stop_reason: StopReason) -> &'static str {
     match stop_reason {
         StopReason::EndTurn => "end_turn",
@@ -487,7 +557,7 @@ fn stop_reason_label(stop_reason: StopReason) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::PermissionOptionKind;
+    use agent_client_protocol::{ConfigOptionUpdate, PermissionOptionKind, SessionConfigOption};
 
     #[test]
     fn incoming_agent_events_update_state() {
@@ -578,5 +648,26 @@ mod tests {
             RequestPermissionOutcome::Cancelled => panic!("expected selected outcome"),
             _ => panic!("expected selected outcome"),
         }
+    }
+
+    #[test]
+    fn config_option_update_is_extracted_from_notification() {
+        let config_option = SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "default",
+            vec![agent_client_protocol::SessionConfigSelectOption::new(
+                "default", "Default",
+            )],
+        );
+        let notification = SessionNotification::new(
+            SessionId::new("session-1"),
+            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(vec![config_option])),
+        );
+
+        let extracted = extract_config_options_from_notification(&notification)
+            .expect("config option update should be extracted");
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].id.to_string(), "mode");
     }
 }
