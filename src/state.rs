@@ -1,5 +1,6 @@
 use gpui::{Context, Task};
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Instant;
@@ -39,23 +40,34 @@ pub struct AppState {
     thread_modes: HashMap<Uuid, SessionModeState>,
     prompt_started_at: HashMap<Uuid, Instant>,
     unread_stopped_threads: HashSet<Uuid>,
+    log_file: Option<PathBuf>,
     persistence: Option<AppPersistence>,
     agent_config_path: Option<PathBuf>,
 }
 
 impl AppState {
     pub fn new() -> Self {
-        Self::with_parts(None, None)
+        Self::with_parts(None, None, None)
     }
 
     pub fn new_with_config(config: AppConfig) -> Self {
+        let AppConfig {
+            data_dir,
+            agent_config,
+            log_file,
+        } = config;
         Self::with_parts(
-            Some(AppPersistence::new(config.data_dir)),
-            config.agent_config,
+            Some(AppPersistence::new(data_dir)),
+            agent_config,
+            log_file,
         )
     }
 
-    fn with_parts(persistence: Option<AppPersistence>, agent_config_path: Option<PathBuf>) -> Self {
+    fn with_parts(
+        persistence: Option<AppPersistence>,
+        agent_config_path: Option<PathBuf>,
+        log_file: Option<PathBuf>,
+    ) -> Self {
         Self {
             workspaces: Vec::new(),
             active_thread_id: None,
@@ -71,6 +83,7 @@ impl AppState {
             thread_modes: HashMap::new(),
             prompt_started_at: HashMap::new(),
             unread_stopped_threads: HashSet::new(),
+            log_file,
             persistence,
             agent_config_path,
         }
@@ -256,6 +269,8 @@ impl AppState {
         if content.trim().is_empty() {
             return;
         }
+
+        self.append_log_line("to_agent", thread_id, content);
 
         if let Some(thread) = self.find_thread_mut(thread_id) {
             thread.add_message(Message::new(thread_id, Role::User, content));
@@ -525,6 +540,7 @@ impl AppState {
     }
 
     fn apply_session_update(&mut self, thread_id: Uuid, update: SessionUpdate) {
+        self.log_session_update(thread_id, &update);
         match update {
             SessionUpdate::AgentMessageChunk(ContentChunk {
                 content: ContentBlock::Text(text),
@@ -646,6 +662,35 @@ impl AppState {
         if let Some(thread) = self.find_thread_mut(thread_id) {
             thread.add_message(Message::new(thread_id, Role::System, content));
             cx.notify();
+        }
+    }
+
+    fn append_log_line(&self, direction: &str, thread_id: Uuid, payload: &str) {
+        let Some(log_file) = &self.log_file else {
+            return;
+        };
+        if let Some(parent) = log_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file)
+        else {
+            return;
+        };
+        let record = serde_json::json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "direction": direction,
+            "thread_id": thread_id.to_string(),
+            "payload": payload,
+        });
+        let _ = writeln!(file, "{record}");
+    }
+
+    fn log_session_update(&self, thread_id: Uuid, update: &SessionUpdate) {
+        if let Ok(payload) = serde_json::to_string(update) {
+            self.append_log_line("from_agent", thread_id, &payload);
         }
     }
 
@@ -1089,6 +1134,21 @@ mod tests {
         assert!(files.iter().any(|entry| entry.ends_with("src/main.rs")));
         assert!(!files.iter().any(|entry| entry.ends_with("ignored.txt")));
         assert!(!files.iter().any(|entry| entry.contains("ignored_dir")));
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn append_log_line_writes_json_records() {
+        let temp_dir = std::env::temp_dir().join(format!("acui-log-test-{}", uuid::Uuid::new_v4()));
+        let log_path = temp_dir.join("acui.log");
+        let state = AppState::with_parts(None, None, Some(log_path.clone()));
+
+        state.append_log_line("to_agent", uuid::Uuid::new_v4(), "hello");
+        state.append_log_line("from_agent", uuid::Uuid::new_v4(), "{\"ok\":true}");
+
+        let raw = std::fs::read_to_string(&log_path).expect("log should exist");
+        assert!(raw.contains("\"direction\":\"to_agent\""));
+        assert!(raw.contains("\"direction\":\"from_agent\""));
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

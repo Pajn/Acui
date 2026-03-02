@@ -28,6 +28,7 @@ fn create_state_entity(
             AppState::new_with_config(AppConfig {
                 data_dir,
                 agent_config: Some(agent_config),
+                log_file: None,
             })
         })
     })
@@ -134,6 +135,7 @@ async fn persisted_thread_reconnect_uses_load_session(cx: &mut TestAppContext) {
             let mut state = AppState::new_with_config(AppConfig {
                 data_dir: data_dir.clone(),
                 agent_config: Some(agent_config_path.clone()),
+                log_file: None,
             });
             state
                 .restore_persisted_state(cx)

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub struct AppConfig {
     pub data_dir: PathBuf,
     pub agent_config: Option<PathBuf>,
+    pub log_file: Option<PathBuf>,
 }
 
 impl Default for AppConfig {
@@ -12,6 +13,7 @@ impl Default for AppConfig {
         Self {
             data_dir: default_data_dir(),
             agent_config: None,
+            log_file: None,
         }
     }
 }
@@ -20,6 +22,7 @@ impl Default for AppConfig {
 struct AppConfigFile {
     data_dir: Option<PathBuf>,
     agent_config: Option<PathBuf>,
+    log_file: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -35,6 +38,7 @@ impl AppConfig {
         Ok(Self {
             data_dir: parsed.data_dir.unwrap_or_else(default_data_dir),
             agent_config: parsed.agent_config,
+            log_file: parsed.log_file,
         })
     }
 }
