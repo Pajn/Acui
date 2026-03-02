@@ -1,10 +1,13 @@
 #![recursion_limit = "1024"]
 
 mod client;
+mod config;
 mod domain;
+mod persistence;
 mod state;
 mod ui;
 
+use config::AppConfig;
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
 use state::AppState;
 use ui::layout::WorkspaceLayout;
@@ -39,10 +42,22 @@ fn main() {
 
     application.run(|cx: &mut App| {
         let app_state = cx.new(|cx| {
-            let mut state = AppState::new();
-            let workspace_path = std::env::current_dir().unwrap_or_else(|_| ".".into());
-            let ws_id = state.add_workspace_from_path(cx, workspace_path);
-            let _ = state.add_thread(cx, ws_id, "Thread 1");
+            let config = AppConfig::load().unwrap_or_else(|err| {
+                eprintln!("failed to load acui.toml, using defaults: {err}");
+                AppConfig::default()
+            });
+            let mut state = AppState::new_with_config(config);
+            if let Err(err) = state.restore_persisted_state(cx) {
+                eprintln!("failed to restore persisted state: {err}");
+            }
+            if let Some(active_thread_id) = state.active_thread_id {
+                state.set_active_thread(cx, active_thread_id);
+            }
+            if state.workspaces.is_empty() {
+                let workspace_path = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                let ws_id = state.add_workspace_from_path(cx, workspace_path);
+                let _ = state.add_thread(cx, ws_id, "Thread 1");
+            }
             state
         });
         cx.set_global(GlobalAppState(app_state.clone()));

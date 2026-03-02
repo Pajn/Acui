@@ -1,7 +1,8 @@
 use agent_client_protocol::{
-    self as acp, Agent, ClientSideConnection, ContentBlock, InitializeRequest, NewSessionRequest,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionId, SessionNotification, StopReason,
+    self as acp, Agent, ClientSideConnection, ContentBlock, InitializeRequest, LoadSessionRequest,
+    NewSessionRequest, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
+    StopReason,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -101,6 +102,22 @@ impl AcpController {
             .await?;
 
         Ok(response.session_id)
+    }
+
+    pub async fn load_session(
+        &self,
+        session_id: SessionId,
+        cwd: impl Into<PathBuf>,
+    ) -> anyhow::Result<()> {
+        let _ = self
+            .connection
+            .initialize(InitializeRequest::new(acp::ProtocolVersion::V1))
+            .await?;
+        let _ = self
+            .connection
+            .load_session(LoadSessionRequest::new(session_id, cwd.into()))
+            .await?;
+        Ok(())
     }
 
     pub async fn send_prompt(

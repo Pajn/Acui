@@ -6,7 +6,9 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::client::{AcpController, AgentEvent};
+use crate::config::AppConfig;
 use crate::domain::{Message, Role, Thread, Workspace};
+use crate::persistence::AppPersistence;
 use agent_client_protocol::{
     ContentBlock, ContentChunk, SessionId, SessionNotification, SessionUpdate, StopReason,
 };
@@ -23,23 +25,53 @@ pub struct AppState {
     agent_tasks: HashMap<Uuid, Task<()>>,
     mock_event_senders: HashMap<Uuid, mpsc::UnboundedSender<AgentEvent>>,
     agent_connections: HashMap<Uuid, ThreadAgentConnection>,
+    persistence: Option<AppPersistence>,
+    agent_config_path: Option<PathBuf>,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        Self::with_parts(None, None)
+    }
+
+    pub fn new_with_config(config: AppConfig) -> Self {
+        Self::with_parts(
+            Some(AppPersistence::new(config.data_dir)),
+            config.agent_config,
+        )
+    }
+
+    fn with_parts(persistence: Option<AppPersistence>, agent_config_path: Option<PathBuf>) -> Self {
         Self {
             workspaces: Vec::new(),
             active_thread_id: None,
             agent_tasks: HashMap::new(),
             mock_event_senders: HashMap::new(),
             agent_connections: HashMap::new(),
+            persistence,
+            agent_config_path,
         }
+    }
+
+    pub fn restore_persisted_state(&mut self, cx: &mut Context<Self>) -> anyhow::Result<()> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        self.workspaces = persistence.load()?;
+        self.active_thread_id = self
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.threads.first())
+            .map(|thread| thread.id);
+        cx.notify();
+        Ok(())
     }
 
     pub fn add_workspace(&mut self, cx: &mut Context<Self>, name: &str) -> Uuid {
         let workspace = Workspace::new(name);
         let id = workspace.id;
         self.workspaces.push(workspace);
+        self.persist_state();
         cx.notify();
         id
     }
@@ -48,6 +80,7 @@ impl AppState {
         let workspace = Workspace::from_path(path);
         let id = workspace.id;
         self.workspaces.push(workspace);
+        self.persist_state();
         cx.notify();
         id
     }
@@ -68,12 +101,22 @@ impl AppState {
         self.listen_to_agent_events(cx, thread_id, rx);
         self.mock_event_senders.insert(thread_id, tx);
 
+        if let Some(config_path) = self.agent_config_path.clone() {
+            self.connect_thread_to_agent_config(cx, thread_id, config_path);
+        }
+
+        self.persist_state();
         cx.notify();
         Some(thread_id)
     }
 
     pub fn set_active_thread(&mut self, cx: &mut Context<Self>, thread_id: Uuid) {
         self.active_thread_id = Some(thread_id);
+        if !self.agent_connections.contains_key(&thread_id)
+            && let Some(config_path) = self.agent_config_path.clone()
+        {
+            self.connect_thread_to_agent_config(cx, thread_id, config_path);
+        }
         cx.notify();
     }
 
@@ -152,16 +195,47 @@ impl AppState {
 
                     match result {
                         Ok((controller, process)) => {
-                            let cwd = this
+                            let (cwd, previous_session_id) = this
                                 .read_with(&cx, |state, _| {
-                                    state.workspace_cwd_for_thread(thread_id)
+                                    (
+                                        state.workspace_cwd_for_thread(thread_id),
+                                        state
+                                            .find_thread(thread_id)
+                                            .and_then(|thread| thread.session_id.clone()),
+                                    )
                                 })
                                 .ok()
-                                .flatten()
-                                .unwrap_or_else(|| {
-                                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-                                });
-                            match controller.initialize_session(cwd).await {
+                                .unwrap_or((None, None));
+
+                            let cwd = cwd.unwrap_or_else(|| {
+                                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                            });
+                            let loaded_session_id = if let Some(session_id) = previous_session_id {
+                                let session_id = SessionId::new(session_id);
+                                match controller
+                                    .load_session(session_id.clone(), cwd.clone())
+                                    .await
+                                {
+                                    Ok(()) => Some(session_id),
+                                    Err(err) => {
+                                        let message = format!("Failed to load ACP session: {err}");
+                                        let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                            state.push_system_message(cx, thread_id, message);
+                                        });
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
+                            let session_result = if let Some(session_id) = loaded_session_id {
+                                Ok(session_id)
+                            } else {
+                                controller.initialize_session(cwd).await
+                            };
+
+                            match session_result {
                                 Ok(session_id) => {
                                     let _ = this.update(&mut cx, |state: &mut AppState, cx| {
                                         state.attach_connection(
@@ -206,6 +280,9 @@ impl AppState {
         rx: mpsc::UnboundedReceiver<AgentEvent>,
     ) {
         self.listen_to_agent_events(cx, thread_id, rx);
+        if let Some(thread) = self.find_thread_mut(thread_id) {
+            thread.session_id = Some(session_id.to_string());
+        }
         self.agent_connections.insert(
             thread_id,
             ThreadAgentConnection {
@@ -214,6 +291,7 @@ impl AppState {
                 _process: process,
             },
         );
+        self.persist_state();
         cx.notify();
     }
 
@@ -290,6 +368,12 @@ impl AppState {
             .find_map(|workspace| workspace.get_thread_mut(thread_id))
     }
 
+    fn find_thread(&self, thread_id: Uuid) -> Option<&Thread> {
+        self.workspaces
+            .iter()
+            .find_map(|workspace| workspace.get_thread(thread_id))
+    }
+
     fn append_agent_chunk(&mut self, thread_id: Uuid, chunk: &str) {
         if let Some(thread) = self.find_thread_mut(thread_id) {
             if let Some(active_message) = thread.get_active_agent_message_mut() {
@@ -323,6 +407,14 @@ impl AppState {
         if let Some(thread) = self.find_thread_mut(thread_id) {
             thread.add_message(Message::new(thread_id, Role::System, content));
             cx.notify();
+        }
+    }
+
+    fn persist_state(&self) {
+        if let Some(persistence) = &self.persistence
+            && let Err(err) = persistence.save(&self.workspaces)
+        {
+            eprintln!("failed to persist app state: {err}");
         }
     }
 }
