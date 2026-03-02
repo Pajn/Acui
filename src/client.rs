@@ -1,8 +1,12 @@
 use agent_client_protocol::{
-    self as acp, ClientSideConnection, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, Result as AcpResult, SessionNotification,
+    self as acp, Agent, ClientSideConnection, ContentBlock, InitializeRequest, NewSessionRequest,
+    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionId, SessionNotification,
 };
 use async_trait::async_trait;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -13,7 +17,7 @@ pub enum AgentEvent {
     Disconnected,
 }
 
-/// The real ACP Client implementation that receives data FROM the agent.
+/// The ACP client implementation that receives data FROM the agent.
 pub struct GpuiAcpClient {
     pub event_tx: mpsc::UnboundedSender<AgentEvent>,
 }
@@ -23,30 +27,33 @@ impl acp::Client for GpuiAcpClient {
     async fn request_permission(
         &self,
         args: RequestPermissionRequest,
-    ) -> AcpResult<RequestPermissionResponse> {
-        Ok(RequestPermissionResponse {
-            outcome: RequestPermissionOutcome::Selected(SelectedPermissionOutcome {
-                option_id: args.options[0].option_id,
-                meta: None,
-            }),
-            meta: None,
-        })
+    ) -> acp::Result<RequestPermissionResponse> {
+        let outcome = args
+            .options
+            .first()
+            .map(|option| {
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                    option.option_id.clone(),
+                ))
+            })
+            .unwrap_or(RequestPermissionOutcome::Cancelled);
+
+        Ok(RequestPermissionResponse::new(outcome))
     }
 
-    async fn session_notification(&self, args: SessionNotification) -> AcpResult<()> {
+    async fn session_notification(&self, args: SessionNotification) -> acp::Result<()> {
         let _ = self.event_tx.send(AgentEvent::Notification(args));
         Ok(())
     }
 }
 
-/// The controller that holds the outgoing connection TO the agent.
+/// Controller over an ACP client-side connection.
 pub struct AcpController {
     pub connection: ClientSideConnection,
 }
 
 impl AcpController {
-    /// Creates a controller over any generic async I/O streams.
-    /// This allows us to pass real process Stdio in production, or memory pipes in tests.
+    /// Creates a controller over generic async I/O streams.
     pub async fn connect<R, W>(
         incoming: R,
         outgoing: W,
@@ -58,7 +65,6 @@ impl AcpController {
     {
         let client_impl = GpuiAcpClient { event_tx };
 
-        // Convert Tokio streams to Futures streams as required by the ACP crate
         let incoming_compat = incoming.compat();
         let outgoing_compat = outgoing.compat_write();
 
@@ -67,76 +73,138 @@ impl AcpController {
                 tokio::task::spawn_local(fut);
             });
 
-        // Run the client-side I/O handler on a LocalSet
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .unwrap();
+                .expect("failed to build tokio runtime");
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                handle_io.await;
+                if handle_io.await.is_err() {
+                    let _ = rt;
+                }
             });
         });
 
         Ok(Self { connection })
     }
+
+    pub async fn initialize_session(&self, cwd: impl Into<PathBuf>) -> anyhow::Result<SessionId> {
+        let _ = self
+            .connection
+            .initialize(InitializeRequest::new(acp::ProtocolVersion::V1))
+            .await?;
+
+        let response = self
+            .connection
+            .new_session(NewSessionRequest::new(cwd.into()))
+            .await?;
+
+        Ok(response.session_id)
+    }
+
+    pub async fn send_prompt(&self, session_id: SessionId, content: String) -> anyhow::Result<()> {
+        let prompt = PromptRequest::new(session_id, vec![ContentBlock::from(content)]);
+        let _ = self.connection.prompt(prompt).await?;
+        Ok(())
+    }
+
+    pub async fn connect_from_config(
+        config_path: impl AsRef<Path>,
+        event_tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> anyhow::Result<(Self, tokio::process::Child)> {
+        let config = AgentProcessConfig::from_path(config_path)?;
+
+        let mut cmd = tokio::process::Command::new(&config.command);
+        cmd.args(&config.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+
+        if let Some(cwd) = config.cwd {
+            cmd.current_dir(cwd);
+        }
+
+        let mut child = cmd.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("agent process did not provide stdout"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("agent process did not provide stdin"))?;
+
+        let controller = Self::connect(stdout, stdin, event_tx).await?;
+        Ok((controller, child))
+    }
 }
 
-// =====================================================================
-// TEST INFRASTRUCTURE: MOCK AGENT (Server-Side)
-// =====================================================================
+#[derive(Debug, Deserialize)]
+pub struct AgentProcessConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+}
+
+impl AgentProcessConfig {
+    pub fn from_path(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let raw = std::fs::read_to_string(path)?;
+        Ok(toml::from_str(&raw)?)
+    }
+}
 
 #[cfg(test)]
 pub mod mock {
     use super::*;
     use agent_client_protocol::{
-        Agent, InitializeRequest, InitializeResponse, PromptRequest, PromptResponse,
-        ProtocolVersion, SessionUpdate, StopReason,
+        Agent, AgentSideConnection, AuthenticateRequest, AuthenticateResponse, CancelNotification,
+        Implementation, InitializeRequest, InitializeResponse, NewSessionRequest,
+        NewSessionResponse, PromptRequest, PromptResponse, SessionUpdate, StopReason,
     };
     use tokio::io::duplex;
 
-    /// A mock implementation of the Agent side of the protocol
     pub struct MockAgent;
 
     #[async_trait(?Send)]
     impl Agent for MockAgent {
-        async fn initialize(&self, args: InitializeRequest) -> AcpResult<InitializeResponse> {
-            Ok(InitializeResponse {
-                protocol_version: ProtocolVersion::V1,
-                agent_info: AgentInfo {
-                    name: "MockAgent".into(),
-                    version: "1.0.0".into(),
-                },
-                auth_methods: vec![],
-                agent_capabilities: AgentCapabilities::default(),
-                meta: None,
-            })
+        async fn initialize(&self, args: InitializeRequest) -> acp::Result<InitializeResponse> {
+            Ok(InitializeResponse::new(args.protocol_version)
+                .agent_info(Implementation::new("MockAgent", "1.0.0")))
         }
 
-        async fn prompt(&self, args: PromptRequest) -> AcpResult<PromptResponse> {
-            // For a mock, we just immediately return a successful stop.
-            // In a real test, you would use an internal channel here to stream
-            // `SessionUpdate`s back to the client to test the UI's reaction.
-            Ok(PromptResponse {
-                // Add any mock content blocks here based on the ACP schema
-                stop_reason: StopReason::EndTurn,
-                meta: None,
-            })
+        async fn authenticate(
+            &self,
+            _args: AuthenticateRequest,
+        ) -> acp::Result<AuthenticateResponse> {
+            Ok(AuthenticateResponse::new())
+        }
+
+        async fn new_session(&self, _args: NewSessionRequest) -> acp::Result<NewSessionResponse> {
+            Ok(NewSessionResponse::new(SessionId::new("mock-session")))
+        }
+
+        async fn prompt(&self, _args: PromptRequest) -> acp::Result<PromptResponse> {
+            Ok(PromptResponse::new(StopReason::EndTurn))
+        }
+
+        async fn cancel(&self, _args: CancelNotification) -> acp::Result<()> {
+            Ok(())
         }
     }
 
-    /// Helper to create an in-memory connected Controller + Server setup for unit tests
-    pub async fn create_mock_controller() -> (AcpController, mpsc::UnboundedReceiver<AgentEvent>) {
-        // Create an in-memory full-duplex pipe with a 1MB buffer
+    pub async fn create_mock_controller() -> (
+        AcpController,
+        AgentSideConnection,
+        mpsc::UnboundedReceiver<AgentEvent>,
+    ) {
         let (client_stream, agent_stream) = duplex(1024 * 1024);
-
-        // Split the streams into read/write halves
         let (client_read, client_write) = tokio::io::split(client_stream);
         let (agent_read, agent_write) = tokio::io::split(agent_stream);
 
-        // 1. Setup the Server Side (Mock Agent)
-        let (agent_conn, agent_io) = ServerSideConnection::new(
+        let (agent_conn, agent_io) = AgentSideConnection::new(
             MockAgent,
             agent_write.compat_write(),
             agent_read.compat(),
@@ -145,24 +213,56 @@ pub mod mock {
             },
         );
 
-        // Run the agent I/O loop in the background
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .unwrap();
+                .expect("failed to build tokio runtime");
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                agent_io.await; // Note: Ensure the agent stays alive for the test
+                let _ = agent_io.await;
             });
         });
 
-        // 2. Setup the Client Side (Our App Controller)
         let (tx, rx) = mpsc::unbounded_channel();
         let controller = AcpController::connect(client_read, client_write, tx)
             .await
-            .unwrap();
+            .expect("failed to create mock controller");
 
-        (controller, rx)
+        (controller, agent_conn, rx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mock_agent_notifications_flow_to_client_events() {
+        use agent_client_protocol::Client;
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (_controller, agent_conn, mut event_rx) = create_mock_controller().await;
+
+                let update = SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    ContentBlock::from("hello from mock"),
+                ));
+                let notification = SessionNotification::new(SessionId::new("mock-session"), update);
+
+                agent_conn
+                    .session_notification(notification.clone())
+                    .await
+                    .expect("session_notification should succeed");
+
+                let event =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+                        .await
+                        .expect("timed out waiting for event")
+                        .expect("event channel unexpectedly closed");
+
+                match event {
+                    AgentEvent::Notification(received) => {
+                        assert_eq!(received.session_id, notification.session_id);
+                    }
+                    AgentEvent::Disconnected => panic!("expected notification event"),
+                }
+            })
+            .await;
     }
 }

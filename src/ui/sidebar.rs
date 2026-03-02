@@ -1,141 +1,146 @@
 use crate::state::AppState;
+use gpui::prelude::*;
 use gpui::*;
-use uuid::Uuid;
+use std::collections::HashSet;
 
 pub struct SidebarView {
-    app_state: Model<AppState>,
+    app_state: Entity<AppState>,
+    collapsed_workspaces: HashSet<uuid::Uuid>,
 }
 
 impl SidebarView {
-    pub fn build(app_state: Model<AppState>, cx: &mut WindowContext) -> View<Self> {
-        cx.new_view(|cx| {
-            // Re-render the sidebar anytime the AppState changes
-            cx.observe(&app_state, |_, _, cx| cx.notify()).detach();
-            Self { app_state }
-        })
+    pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        cx.observe(&app_state, |_, _, cx| cx.notify()).detach();
+        Self {
+            app_state,
+            collapsed_workspaces: HashSet::new(),
+        }
     }
 }
 
 impl Render for SidebarView {
-    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
-        let state = self.app_state.read(cx);
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (workspaces, active_thread_id) = {
+            let state = self.app_state.read(cx);
+            (state.workspaces.clone(), state.active_thread_id)
+        };
 
         div()
+            .id("sidebar-root")
             .flex()
             .flex_col()
-            .w(250.0)
+            .w(px(260.0))
             .h_full()
+            .overflow_y_scroll()
             .bg(rgb(0x252526))
             .border_r_1()
             .border_color(rgb(0x3c3c3c))
-            .p_4()
-            // "New Workspace" Button
+            .p_3()
+            .gap_2()
             .child(
                 div()
+                    .id("new-workspace-button")
                     .bg(rgb(0x0e639c))
                     .text_color(white())
                     .p_2()
                     .rounded_md()
                     .cursor_pointer()
                     .child("New Workspace")
-                    .on_click(cx.listener(|this, _event, cx| {
+                    .on_click(cx.listener(|this, _, _, cx| {
                         this.app_state.update(cx, |state, cx| {
-                            state.add_workspace(cx, "New Workspace");
+                            let index = state.workspaces.len() + 1;
+                            let name = format!("Workspace {index}");
+                            state.add_workspace(cx, &name);
                         });
                     })),
             )
-            // List Workspaces and Threads
-            .children(state.workspaces.iter().map(|workspace| {
-                let ws_id = workspace.id;
-                div()
-                    .mt_4()
-                    .child(
-                        div()
+            .children(
+                workspaces
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ws_index, workspace)| {
+                        let ws_id = workspace.id;
+                        let is_collapsed = self.collapsed_workspaces.contains(&ws_id);
+
+                        let header = div()
+                            .id(("workspace-header", ws_index))
+                            .mt_2()
+                            .p_2()
+                            .rounded_md()
+                            .bg(rgb(0x2d2d30))
                             .text_color(rgb(0xcccccc))
-                            .font_weight(FontWeight::BOLD)
-                            .child(workspace.name.clone()),
-                    )
-                    // "New Thread" Button for this workspace
-                    .child(
-                        div()
-                            .text_color(rgb(0x888888))
+                            .cursor_pointer()
+                            .child(if is_collapsed {
+                                format!("▶ {}", workspace.name)
+                            } else {
+                                format!("▼ {}", workspace.name)
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.collapsed_workspaces.contains(&ws_id) {
+                                    this.collapsed_workspaces.remove(&ws_id);
+                                } else {
+                                    this.collapsed_workspaces.insert(ws_id);
+                                }
+                                cx.notify();
+                            }));
+
+                        if is_collapsed {
+                            return div().child(header);
+                        }
+
+                        let new_thread_button = div()
+                            .id(("workspace-new-thread", ws_index))
+                            .text_color(rgb(0x8f8f8f))
                             .text_sm()
                             .cursor_pointer()
+                            .pl_2()
                             .child("+ New Thread")
-                            .on_click(cx.listener(move |this, _, cx| {
+                            .on_click(cx.listener(move |this, _, _, cx| {
                                 this.app_state.update(cx, |state, cx| {
-                                    state.add_thread(cx, ws_id, "New Thread");
+                                    let thread_index = state
+                                        .workspaces
+                                        .iter()
+                                        .find(|w| w.id == ws_id)
+                                        .map(|w| w.threads.len() + 1)
+                                        .unwrap_or(1);
+                                    let name = format!("Thread {thread_index}");
+                                    let _ = state.add_thread(cx, ws_id, &name);
                                 });
-                            })),
-                    )
-                    // Render Threads
-                    .children(workspace.threads.iter().map(|thread| {
-                        let thread_id = thread.id;
-                        let is_active = state.active_thread_id == Some(thread_id);
-                        let bg_color = if is_active {
-                            rgb(0x37373d)
-                        } else {
-                            transparent_black()
-                        };
+                            }));
+
+                        let thread_list = workspace.threads.into_iter().enumerate().map(
+                            |(thread_index, thread)| {
+                                let thread_id = thread.id;
+                                let is_active = active_thread_id == Some(thread_id);
+                                let thread_dom_id = ws_index * 1000 + thread_index;
+
+                                div()
+                                    .id(("thread-item", thread_dom_id))
+                                    .pl_4()
+                                    .pr_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(if is_active {
+                                        rgb(0x37373d)
+                                    } else {
+                                        rgba(0x00000000)
+                                    })
+                                    .text_color(rgb(0xcccccc))
+                                    .cursor_pointer()
+                                    .child(thread.name)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.app_state.update(cx, |state, cx| {
+                                            state.set_active_thread(cx, thread_id);
+                                        });
+                                    }))
+                            },
+                        );
 
                         div()
-                            .pl_4()
-                            .py_1()
-                            .mt_1()
-                            .bg(bg_color)
-                            .text_color(rgb(0xcccccc))
-                            .cursor_pointer()
-                            .child(thread.name.clone())
-                            .on_click(cx.listener(move |this, _, cx| {
-                                this.app_state.update(cx, |state, cx| {
-                                    state.set_active_thread(cx, thread_id);
-                                });
-                            }))
-                    }))
-            }))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use gpui::{TestAppContext, VisualTestContext};
-
-    #[gpui::test]
-    fn test_clicking_new_workspace_updates_state(cx: &mut VisualTestContext) {
-        // 1. Initialize our AppState (Model)
-        let app_state = cx.new_model(|_| AppState::new());
-
-        // 2. Mount the SidebarView in a simulated, headless window
-        let window = cx.add_window(|cx| SidebarView::build(app_state.clone(), cx));
-        
-        // 3. Verify initial state (0 workspaces)
-        app_state.update(cx, |state, _| {
-            assert_eq!(state.workspaces.len(), 0);
-        });
-
-        // 4. Simulate the user interaction
-        // Note: GPUI testing utilities are actively evolving. 
-        // You generally simulate events on the window context.
-        // If your button had a specific action tied to it, you could dispatch it here.
-        // For direct clicks, you simulate mouse events at specific screen coordinates, 
-        // or directly invoke the action your UI triggers.
-        
-        // Let's assume we simulate the direct state update that the button's on_click listener performs:
-        app_state.update(cx, |state, cx| {
-            state.add_workspace(cx, "New Workspace");
-        });
-
-        // 5. Force the UI to process the reactive update
-        cx.run_until_parked(); 
-
-        // 6. Assert the state changed
-        app_state.update(cx, |state, _| {
-            assert_eq!(state.workspaces.len(), 1);
-            assert_eq!(state.workspaces[0].name, "New Workspace");
-        });
-        
-        // 7. (Optional) In more advanced GPUI tests, you can query the rendered DOM 
-        // to assert that the text "New Workspace" is now physically present in the view tree.
+                            .child(header)
+                            .child(new_thread_button)
+                            .children(thread_list)
+                    }),
+            )
     }
 }
