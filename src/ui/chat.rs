@@ -27,7 +27,7 @@ struct SuggestionState {
 
 pub struct ChatView {
     app_state: Entity<AppState>,
-    scroll_handle: UniformListScrollHandle,
+    scroll_handle: ScrollHandle,
     input_buffer: String,
     locked_to_bottom: bool,
     suggestion_anchor: Option<(SuggestionKind, usize)>,
@@ -39,11 +39,7 @@ impl ChatView {
     pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         cx.observe(&app_state, |this, _, cx| {
             if this.locked_to_bottom {
-                let count = this.app_state.read(cx).active_thread_message_count();
-                if count > 0 {
-                    this.scroll_handle
-                        .scroll_to_item(count - 1, ScrollStrategy::Bottom);
-                }
+                this.scroll_handle.scroll_to_bottom();
             }
             cx.notify();
         })
@@ -108,7 +104,7 @@ impl ChatView {
 
         Self {
             app_state,
-            scroll_handle: UniformListScrollHandle::new(),
+            scroll_handle: ScrollHandle::new(),
             input_buffer: String::new(),
             locked_to_bottom: true,
             suggestion_anchor: None,
@@ -135,9 +131,8 @@ impl ChatView {
     }
 
     fn update_scroll_lock(&mut self) {
-        let base = self.scroll_handle.0.borrow().base_handle.clone();
-        let max_y = base.max_offset().height;
-        let y = base.offset().y;
+        let max_y = self.scroll_handle.max_offset().height;
+        let y = self.scroll_handle.offset().y;
         self.locked_to_bottom = (max_y - y).abs() <= px(2.0);
     }
 
@@ -259,7 +254,7 @@ impl Render for ChatView {
             )
         };
 
-        let chat_content = if active_thread_id.is_some() {
+        let chat_content: AnyElement = if active_thread_id.is_some() {
             if messages.is_empty() {
                 div()
                     .flex_1()
@@ -268,35 +263,33 @@ impl Render for ChatView {
                     .justify_center()
                     .text_color(rgb(0x888888))
                     .child("Send a message to start")
+                    .into_any_element()
             } else {
-                let message_count = messages.len();
-                let items = messages;
+                let rows = messages.into_iter().enumerate().map(|(index, msg)| {
+                    let bg = match msg.role {
+                        Role::User => rgb(0x0e639c),
+                        Role::Agent => rgb(0x3c3c3c),
+                        Role::System => rgb(0x6b2f2f),
+                    };
 
-                div().flex_1().w_full().child(
-                    uniform_list("chat-message-list", message_count, move |range, _, _| {
-                        range
-                            .map(|i| {
-                                let msg = &items[i];
-                                let bg = match msg.role {
-                                    Role::User => rgb(0x0e639c),
-                                    Role::Agent => rgb(0x3c3c3c),
-                                    Role::System => rgb(0x6b2f2f),
-                                };
+                    div().id(("chat-message", index)).p_2().child(
+                        div()
+                            .p_2()
+                            .rounded_md()
+                            .bg(bg)
+                            .text_color(white())
+                            .child(msg.content),
+                    )
+                });
 
-                                div().p_2().child(
-                                    div()
-                                        .p_2()
-                                        .rounded_md()
-                                        .bg(bg)
-                                        .text_color(white())
-                                        .child(msg.content.clone()),
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .track_scroll(self.scroll_handle.clone())
-                    .h_full(),
-                )
+                div()
+                    .id("chat-message-list")
+                    .flex_1()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle)
+                    .children(rows)
+                    .into_any_element()
             }
         } else {
             div()
@@ -306,6 +299,7 @@ impl Render for ChatView {
                 .justify_center()
                 .text_color(rgb(0x888888))
                 .child("Select or create a thread to begin")
+                .into_any_element()
         };
 
         let input_hint = if self.input_buffer.is_empty() {
