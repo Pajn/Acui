@@ -1,6 +1,7 @@
 use crate::domain::{Thread, Workspace};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -70,7 +71,11 @@ impl AppPersistence {
 
     pub fn save(&self, workspaces: &[Workspace]) -> anyhow::Result<()> {
         self.prepare_dirs()?;
+        let mut workspace_files = HashSet::new();
+        let mut thread_files = HashSet::new();
         for workspace in workspaces {
+            let workspace_file = format!("{}.json", workspace.id);
+            workspace_files.insert(workspace_file.clone());
             let workspace_record = WorkspaceRecord {
                 id: workspace.id,
                 name: workspace.name.clone(),
@@ -79,11 +84,13 @@ impl AppPersistence {
                 thread_ids: workspace.threads.iter().map(|thread| thread.id).collect(),
             };
             write_record(
-                &self.workspaces_dir().join(format!("{}.json", workspace.id)),
+                &self.workspaces_dir().join(workspace_file),
                 &workspace_record,
             )?;
 
             for thread in &workspace.threads {
+                let thread_file = format!("{}.json", thread.id);
+                thread_files.insert(thread_file.clone());
                 let thread_record = ThreadRecord {
                     id: thread.id,
                     workspace_id: thread.workspace_id,
@@ -93,22 +100,18 @@ impl AppPersistence {
                     updated_at: thread.updated_at,
                 };
                 write_record(
-                    &self.threads_dir().join(format!("{}.json", thread.id)),
+                    &self.threads_dir().join(thread_file),
                     &thread_record,
                 )?;
             }
         }
 
+        cleanup_stale_records(&self.workspaces_dir(), &workspace_files)?;
+        cleanup_stale_records(&self.threads_dir(), &thread_files)?;
         Ok(())
     }
 
     fn prepare_dirs(&self) -> anyhow::Result<()> {
-        if self.workspaces_dir().exists() {
-            std::fs::remove_dir_all(self.workspaces_dir())?;
-        }
-        if self.threads_dir().exists() {
-            std::fs::remove_dir_all(self.threads_dir())?;
-        }
         std::fs::create_dir_all(self.workspaces_dir())?;
         std::fs::create_dir_all(self.threads_dir())?;
         Ok(())
@@ -149,6 +152,27 @@ fn write_record<T: Serialize>(path: &Path, record: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cleanup_stale_records(dir: &Path, keep_files: &HashSet<String>) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(file_name) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        if !keep_files.contains(&file_name) {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::AppPersistence;
@@ -179,6 +203,27 @@ mod tests {
             Some("session-123")
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_does_not_delete_non_record_files_in_persistence_dirs() {
+        let root = std::env::temp_dir().join(format!("acui-persist-test-{}", Uuid::new_v4()));
+        let persistence = AppPersistence::new(root.clone());
+
+        let workspace = Workspace::from_path(PathBuf::from("/tmp/my-workspace"));
+        persistence
+            .save(&[workspace])
+            .expect("initial save should succeed");
+
+        let marker = root.join("workspaces").join("marker.txt");
+        std::fs::write(&marker, "keep me").expect("should write marker");
+
+        persistence
+            .save(&[])
+            .expect("second save should succeed without deleting marker");
+
+        assert!(marker.exists(), "marker file should remain after save");
         let _ = std::fs::remove_dir_all(root);
     }
 }
