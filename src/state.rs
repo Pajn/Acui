@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::client::{AcpController, AgentEvent};
 use crate::domain::{Message, Role, Thread, Workspace};
 use agent_client_protocol::{
-    ContentBlock, ContentChunk, SessionId, SessionNotification, SessionUpdate,
+    ContentBlock, ContentChunk, SessionId, SessionNotification, SessionUpdate, StopReason,
 };
 
 struct ThreadAgentConnection {
@@ -101,8 +101,23 @@ impl AppState {
             let session_id = connection.session_id.clone();
             let content = content.to_owned();
             cx.spawn(
-                move |_this: gpui::WeakEntity<AppState>, _cx: &mut gpui::AsyncApp| async move {
-                    let _ = controller.send_prompt(session_id, content).await;
+                move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
+                    let mut cx = cx.clone();
+                    async move {
+                        match controller.send_prompt(session_id, content).await {
+                            Ok(stop_reason) => {
+                                let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                    state.apply_prompt_stop_reason(cx, thread_id, stop_reason);
+                                });
+                            }
+                            Err(err) => {
+                                let message = format!("Prompt failed: {err}");
+                                let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                    state.push_system_message(cx, thread_id, message);
+                                });
+                            }
+                        }
+                    }
                 },
             )
             .detach();
@@ -293,6 +308,17 @@ impl AppState {
         }
     }
 
+    fn apply_prompt_stop_reason(
+        &mut self,
+        cx: &mut Context<Self>,
+        thread_id: Uuid,
+        stop_reason: StopReason,
+    ) {
+        self.finalize_agent_message(thread_id);
+        let message = format!("Stop reason: {}", stop_reason_label(stop_reason));
+        self.push_system_message(cx, thread_id, message);
+    }
+
     fn push_system_message(&mut self, cx: &mut Context<Self>, thread_id: Uuid, content: String) {
         if let Some(thread) = self.find_thread_mut(thread_id) {
             thread.add_message(Message::new(thread_id, Role::System, content));
@@ -308,6 +334,17 @@ pub fn extract_text_from_notification(notification: &SessionNotification) -> Opt
             ..
         }) => Some(text.text.clone()),
         _ => None,
+    }
+}
+
+fn stop_reason_label(stop_reason: StopReason) -> &'static str {
+    match stop_reason {
+        StopReason::EndTurn => "end_turn",
+        StopReason::MaxTokens => "max_tokens",
+        StopReason::MaxTurnRequests => "max_turn_requests",
+        StopReason::Refusal => "refusal",
+        StopReason::Cancelled => "cancelled",
+        _ => "unknown",
     }
 }
 
@@ -357,5 +394,11 @@ mod tests {
 
         let cwd = state.workspace_cwd_for_thread(thread_id);
         assert_eq!(cwd, Some(PathBuf::from("/tmp/ws-a")));
+    }
+
+    #[test]
+    fn stop_reason_label_covers_known_values() {
+        assert_eq!(stop_reason_label(StopReason::EndTurn), "end_turn");
+        assert_eq!(stop_reason_label(StopReason::Cancelled), "cancelled");
     }
 }
