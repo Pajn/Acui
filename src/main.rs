@@ -23,9 +23,14 @@ fn open_main_window(cx: &mut App, app_state: gpui::Entity<AppState>) {
     cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            app_id: Some("acui".into()),
             ..Default::default()
         },
-        move |window, cx| cx.new(|cx| WorkspaceLayout::new(app_state.clone(), window, cx)),
+        move |window, cx| {
+            window.set_app_id("acui");
+            window.set_window_title("acui");
+            cx.new(|cx| WorkspaceLayout::new(app_state.clone(), window, cx))
+        },
     )
     .expect("failed to open window");
 }
