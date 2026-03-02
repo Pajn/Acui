@@ -44,6 +44,14 @@ impl AppState {
         id
     }
 
+    pub fn add_workspace_from_path(&mut self, cx: &mut Context<Self>, path: PathBuf) -> Uuid {
+        let workspace = Workspace::from_path(path);
+        let id = workspace.id;
+        self.workspaces.push(workspace);
+        cx.notify();
+        id
+    }
+
     pub fn add_thread(
         &mut self,
         cx: &mut Context<Self>,
@@ -67,6 +75,16 @@ impl AppState {
     pub fn set_active_thread(&mut self, cx: &mut Context<Self>, thread_id: Uuid) {
         self.active_thread_id = Some(thread_id);
         cx.notify();
+    }
+
+    pub fn workspace_cwd_for_thread(&self, thread_id: Uuid) -> Option<PathBuf> {
+        self.workspaces.iter().find_map(|workspace| {
+            workspace
+                .threads
+                .iter()
+                .any(|thread| thread.id == thread_id)
+                .then(|| workspace.path.clone())
+        })
     }
 
     pub fn send_user_message(&mut self, cx: &mut Context<Self>, thread_id: Uuid, content: &str) {
@@ -119,8 +137,15 @@ impl AppState {
 
                     match result {
                         Ok((controller, process)) => {
-                            let cwd =
-                                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                            let cwd = this
+                                .read_with(&cx, |state, _| {
+                                    state.workspace_cwd_for_thread(thread_id)
+                                })
+                                .ok()
+                                .flatten()
+                                .unwrap_or_else(|| {
+                                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                                });
                             match controller.initialize_session(cwd).await {
                                 Ok(session_id) => {
                                     let _ = this.update(&mut cx, |state: &mut AppState, cx| {
@@ -319,5 +344,18 @@ mod tests {
         assert_eq!(thread.messages.len(), 1);
         assert_eq!(thread.messages[0].content, "hello");
         assert!(!thread.messages[0].is_streaming);
+    }
+
+    #[test]
+    fn workspace_cwd_comes_from_thread_workspace() {
+        let mut state = AppState::new();
+        let mut workspace = Workspace::from_path(PathBuf::from("/tmp/ws-a"));
+        let thread = Thread::new(workspace.id, "Thread");
+        let thread_id = thread.id;
+        workspace.add_thread(thread);
+        state.workspaces.push(workspace);
+
+        let cwd = state.workspace_cwd_for_thread(thread_id);
+        assert_eq!(cwd, Some(PathBuf::from("/tmp/ws-a")));
     }
 }

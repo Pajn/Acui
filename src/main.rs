@@ -40,7 +40,8 @@ fn main() {
     application.run(|cx: &mut App| {
         let app_state = cx.new(|cx| {
             let mut state = AppState::new();
-            let ws_id = state.add_workspace(cx, "Workspace 1");
+            let workspace_path = std::env::current_dir().unwrap_or_else(|_| ".".into());
+            let ws_id = state.add_workspace_from_path(cx, workspace_path);
             let _ = state.add_thread(cx, ws_id, "Thread 1");
             state
         });

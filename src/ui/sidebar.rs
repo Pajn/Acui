@@ -47,11 +47,35 @@ impl Render for SidebarView {
                     .cursor_pointer()
                     .child("New Workspace")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.app_state.update(cx, |state, cx| {
-                            let index = state.workspaces.len() + 1;
-                            let name = format!("Workspace {index}");
-                            state.add_workspace(cx, &name);
+                        let picker = cx.prompt_for_paths(PathPromptOptions {
+                            files: false,
+                            directories: true,
+                            multiple: false,
+                            prompt: Some("Select workspace folder".into()),
                         });
+                        let app_state = this.app_state.clone();
+                        cx.spawn(
+                            move |_sidebar: gpui::WeakEntity<SidebarView>,
+                                  cx: &mut gpui::AsyncApp| {
+                                let mut cx = cx.clone();
+                                async move {
+                                    let path = match picker.await {
+                                        Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                                        _ => None,
+                                    };
+                                    if let Some(path) = path {
+                                        let _ = app_state.update(
+                                            &mut cx,
+                                            |state: &mut AppState, cx| {
+                                                let ws_id = state.add_workspace_from_path(cx, path);
+                                                let _ = state.add_thread(cx, ws_id, "Thread 1");
+                                            },
+                                        );
+                                    }
+                                }
+                            },
+                        )
+                        .detach();
                     })),
             )
             .children(

@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 /// Represents who sent the message.
@@ -90,6 +91,7 @@ impl Thread {
 pub struct Workspace {
     pub id: Uuid,
     pub name: String,
+    pub path: PathBuf,
     pub threads: Vec<Thread>,
     pub created_at: DateTime<Utc>,
 }
@@ -99,6 +101,22 @@ impl Workspace {
         Self {
             id: Uuid::new_v4(),
             name: name.into(),
+            path: PathBuf::from("."),
+            threads: Vec::new(),
+            created_at: Utc::now(),
+        }
+    }
+
+    pub fn from_path(path: PathBuf) -> Self {
+        let fallback = path.display().to_string();
+        let name = path
+            .file_name()
+            .and_then(|part| part.to_str())
+            .map_or(fallback, ToOwned::to_owned);
+        Self {
+            id: Uuid::new_v4(),
+            name,
+            path,
             threads: Vec::new(),
             created_at: Utc::now(),
         }
@@ -114,5 +132,17 @@ impl Workspace {
 
     pub fn get_thread(&self, thread_id: Uuid) -> Option<&Thread> {
         self.threads.iter().find(|t| t.id == thread_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Workspace;
+    use std::path::PathBuf;
+
+    #[test]
+    fn workspace_name_uses_directory_name() {
+        let workspace = Workspace::from_path(PathBuf::from("/tmp/acui-project"));
+        assert_eq!(workspace.name, "acui-project");
     }
 }
