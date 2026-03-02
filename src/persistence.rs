@@ -145,7 +145,12 @@ where
 
 fn write_record<T: Serialize>(path: &Path, record: &T) -> anyhow::Result<()> {
     let serialized = serde_json::to_string_pretty(record)?;
-    std::fs::write(path, serialized)?;
+    let temp_path = path.with_extension("tmp");
+    std::fs::write(&temp_path, serialized)?;
+    if let Err(err) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err.into());
+    }
     Ok(())
 }
 
