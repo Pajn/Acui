@@ -2,13 +2,13 @@ use agent_client_protocol::{
     self as acp, Agent, AgentSideConnection, AuthenticateRequest, AuthenticateResponse,
     AvailableCommand, AvailableCommandsUpdate, CancelNotification, Client, ContentBlock,
     ContentChunk, CurrentModeUpdate, Implementation, InitializeRequest, InitializeResponse,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
-    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-    PromptResponse, ReadTextFileRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    SessionConfigOption, SessionConfigSelectOption, SessionMode, SessionModeId, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    WaitForTerminalExitRequest, WriteTextFileRequest,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+    PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    PromptRequest, PromptResponse, ReadTextFileRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionConfigOption, SessionConfigSelectOption, SessionMode,
+    SessionModeId, SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use async_trait::async_trait;
 use std::cell::RefCell;

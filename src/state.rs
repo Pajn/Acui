@@ -12,11 +12,10 @@ use crate::config::AppConfig;
 use crate::domain::{Message, Role, Thread, Workspace};
 use crate::persistence::AppPersistence;
 use agent_client_protocol::{
-    AvailableCommand, ContentBlock, ContentChunk, PermissionOption, PermissionOptionId,
+    AvailableCommand, ContentBlock, ContentChunk, PermissionOption, PermissionOptionId, Plan,
     RequestPermissionOutcome, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
     SessionConfigValueId, SessionId, SessionModeId, SessionModeState, SessionNotification,
     SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind,
-    Plan,
 };
 use ignore::WalkBuilder;
 
@@ -57,11 +56,7 @@ impl AppState {
             agent_config,
             log_file,
         } = config;
-        Self::with_parts(
-            Some(AppPersistence::new(data_dir)),
-            agent_config,
-            log_file,
-        )
+        Self::with_parts(Some(AppPersistence::new(data_dir)), agent_config, log_file)
     }
 
     fn with_parts(
@@ -157,7 +152,11 @@ impl AppState {
         dragged_thread_id: Uuid,
         target_thread_id: Uuid,
     ) {
-        let Some(workspace) = self.workspaces.iter_mut().find(|item| item.id == workspace_id) else {
+        let Some(workspace) = self
+            .workspaces
+            .iter_mut()
+            .find(|item| item.id == workspace_id)
+        else {
             return;
         };
         let Some(from_index) = workspace
@@ -326,12 +325,7 @@ impl AppState {
         .detach();
     }
 
-    pub fn set_session_mode(
-        &mut self,
-        cx: &mut Context<Self>,
-        thread_id: Uuid,
-        mode_id: String,
-    ) {
+    pub fn set_session_mode(&mut self, cx: &mut Context<Self>, thread_id: Uuid, mode_id: String) {
         let Some(connection) = self.agent_connections.get(&thread_id) else {
             return;
         };
@@ -747,7 +741,10 @@ impl AppState {
         stop_reason: StopReason,
     ) {
         self.finalize_agent_message(thread_id);
-        let elapsed = self.prompt_started_at.remove(&thread_id).map(|started| started.elapsed());
+        let elapsed = self
+            .prompt_started_at
+            .remove(&thread_id)
+            .map(|started| started.elapsed());
         let elapsed_label = elapsed
             .map(format_duration_short)
             .unwrap_or_else(|| "n/a".to_string());

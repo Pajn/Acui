@@ -557,7 +557,11 @@ impl AcpController {
     pub async fn initialize_session(
         &self,
         cwd: impl Into<PathBuf>,
-    ) -> anyhow::Result<(SessionId, Vec<SessionConfigOption>, Option<SessionModeState>)> {
+    ) -> anyhow::Result<(
+        SessionId,
+        Vec<SessionConfigOption>,
+        Option<SessionModeState>,
+    )> {
         let _ = self.connection.initialize(acp_initialize_request()).await?;
 
         let response = self

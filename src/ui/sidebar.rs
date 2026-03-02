@@ -157,9 +157,7 @@ impl Render for SidebarView {
                                     });
                                 }
                             }))
-                            .drag_over::<SidebarDragItem>(|style, _, _, _| {
-                                style.bg(rgb(0x3a3a40))
-                            });
+                            .drag_over::<SidebarDragItem>(|style, _, _, _| style.bg(rgb(0x3a3a40)));
 
                         if is_collapsed {
                             return div().child(header);
@@ -227,7 +225,9 @@ impl Render for SidebarView {
                                             thread_id,
                                         },
                                         move |_dragged, _, _, cx| {
-                                            cx.new(|_| DragPreview::new(format!("Thread: {thread_name}")))
+                                            cx.new(|_| {
+                                                DragPreview::new(format!("Thread: {thread_name}"))
+                                            })
                                         },
                                     )
                                     .on_drop(cx.listener(
@@ -249,11 +249,15 @@ impl Render for SidebarView {
                                             }
                                         },
                                     ))
-                                    .drag_over::<SidebarDragItem>(move |style, dragged, _, _| match dragged {
-                                        SidebarDragItem::Thread { workspace_id, .. } if *workspace_id == ws_id => {
-                                            style.bg(rgb(0x42424a))
+                                    .drag_over::<SidebarDragItem>(move |style, dragged, _, _| {
+                                        match dragged {
+                                            SidebarDragItem::Thread { workspace_id, .. }
+                                                if *workspace_id == ws_id =>
+                                            {
+                                                style.bg(rgb(0x42424a))
+                                            }
+                                            _ => style,
                                         }
-                                        _ => style,
                                     })
                                     .child(
                                         div()
@@ -305,7 +309,10 @@ mod tests {
 
     #[test]
     fn relative_time_short_formats_units() {
-        assert_eq!(relative_time_short(Utc::now() - Duration::seconds(12)), "12s");
+        assert_eq!(
+            relative_time_short(Utc::now() - Duration::seconds(12)),
+            "12s"
+        );
         assert_eq!(relative_time_short(Utc::now() - Duration::minutes(5)), "5m");
         assert_eq!(relative_time_short(Utc::now() - Duration::hours(3)), "3h");
     }

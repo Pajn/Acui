@@ -620,27 +620,39 @@ impl Render for ChatView {
         };
 
         let mode_panel = match (active_thread_id, modes) {
-            (Some(thread_id), Some(SessionModeState { current_mode_id, available_modes, .. }))
-                if !available_modes.is_empty() =>
-            {
-                let buttons = available_modes.into_iter().enumerate().map(|(index, mode)| {
-                    let mode_id = mode.id.to_string();
-                    let is_current = mode_id == current_mode_id.to_string();
-                    div()
-                        .id(("session-mode", index))
-                        .bg(if is_current { rgb(0x0e639c) } else { rgb(0x3c3c3c) })
-                        .text_color(white())
-                        .rounded_md()
-                        .px_2()
-                        .py_1()
-                        .cursor_pointer()
-                        .child(mode.name)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.app_state.update(cx, |state, cx| {
-                                state.set_session_mode(cx, thread_id, mode_id.clone());
-                            });
-                        }))
-                });
+            (
+                Some(thread_id),
+                Some(SessionModeState {
+                    current_mode_id,
+                    available_modes,
+                    ..
+                }),
+            ) if !available_modes.is_empty() => {
+                let buttons = available_modes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, mode)| {
+                        let mode_id = mode.id.to_string();
+                        let is_current = mode_id == current_mode_id.to_string();
+                        div()
+                            .id(("session-mode", index))
+                            .bg(if is_current {
+                                rgb(0x0e639c)
+                            } else {
+                                rgb(0x3c3c3c)
+                            })
+                            .text_color(white())
+                            .rounded_md()
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .child(mode.name)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.app_state.update(cx, |state, cx| {
+                                    state.set_session_mode(cx, thread_id, mode_id.clone());
+                                });
+                            }))
+                    });
                 div()
                     .w_full()
                     .p_2()

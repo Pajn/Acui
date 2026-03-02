@@ -99,10 +99,7 @@ impl AppPersistence {
                     created_at: thread.created_at,
                     updated_at: thread.updated_at,
                 };
-                write_record(
-                    &self.threads_dir().join(thread_file),
-                    &thread_record,
-                )?;
+                write_record(&self.threads_dir().join(thread_file), &thread_record)?;
             }
         }
 

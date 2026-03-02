@@ -88,7 +88,9 @@ impl Thread {
     }
 
     pub fn get_message_mut(&mut self, message_id: Uuid) -> Option<&mut Message> {
-        self.messages.iter_mut().find(|message| message.id == message_id)
+        self.messages
+            .iter_mut()
+            .find(|message| message.id == message_id)
     }
 }
 
@@ -139,7 +141,6 @@ impl Workspace {
     pub fn get_thread(&self, thread_id: Uuid) -> Option<&Thread> {
         self.threads.iter().find(|t| t.id == thread_id)
     }
-
 }
 
 #[cfg(test)]
