@@ -1,7 +1,8 @@
 use gpui::{Context, Task};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -12,8 +13,8 @@ use crate::persistence::AppPersistence;
 use agent_client_protocol::{
     AvailableCommand, ContentBlock, ContentChunk, PermissionOption, PermissionOptionId,
     RequestPermissionOutcome, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-    SessionConfigValueId, SessionId, SessionNotification, SessionUpdate, StopReason, ToolCall,
-    ToolCallContent, ToolCallStatus, ToolCallUpdate,
+    SessionConfigValueId, SessionId, SessionModeState, SessionNotification, SessionUpdate,
+    StopReason, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind, Plan,
 };
 use ignore::WalkBuilder;
 
@@ -33,6 +34,11 @@ pub struct AppState {
     thread_config_options: HashMap<Uuid, Vec<SessionConfigOption>>,
     thread_available_commands: HashMap<Uuid, Vec<AvailableCommand>>,
     thread_tool_calls: HashMap<Uuid, HashMap<String, ToolCall>>,
+    thread_tool_call_messages: HashMap<Uuid, HashMap<String, Uuid>>,
+    thread_plans: HashMap<Uuid, Plan>,
+    thread_modes: HashMap<Uuid, SessionModeState>,
+    prompt_started_at: HashMap<Uuid, Instant>,
+    unread_stopped_threads: HashSet<Uuid>,
     persistence: Option<AppPersistence>,
     agent_config_path: Option<PathBuf>,
 }
@@ -60,6 +66,11 @@ impl AppState {
             thread_config_options: HashMap::new(),
             thread_available_commands: HashMap::new(),
             thread_tool_calls: HashMap::new(),
+            thread_tool_call_messages: HashMap::new(),
+            thread_plans: HashMap::new(),
+            thread_modes: HashMap::new(),
+            prompt_started_at: HashMap::new(),
+            unread_stopped_threads: HashSet::new(),
             persistence,
             agent_config_path,
         }
@@ -124,6 +135,7 @@ impl AppState {
 
     pub fn set_active_thread(&mut self, cx: &mut Context<Self>, thread_id: Uuid) {
         self.active_thread_id = Some(thread_id);
+        self.unread_stopped_threads.remove(&thread_id);
         if !self.agent_connections.contains_key(&thread_id)
             && let Some(config_path) = self.agent_config_path.clone()
         {
@@ -168,6 +180,20 @@ impl AppState {
     pub fn active_thread_available_commands(&self) -> Option<Vec<AvailableCommand>> {
         let thread_id = self.active_thread_id?;
         self.thread_available_commands.get(&thread_id).cloned()
+    }
+
+    pub fn active_thread_plan(&self) -> Option<Plan> {
+        let thread_id = self.active_thread_id?;
+        self.thread_plans.get(&thread_id).cloned()
+    }
+
+    pub fn active_thread_modes(&self) -> Option<SessionModeState> {
+        let thread_id = self.active_thread_id?;
+        self.thread_modes.get(&thread_id).cloned()
+    }
+
+    pub fn thread_has_unread_stop(&self, thread_id: Uuid) -> bool {
+        self.unread_stopped_threads.contains(&thread_id)
     }
 
     pub fn resolve_permission(
@@ -239,6 +265,7 @@ impl AppState {
             let controller = Rc::clone(&connection.controller);
             let session_id = connection.session_id.clone();
             let content = content.to_owned();
+            self.prompt_started_at.insert(thread_id, Instant::now());
             cx.spawn(
                 move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
                     let mut cx = cx.clone();
@@ -519,21 +546,39 @@ impl AppState {
             SessionUpdate::ToolCallUpdate(update) => {
                 self.apply_tool_call_update(thread_id, update);
             }
+            SessionUpdate::Plan(plan) => {
+                self.thread_plans.insert(thread_id, plan);
+            }
+            SessionUpdate::CurrentModeUpdate(update) => {
+                if let Some(modes) = self.thread_modes.get_mut(&thread_id) {
+                    modes.current_mode_id = update.current_mode_id;
+                }
+            }
             _ => {}
         }
     }
 
     fn record_tool_call(&mut self, thread_id: Uuid, tool_call: ToolCall) {
+        let tool_call_id = tool_call.tool_call_id.to_string();
         self.thread_tool_calls
             .entry(thread_id)
             .or_default()
-            .insert(tool_call.tool_call_id.to_string(), tool_call.clone());
+            .insert(tool_call_id.clone(), tool_call.clone());
         let rendered = render_tool_call_message(&tool_call);
+        let mut message_id = None;
         if let Some(thread) = self.find_thread_mut(thread_id) {
-            thread.add_message(Message::new(thread_id, Role::Agent, rendered));
+            let message = Message::new(thread_id, Role::Agent, rendered);
+            message_id = Some(message.id);
+            thread.add_message(message);
             if let Some(active_message) = thread.get_active_agent_message_mut() {
                 active_message.finalize();
             }
+        }
+        if let Some(message_id) = message_id {
+            self.thread_tool_call_messages
+                .entry(thread_id)
+                .or_default()
+                .insert(tool_call_id, message_id);
         }
     }
 
@@ -545,12 +590,34 @@ impl AppState {
             .entry(update.tool_call_id.to_string())
             .or_insert_with(|| ToolCall::new(update.tool_call_id.clone(), "Tool call"));
         entry.update(update.fields);
+        let tool_call_id = entry.tool_call_id.to_string();
         let rendered = render_tool_call_message(entry);
+        let existing_message_id = self
+            .thread_tool_call_messages
+            .get(&thread_id)
+            .and_then(|messages| messages.get(&tool_call_id))
+            .copied();
+        let mut inserted_message_id = None;
         if let Some(thread) = self.find_thread_mut(thread_id) {
-            thread.add_message(Message::new(thread_id, Role::Agent, rendered));
-            if let Some(active_message) = thread.get_active_agent_message_mut() {
-                active_message.finalize();
+            if let Some(message_id) = existing_message_id
+                && let Some(message) = thread.get_message_mut(message_id)
+            {
+                message.content = rendered;
+                message.is_streaming = false;
+            } else {
+                let message = Message::new(thread_id, Role::Agent, rendered);
+                inserted_message_id = Some(message.id);
+                thread.add_message(message);
+                if let Some(active_message) = thread.get_active_agent_message_mut() {
+                    active_message.finalize();
+                }
             }
+        }
+        if let Some(message_id) = inserted_message_id {
+            self.thread_tool_call_messages
+                .entry(thread_id)
+                .or_default()
+                .insert(tool_call_id, message_id);
         }
     }
 
@@ -561,7 +628,17 @@ impl AppState {
         stop_reason: StopReason,
     ) {
         self.finalize_agent_message(thread_id);
-        let message = format!("Stop reason: {}", stop_reason_label(stop_reason));
+        let elapsed = self.prompt_started_at.remove(&thread_id).map(|started| started.elapsed());
+        let elapsed_label = elapsed
+            .map(format_duration_short)
+            .unwrap_or_else(|| "n/a".to_string());
+        let message = format!(
+            "Stop reason: {} ({elapsed_label})",
+            stop_reason_label(stop_reason)
+        );
+        if self.active_thread_id != Some(thread_id) {
+            self.unread_stopped_threads.insert(thread_id);
+        }
         self.push_system_message(cx, thread_id, message);
     }
 
@@ -618,6 +695,7 @@ pub fn extract_config_options_from_notification(
 fn render_tool_call_message(tool_call: &ToolCall) -> String {
     let mut lines = vec![
         format!("Tool: {}", tool_call.title),
+        format!("Kind: {}", tool_kind_label(tool_call.kind)),
         format!(
             "Status: {}",
             match tool_call.status {
@@ -635,6 +713,21 @@ fn render_tool_call_message(tool_call: &ToolCall) -> String {
         }
     }
     lines.join("\n")
+}
+
+fn tool_kind_label(kind: ToolKind) -> &'static str {
+    match kind {
+        ToolKind::Read => "read",
+        ToolKind::Edit => "edit",
+        ToolKind::Delete => "delete",
+        ToolKind::Move => "move",
+        ToolKind::Search => "search",
+        ToolKind::Execute => "execute",
+        ToolKind::Think => "think",
+        ToolKind::Fetch => "fetch",
+        ToolKind::SwitchMode => "switch_mode",
+        _ => "other",
+    }
 }
 
 fn render_tool_call_content(content: &ToolCallContent) -> String {
@@ -720,6 +813,20 @@ fn stop_reason_label(stop_reason: StopReason) -> &'static str {
     }
 }
 
+fn format_duration_short(duration: std::time::Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1_000 {
+        return format!("{millis}ms");
+    }
+    let seconds = duration.as_secs_f64();
+    if seconds < 60.0 {
+        return format!("{seconds:.1}s");
+    }
+    let minutes = (seconds / 60.0).floor() as u64;
+    let rem_seconds = (seconds % 60.0).round() as u64;
+    format!("{minutes}m {rem_seconds}s")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,6 +884,18 @@ mod tests {
     fn stop_reason_label_covers_known_values() {
         assert_eq!(stop_reason_label(StopReason::EndTurn), "end_turn");
         assert_eq!(stop_reason_label(StopReason::Cancelled), "cancelled");
+    }
+
+    #[test]
+    fn format_duration_short_uses_human_readable_units() {
+        assert_eq!(
+            format_duration_short(std::time::Duration::from_millis(420)),
+            "420ms"
+        );
+        assert_eq!(
+            format_duration_short(std::time::Duration::from_millis(1_600)),
+            "1.6s"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -913,6 +1032,7 @@ mod tests {
             .iter()
             .find_map(|workspace| workspace.get_thread(thread_id))
             .expect("thread should exist");
+        assert_eq!(thread.messages.len(), 1);
         let rendered = thread
             .messages
             .iter()
@@ -920,6 +1040,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("Tool: Read file"));
+        assert!(rendered.contains("Kind: other"));
         assert!(rendered.contains("Diff: src/main.rs"));
         assert!(rendered.contains("-old line"));
         assert!(rendered.contains("+new line"));

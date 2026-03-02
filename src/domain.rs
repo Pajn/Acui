@@ -86,6 +86,10 @@ impl Thread {
             .last_mut()
             .filter(|m| m.role == Role::Agent && m.is_streaming)
     }
+
+    pub fn get_message_mut(&mut self, message_id: Uuid) -> Option<&mut Message> {
+        self.messages.iter_mut().find(|message| message.id == message_id)
+    }
 }
 
 /// A workspace acting as a folder for multiple threads.
@@ -135,6 +139,7 @@ impl Workspace {
     pub fn get_thread(&self, thread_id: Uuid) -> Option<&Thread> {
         self.threads.iter().find(|t| t.id == thread_id)
     }
+
 }
 
 #[cfg(test)]
