@@ -692,6 +692,10 @@ impl Render for ChatView {
             config_options,
             modes,
             is_working,
+            configured_agents,
+            selected_agent,
+            is_agent_locked,
+            locked_agent,
         ) = {
             let state = self.app_state.read(cx);
             (
@@ -701,6 +705,10 @@ impl Render for ChatView {
                 state.active_thread_config_options(),
                 state.active_thread_modes(),
                 state.active_thread_is_working(),
+                state.configured_agents().to_vec(),
+                state.active_thread_selected_agent(),
+                state.active_thread_is_agent_locked(),
+                state.active_thread_locked_agent(),
             )
         };
 
@@ -1012,6 +1020,79 @@ impl Render for ChatView {
             _ => div(),
         };
 
+        // Agent panel: shown below the input when there are configured agents.
+        // - Thread unlocked: clickable selector buttons (one per configured agent).
+        // - Thread locked: static label showing which agent is in use.
+        let agent_panel = if active_thread_id.is_some() && !configured_agents.is_empty() {
+            let panel_content: AnyElement = if is_agent_locked {
+                // Static label
+                let label = locked_agent
+                    .as_deref()
+                    .unwrap_or("unknown agent")
+                    .to_string();
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_color(rgb(0x888888)).child("Agent"))
+                    .child(div().text_color(rgb(0xdddddd)).child(label))
+                    .into_any_element()
+            } else {
+                // Clickable agent selector buttons
+                let thread_id = active_thread_id.unwrap();
+                let buttons = configured_agents
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, agent)| {
+                        let agent_name = agent.name.clone();
+                        let is_selected = selected_agent.as_deref() == Some(&agent_name);
+                        div()
+                            .id(("agent-selector", index))
+                            .bg(if is_selected {
+                                rgb(0x0e639c)
+                            } else {
+                                rgb(0x3c3c3c)
+                            })
+                            .text_color(white())
+                            .rounded_md()
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .child(agent.name)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.app_state.update(cx, |state, cx| {
+                                    state.select_agent_for_thread(
+                                        cx,
+                                        thread_id,
+                                        agent_name.clone(),
+                                    );
+                                });
+                            }))
+                            .into_any_element()
+                    });
+                div()
+                    .flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .children(buttons)
+                    .into_any_element()
+            };
+
+            div()
+                .w_full()
+                .p_2()
+                .bg(rgb(0x1f2933))
+                .border_t_1()
+                .border_color(rgb(0x3c3c3c))
+                .flex()
+                .gap_2()
+                .items_center()
+                .child(div().text_color(rgb(0x888888)).child("Agent:"))
+                .child(panel_content)
+        } else {
+            div()
+        };
+
         div()
             .debug_selector(|| "chat-root".to_string())
             .flex()
@@ -1025,6 +1106,7 @@ impl Render for ChatView {
             .child(permission_panel)
             .child(suggestion_panel)
             .child(input_box)
+            .child(agent_panel)
             .child(mode_panel)
             .child(config_panel)
     }
