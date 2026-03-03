@@ -78,6 +78,12 @@ pub struct AppState {
     enable_mock_agent: bool,
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppState {
     pub fn new() -> Self {
         Self::with_parts(None, Vec::new(), true, None)
@@ -284,10 +290,8 @@ impl AppState {
             .thread_state
             .get(&thread_id)
             .is_some_and(|ts| ts.connection.is_some() || ts.connecting);
-        if !already_connecting {
-            if let Some(agent) = locked_agent {
-                self.connect_thread_to_agent(cx, thread_id, agent);
-            }
+        if !already_connecting && let Some(agent) = locked_agent {
+            self.connect_thread_to_agent(cx, thread_id, agent);
         }
         cx.notify();
     }
@@ -703,10 +707,10 @@ impl AppState {
                     // Lock thread, attach connection, and retrieve Rc'd controller + session_id
                     // for the send step — all within the same update to avoid races.
                     let send_conn = this.update(&mut cx, |state: &mut AppState, cx| {
-                        if let Some(thread) = state.find_thread_mut(thread_id) {
-                            if thread.agent_name.is_none() {
-                                thread.agent_name = Some(agent.name.clone());
-                            }
+                        if let Some(thread) = state.find_thread_mut(thread_id)
+                            && thread.agent_name.is_none()
+                        {
+                            thread.agent_name = Some(agent.name.clone());
                         }
                         state.append_log_line(
                             "from_agent.initialize_session_ok",
@@ -856,10 +860,10 @@ impl AppState {
                                             .to_string(),
                                         );
                                         // Lock the thread to this agent.
-                                        if let Some(thread) = state.find_thread_mut(thread_id) {
-                                            if thread.agent_name.is_none() {
-                                                thread.agent_name = Some(agent.name.clone());
-                                            }
+                                        if let Some(thread) = state.find_thread_mut(thread_id)
+                                            && thread.agent_name.is_none()
+                                        {
+                                            thread.agent_name = Some(agent.name.clone());
                                         }
                                         state.ts_mut(thread_id).connecting = false;
                                         state.attach_connection(

@@ -485,3 +485,36 @@ async fn thread_switch_re_engages_scroll_lock(cx: &mut TestAppContext) {
         );
     });
 }
+
+#[gpui::test]
+async fn shift_enter_inserts_newline(cx: &mut TestAppContext) {
+    with_chat_window(cx, |chat, _diff_message_id, window_cx| {
+        window_cx.update(|window, cx| {
+            ChatView::debug_focus_input(&chat, window, cx);
+        });
+        window_cx.run_until_parked();
+
+        window_cx.simulate_keystrokes("a");
+        window_cx.run_until_parked();
+        window_cx.simulate_keystrokes("b");
+        window_cx.run_until_parked();
+        window_cx.simulate_keystrokes("c");
+        window_cx.run_until_parked();
+
+        // Move cursor between 'a' and 'b' (at index 1)
+        window_cx.update(|window, cx| {
+            ChatView::debug_set_cursor(&chat, 1, window, cx);
+        });
+        window_cx.run_until_parked();
+
+        window_cx.simulate_keystrokes("shift-enter");
+        window_cx.run_until_parked();
+
+        let value = window_cx.read(|app| chat.read(app).debug_input_value(app));
+        // If it doubles, this will be "a\n\nbc", if it's correct it's "a\nbc"
+        assert_eq!(value, "a\nbc");
+
+        let cursor = window_cx.read(|app| chat.read(app).debug_cursor(app));
+        assert_eq!(cursor, 2, "Cursor should be at 2 (after newline)");
+    });
+}

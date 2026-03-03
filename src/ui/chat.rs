@@ -3,7 +3,7 @@ use crate::state::AppState;
 use agent_client_protocol::{AvailableCommand, SessionModeState};
 use gpui::prelude::*;
 use gpui::*;
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, RopeExt};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::skeleton::Skeleton;
 use gpui_component::text::TextView;
@@ -65,7 +65,7 @@ impl ChatView {
             InputState::new(window, cx)
                 .multi_line(true)
                 .rows(3)
-                .placeholder("Type and press Enter...")
+                .placeholder("Type and press Enter to send, Shift+Enter for new line...")
         });
 
         cx.observe(&app_state, |this, _, cx| {
@@ -147,11 +147,18 @@ impl ChatView {
                 this.history_down(window, cx);
                 return;
             }
-            if key == "enter"
-                && !event.keystroke.modifiers.shift
-                && !event.keystroke.modifiers.secondary()
-            {
-                this.submit_input(window, cx);
+            if key == "enter" {
+                if event.keystroke.modifiers.shift {
+                    this.input_state.update(cx, |state, cx| {
+                        state.insert("\n", window, cx);
+                    });
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                if !event.keystroke.modifiers.secondary() {
+                    this.submit_input(window, cx);
+                }
             }
         })
         .detach();
@@ -192,10 +199,6 @@ impl ChatView {
         }
     }
 
-    fn input_value(&self, cx: &Context<Self>) -> String {
-        self.input_state.read(cx).value().to_string()
-    }
-
     fn set_input_value(
         &self,
         value: impl Into<String>,
@@ -207,6 +210,10 @@ impl ChatView {
             state.set_value(value, window, cx);
             state.focus(window, cx);
         });
+    }
+
+    fn input_value(&self, cx: &Context<Self>) -> String {
+        self.input_state.read(cx).value().to_string()
     }
 
     fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -511,36 +518,43 @@ impl ChatView {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        let state = app_state.read(cx);
-        let Some(thread) = state.active_thread() else {
-            return div().into_any_element();
-        };
-        let Some(message) = thread.messages.get(index) else {
-            return div().into_any_element();
-        };
+        let (bg, display_content, copy_content, message_id, is_collapsible, is_expanded) = {
+            let state = app_state.read(cx);
+            let Some(thread) = state.active_thread() else {
+                return div().into_any_element();
+            };
+            let Some(message) = thread.messages.get(index) else {
+                return div().into_any_element();
+            };
 
-        let bg = match message.role {
-            Role::User => rgb(0x0e639c),
-            Role::Agent => rgb(0x3c3c3c),
-            Role::System => rgb(0x6b2f2f),
+            let bg = match message.role {
+                Role::User => rgb(0x0e639c),
+                Role::Agent => rgb(0x3c3c3c),
+                Role::System => rgb(0x6b2f2f),
+            };
+            let line_count = message.content.lines().count();
+            let is_diff_message = message.content.contains("--- before\n+++ after");
+            let is_collapsible = line_count > COLLAPSE_LINE_LIMIT && !is_diff_message;
+            let is_expanded = expanded_messages.contains(&message.id);
+            let display_content = if is_collapsible && !is_expanded {
+                message
+                    .content
+                    .lines()
+                    .take(COLLAPSE_LINE_LIMIT)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                message.content.clone()
+            };
+            (
+                bg,
+                display_content,
+                message.content.clone(),
+                message.id,
+                is_collapsible,
+                is_expanded,
+            )
         };
-        let line_count = message.content.lines().count();
-        let is_diff_message = message.content.contains("--- before\n+++ after");
-        let is_collapsible = line_count > COLLAPSE_LINE_LIMIT && !is_diff_message;
-        let is_expanded = expanded_messages.contains(&message.id);
-        let display_content = if is_collapsible && !is_expanded {
-            message
-                .content
-                .lines()
-                .take(COLLAPSE_LINE_LIMIT)
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            message.content.clone()
-        };
-        let copy_content = message.content.clone();
-        let message_id = message.id;
-        drop(state);
 
         let content_el = Self::render_message_content(
             message_id,
@@ -588,7 +602,7 @@ impl ChatView {
                                     "Show more"
                                 })
                                 .on_click(move |_, _, cx| {
-                                    let _ = this_expand.update(cx, |view, cx| {
+                                    this_expand.update(cx, |view, cx| {
                                         if view.expanded_messages.contains(&message_id) {
                                             view.expanded_messages.remove(&message_id);
                                         } else {
@@ -668,6 +682,44 @@ impl ChatView {
     #[allow(dead_code)]
     pub fn debug_app_state(&self) -> Entity<AppState> {
         self.app_state.clone()
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn debug_input_value(&self, cx: &App) -> String {
+        self.input_state.read(cx).value().to_string()
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn debug_focus_input(this: &Entity<ChatView>, window: &mut Window, cx: &mut App) {
+        this.update(cx, |view, cx| {
+            view.input_state.update(cx, |state, cx| {
+                state.focus(window, cx);
+            });
+        });
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn debug_cursor(&self, cx: &App) -> usize {
+        self.input_state.read(cx).cursor()
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn debug_set_cursor(
+        this: &Entity<ChatView>,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        this.update(cx, |view, cx| {
+            view.input_state.update(cx, |state, cx| {
+                let position = state.text().offset_to_position(offset);
+                state.set_cursor_position(position, window, cx);
+            });
+        });
     }
 }
 
