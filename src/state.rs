@@ -1052,11 +1052,24 @@ impl AppState {
         }
     }
 
+    fn append_agent_thought_chunk(&mut self, thread_id: Uuid, chunk: &str) {
+        if let Some(thread) = self.find_thread_mut(thread_id) {
+            if let Some(active_message) = thread.get_active_thought_message_mut() {
+                active_message.append_text(chunk);
+            } else {
+                thread.add_message(Message::new(thread_id, Role::Thought, chunk));
+            }
+        }
+    }
+
     fn finalize_agent_message(&mut self, thread_id: Uuid) {
-        if let Some(thread) = self.find_thread_mut(thread_id)
-            && let Some(active_message) = thread.get_active_agent_message_mut()
-        {
-            active_message.finalize();
+        if let Some(thread) = self.find_thread_mut(thread_id) {
+            if let Some(active_message) = thread.get_active_agent_message_mut() {
+                active_message.finalize();
+            }
+            if let Some(active_message) = thread.get_active_thought_message_mut() {
+                active_message.finalize();
+            }
         }
     }
 
@@ -1068,6 +1081,12 @@ impl AppState {
                 ..
             }) => {
                 self.append_agent_chunk(thread_id, &text.text);
+            }
+            SessionUpdate::AgentThoughtChunk(ContentChunk {
+                content: ContentBlock::Text(text),
+                ..
+            }) => {
+                self.append_agent_thought_chunk(thread_id, &text.text);
             }
             SessionUpdate::ConfigOptionUpdate(update) => {
                 self.ts_mut(thread_id).config_options = update.config_options;
@@ -1564,6 +1583,47 @@ mod tests {
             .expect("commands should be present");
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].name, "build");
+    }
+
+    #[test]
+    fn agent_thought_chunks_update_state() {
+        let mut state = AppState::new();
+        let mut workspace = Workspace::new("Test");
+        let thread = Thread::new(workspace.id, "Thread");
+        let thread_id = thread.id;
+        workspace.add_thread(thread);
+        state.workspaces.push(workspace);
+
+        // First thought chunk: creates a new Thought message
+        state.apply_session_update(
+            thread_id,
+            SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::from("thinking"))),
+        );
+
+        // Second thought chunk: appends to the active Thought message
+        state.apply_session_update(
+            thread_id,
+            SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::from(" more"))),
+        );
+
+        let thread = state
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.get_thread(thread_id))
+            .expect("thread should exist");
+        assert_eq!(thread.messages.len(), 1);
+        assert_eq!(thread.messages[0].role, Role::Thought);
+        assert_eq!(thread.messages[0].content, "thinking more");
+        assert!(thread.messages[0].is_streaming);
+
+        // Finalize
+        state.finalize_agent_message(thread_id);
+        let thread = state
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.get_thread(thread_id))
+            .expect("thread should exist");
+        assert!(!thread.messages[0].is_streaming);
     }
 
     #[test]

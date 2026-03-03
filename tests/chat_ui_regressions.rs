@@ -487,6 +487,49 @@ async fn thread_switch_re_engages_scroll_lock(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn thought_messages_rendered_with_dimmed_text(cx: &mut TestAppContext) {
+    with_chat_window(cx, |chat, _diff_message_id, window_cx| {
+        flush_layout(window_cx);
+
+        // Capture app_state and add a thought message.
+        let (app_state, thread_id) = window_cx.read(|app| {
+            let view = chat.read(app);
+            let state = view.debug_app_state();
+            let thread_id = state.read(app).active_thread_id.expect("active thread");
+            (state, thread_id)
+        });
+
+        window_cx.update(|_, app| {
+            app_state.update(app, |state: &mut AppState, _| {
+                if let Some(thread) = state
+                    .workspaces
+                    .iter_mut()
+                    .find_map(|ws| ws.get_thread_mut(thread_id))
+                {
+                    thread.add_message(Message::new(thread_id, Role::Thought, "thinking..."));
+                }
+            });
+        });
+
+        flush_layout(window_cx);
+
+        // Verify that the thought message is rendered.
+        let message_count = window_cx.read(|app| {
+            let state = chat.read(app).debug_app_state();
+            state.read(app).active_thread_message_count()
+        });
+
+        let selector =
+            acui::ui::chat::row_debug_selector(message_count - 1).expect("selector should exist");
+        assert!(
+            window_cx.debug_bounds(selector).is_some(),
+            "thought message should be rendered at {}",
+            selector
+        );
+    });
+}
+
+#[gpui::test]
 async fn shift_enter_inserts_newline(cx: &mut TestAppContext) {
     with_chat_window(cx, |chat, _diff_message_id, window_cx| {
         window_cx.update(|window, cx| {

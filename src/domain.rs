@@ -9,7 +9,8 @@ use uuid::Uuid;
 pub enum Role {
     User,
     Agent,
-    System, // Useful for connection errors or app-level notifications
+    Thought, // Dimmed thought chunks from agent
+    System,  // Useful for connection errors or app-level notifications
 }
 
 /// A UI-level representation of a message.
@@ -33,7 +34,7 @@ impl Message {
             role,
             content: content.into(),
             timestamp: Utc::now(),
-            is_streaming: role == Role::Agent,
+            is_streaming: role == Role::Agent || role == Role::Thought,
         }
     }
 
@@ -88,6 +89,13 @@ impl Thread {
         self.messages
             .last_mut()
             .filter(|m| m.role == Role::Agent && m.is_streaming)
+    }
+
+    /// Retrieves the active streaming thought message.
+    pub fn get_active_thought_message_mut(&mut self) -> Option<&mut Message> {
+        self.messages
+            .last_mut()
+            .filter(|m| m.role == Role::Thought && m.is_streaming)
     }
 
     pub fn get_message_mut(&mut self, message_id: Uuid) -> Option<&mut Message> {

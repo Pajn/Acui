@@ -518,7 +518,15 @@ impl ChatView {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        let (bg, display_content, copy_content, message_id, is_collapsible, is_expanded) = {
+        let (
+            bg,
+            text_color,
+            display_content,
+            copy_content,
+            message_id,
+            is_collapsible,
+            is_expanded,
+        ): (Rgba, Rgba, String, String, Uuid, bool, bool) = {
             let state = app_state.read(cx);
             let Some(thread) = state.active_thread() else {
                 return div().into_any_element();
@@ -530,7 +538,13 @@ impl ChatView {
             let bg = match message.role {
                 Role::User => rgb(0x0e639c),
                 Role::Agent => rgb(0x3c3c3c),
+                Role::Thought => rgb(0x2d2d30),
                 Role::System => rgb(0x6b2f2f),
+            };
+            let text_color = if message.role == Role::Thought {
+                rgb(0xaaaaaa)
+            } else {
+                rgb(0xffffff)
             };
             let line_count = message.content.lines().count();
             let is_diff_message = message.content.contains("--- before\n+++ after");
@@ -548,6 +562,7 @@ impl ChatView {
             };
             (
                 bg,
+                text_color,
                 display_content,
                 message.content.clone(),
                 message.id,
@@ -585,7 +600,7 @@ impl ChatView {
                     .p_2()
                     .rounded_md()
                     .bg(bg)
-                    .text_color(white())
+                    .text_color(text_color)
                     .whitespace_normal()
                     .child(content_el)
                     .when(is_collapsible, |this| {
@@ -1194,8 +1209,8 @@ fn file_suggestion_items(files: &[String], query: &str) -> Vec<SuggestionItem> {
         .collect()
 }
 
-fn row_debug_selector(index: usize) -> Option<&'static str> {
-    const SELECTORS: [&str; 12] = [
+pub fn row_debug_selector(index: usize) -> Option<&'static str> {
+    const SELECTORS: [&str; 64] = [
         "chat-row-0",
         "chat-row-1",
         "chat-row-2",
@@ -1208,6 +1223,58 @@ fn row_debug_selector(index: usize) -> Option<&'static str> {
         "chat-row-9",
         "chat-row-10",
         "chat-row-11",
+        "chat-row-12",
+        "chat-row-13",
+        "chat-row-14",
+        "chat-row-15",
+        "chat-row-16",
+        "chat-row-17",
+        "chat-row-18",
+        "chat-row-19",
+        "chat-row-20",
+        "chat-row-21",
+        "chat-row-22",
+        "chat-row-23",
+        "chat-row-24",
+        "chat-row-25",
+        "chat-row-26",
+        "chat-row-27",
+        "chat-row-28",
+        "chat-row-29",
+        "chat-row-30",
+        "chat-row-31",
+        "chat-row-32",
+        "chat-row-33",
+        "chat-row-34",
+        "chat-row-35",
+        "chat-row-36",
+        "chat-row-37",
+        "chat-row-38",
+        "chat-row-39",
+        "chat-row-40",
+        "chat-row-41",
+        "chat-row-42",
+        "chat-row-43",
+        "chat-row-44",
+        "chat-row-45",
+        "chat-row-46",
+        "chat-row-47",
+        "chat-row-48",
+        "chat-row-49",
+        "chat-row-50",
+        "chat-row-51",
+        "chat-row-52",
+        "chat-row-53",
+        "chat-row-54",
+        "chat-row-55",
+        "chat-row-56",
+        "chat-row-57",
+        "chat-row-58",
+        "chat-row-59",
+        "chat-row-60",
+        "chat-row-61",
+        "chat-row-62",
+        "chat-row-63",
     ];
     SELECTORS.get(index).copied()
 }
@@ -1226,7 +1293,7 @@ mod tests {
     #[::core::prelude::v1::test]
     fn row_debug_selectors_cover_expected_range() {
         assert_eq!(row_debug_selector(0), Some("chat-row-0"));
-        assert_eq!(row_debug_selector(11), Some("chat-row-11"));
-        assert_eq!(row_debug_selector(12), None);
+        assert_eq!(row_debug_selector(63), Some("chat-row-63"));
+        assert_eq!(row_debug_selector(64), None);
     }
 }
