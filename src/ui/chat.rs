@@ -1,9 +1,15 @@
-use crate::domain::Role;
+use crate::domain::{Message, Role};
 use crate::state::AppState;
 use agent_client_protocol::{AvailableCommand, SessionModeState};
 use gpui::prelude::*;
 use gpui::*;
-use std::ops::Range;
+use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::skeleton::Skeleton;
+use gpui_component::text::TextView;
+use gpui_component::{VirtualListScrollHandle, v_virtual_list};
+use std::collections::HashSet;
+use std::rc::Rc;
+use uuid::Uuid;
 
 mod support;
 use support::render_config_option_row;
@@ -27,21 +33,37 @@ struct SuggestionState {
     selected: usize,
 }
 
+#[derive(Clone)]
+enum ChatRow {
+    Message(Message),
+    Working,
+}
+
 pub struct ChatView {
     app_state: Entity<AppState>,
-    scroll_handle: ScrollHandle,
+    scroll_handle: VirtualListScrollHandle,
     suggestion_scroll_handle: ScrollHandle,
-    input_buffer: String,
-    input_cursor: usize,
-    input_selection: Option<Range<usize>>,
+    input_state: Entity<InputState>,
     locked_to_bottom: bool,
     suggestion_anchor: Option<(SuggestionKind, usize)>,
     suggestion_selected: usize,
     dismissed_suggestion: Option<(SuggestionKind, usize)>,
+    input_history: Vec<String>,
+    history_cursor: Option<usize>,
+    history_draft: String,
+    expanded_messages: HashSet<Uuid>,
+    rows: Vec<ChatRow>,
 }
 
 impl ChatView {
-    pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+    pub fn new(app_state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let input_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .rows(3)
+                .placeholder("Type and press Enter...")
+        });
+
         cx.observe(&app_state, |this, _, cx| {
             if this.locked_to_bottom {
                 this.scroll_handle.scroll_to_bottom();
@@ -50,14 +72,17 @@ impl ChatView {
         })
         .detach();
 
-        cx.observe_keystrokes(|this, event, _window, cx| {
-            let key = event.keystroke.key.as_str();
-            let command = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
-            if command && key == "a" {
-                this.select_all_input();
+        cx.subscribe(&input_state, |this, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.history_cursor = None;
+                this.reconcile_suggestion_visibility(cx);
                 cx.notify();
-                return;
             }
+        })
+        .detach();
+
+        cx.observe_keystrokes(|this, event, window, cx| {
+            let key = event.keystroke.key.as_str();
 
             if let Some(suggestions) = this.compute_suggestions(cx) {
                 if key == "escape" {
@@ -80,92 +105,68 @@ impl ChatView {
                 }
                 if key == "tab" || (event.keystroke.modifiers.control && event.keystroke.key == "y")
                 {
-                    this.apply_suggestion(&suggestions);
+                    this.apply_suggestion(&suggestions, window, cx);
                     cx.notify();
                     return;
                 }
             }
 
-            if key == "left" {
-                this.move_cursor_left();
-                this.reconcile_suggestion_visibility();
-                cx.notify();
+            if key == "up" && this.input_value(cx).trim().is_empty() {
+                this.history_up(window, cx);
                 return;
             }
-            if key == "right" {
-                this.move_cursor_right();
-                this.reconcile_suggestion_visibility();
-                cx.notify();
+            if key == "down"
+                && (this.history_cursor.is_some() || this.input_value(cx).trim().is_empty())
+            {
+                this.history_down(window, cx);
                 return;
             }
-            if key == "home" {
-                this.clear_selection();
-                this.input_cursor = 0;
-                this.reconcile_suggestion_visibility();
-                cx.notify();
-                return;
-            }
-            if key == "end" {
-                this.clear_selection();
-                this.input_cursor = this.input_len_chars();
-                this.reconcile_suggestion_visibility();
-                cx.notify();
-                return;
-            }
-            if key == "backspace" {
-                this.backspace();
-                this.reconcile_suggestion_visibility();
-                cx.notify();
-                return;
-            }
-            if key == "delete" {
-                this.delete_forward();
-                this.reconcile_suggestion_visibility();
-                cx.notify();
-                return;
-            }
-            if key == "enter" {
-                this.submit_input(cx);
-                return;
-            }
-
-            if let Some(input) = event.keystroke.key_char.as_deref() {
-                if input == "\n" {
-                    this.submit_input(cx);
-                    return;
-                }
-
-                if event.keystroke.modifiers.control {
-                    return;
-                }
-                if event.keystroke.modifiers.alt || event.keystroke.modifiers.platform {
-                    return;
-                }
-                if input.chars().any(|ch| !ch.is_control()) {
-                    this.insert_text(input);
-                    this.reconcile_suggestion_visibility();
-                    cx.notify();
-                }
+            if key == "enter"
+                && !event.keystroke.modifiers.shift
+                && !event.keystroke.modifiers.secondary()
+            {
+                this.submit_input(window, cx);
             }
         })
         .detach();
 
         Self {
             app_state,
-            scroll_handle: ScrollHandle::new(),
+            scroll_handle: VirtualListScrollHandle::new(),
             suggestion_scroll_handle: ScrollHandle::new(),
-            input_buffer: String::new(),
-            input_cursor: 0,
-            input_selection: None,
+            input_state,
             locked_to_bottom: true,
             suggestion_anchor: None,
             suggestion_selected: 0,
             dismissed_suggestion: None,
+            input_history: Vec::new(),
+            history_cursor: None,
+            history_draft: String::new(),
+            expanded_messages: HashSet::new(),
+            rows: Vec::new(),
         }
     }
 
-    fn submit_input(&mut self, cx: &mut Context<Self>) {
-        let content = self.input_buffer.trim().to_owned();
+    fn input_value(&self, cx: &Context<Self>) -> String {
+        self.input_state.read(cx).value().to_string()
+    }
+
+    fn set_input_value(
+        &self,
+        value: impl Into<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value = value.into();
+        self.input_state.update(cx, |state, cx| {
+            state.set_value(value, window, cx);
+            state.focus(window, cx);
+        });
+    }
+
+    fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.input_value(cx);
+        let content = raw.trim().to_owned();
         if content.is_empty() {
             return;
         }
@@ -175,12 +176,48 @@ impl ChatView {
             self.app_state.update(cx, |state, cx| {
                 state.send_user_message(cx, thread_id, &content);
             });
-            self.input_buffer.clear();
-            self.input_cursor = 0;
-            self.input_selection = None;
+            if self
+                .input_history
+                .last()
+                .is_none_or(|last| last != &content)
+            {
+                self.input_history.push(content);
+            }
+            self.history_cursor = None;
+            self.history_draft.clear();
+            self.set_input_value("", window, cx);
             self.locked_to_bottom = true;
             cx.notify();
         }
+    }
+
+    fn history_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let next_index = match self.history_cursor {
+            Some(index) => index.saturating_sub(1),
+            None => {
+                self.history_draft = self.input_value(cx);
+                self.input_history.len().saturating_sub(1)
+            }
+        };
+        self.history_cursor = Some(next_index);
+        self.set_input_value(self.input_history[next_index].clone(), window, cx);
+    }
+
+    fn history_down(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.history_cursor else {
+            return;
+        };
+        if index + 1 < self.input_history.len() {
+            let next_index = index + 1;
+            self.history_cursor = Some(next_index);
+            self.set_input_value(self.input_history[next_index].clone(), window, cx);
+            return;
+        }
+        self.history_cursor = None;
+        self.set_input_value(self.history_draft.clone(), window, cx);
     }
 
     fn update_scroll_lock(&mut self) {
@@ -189,26 +226,26 @@ impl ChatView {
         self.locked_to_bottom = (max_y - y).abs() <= px(2.0);
     }
 
-    fn suggestion_anchor(&self) -> Option<(SuggestionKind, usize, String)> {
-        if self.input_buffer.starts_with('/') && !self.input_buffer.contains(char::is_whitespace) {
-            return Some((SuggestionKind::Slash, 0, self.input_buffer[1..].to_string()));
+    fn suggestion_anchor_from_input(&self, input: &str) -> Option<(SuggestionKind, usize, String)> {
+        if input.starts_with('/') && !input.contains(char::is_whitespace) {
+            return Some((SuggestionKind::Slash, 0, input[1..].to_string()));
         }
 
-        let token_start = self
-            .input_buffer
+        let token_start = input
             .rfind(char::is_whitespace)
             .map(|index| index + 1)
             .unwrap_or(0);
-        let token = &self.input_buffer[token_start..];
+        let token = &input[token_start..];
         token
             .strip_prefix('@')
             .map(|query| (SuggestionKind::File, token_start, query.to_string()))
     }
 
-    fn reconcile_suggestion_visibility(&mut self) {
+    fn reconcile_suggestion_visibility(&mut self, cx: &Context<Self>) {
+        let input = self.input_value(cx);
         if self.dismissed_suggestion.is_some()
             && self
-                .suggestion_anchor()
+                .suggestion_anchor_from_input(&input)
                 .map(|(kind, start, _)| (kind, start))
                 != self.dismissed_suggestion
         {
@@ -217,8 +254,9 @@ impl ChatView {
     }
 
     fn compute_suggestions(&mut self, cx: &Context<Self>) -> Option<SuggestionState> {
-        self.reconcile_suggestion_visibility();
-        let (kind, start, query) = self.suggestion_anchor()?;
+        let input = self.input_value(cx);
+        self.reconcile_suggestion_visibility(cx);
+        let (kind, start, query) = self.suggestion_anchor_from_input(&input)?;
         if self.dismissed_suggestion == Some((kind, start)) {
             return None;
         }
@@ -282,111 +320,191 @@ impl ChatView {
         self.suggestion_selected = (self.suggestion_selected + 1) % total;
     }
 
-    fn apply_suggestion(&mut self, state: &SuggestionState) {
+    fn apply_suggestion(
+        &mut self,
+        state: &SuggestionState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(item) = state.items.get(state.selected) else {
             return;
         };
-        self.input_buffer
-            .replace_range(state.start..self.input_buffer.len(), &item.replacement);
-        self.input_cursor = self.input_buffer.chars().count();
-        self.input_selection = None;
+        let mut input = self.input_value(cx);
+        input.replace_range(state.start..input.len(), &item.replacement);
         self.suggestion_anchor = None;
         self.dismissed_suggestion = None;
+        self.set_input_value(input, window, cx);
     }
 
-    fn input_len_chars(&self) -> usize {
-        self.input_buffer.chars().count()
-    }
-
-    fn char_to_byte_index(&self, char_index: usize) -> usize {
-        self.input_buffer
-            .char_indices()
-            .nth(char_index)
-            .map_or(self.input_buffer.len(), |(index, _)| index)
-    }
-
-    fn clear_selection(&mut self) {
-        self.input_selection = None;
-    }
-
-    fn delete_selection(&mut self) -> bool {
-        let Some(selection) = self.input_selection.clone() else {
-            return false;
-        };
-        let start = selection.start.min(selection.end);
-        let end = selection.start.max(selection.end);
-        let start_byte = self.char_to_byte_index(start);
-        let end_byte = self.char_to_byte_index(end);
-        self.input_buffer.replace_range(start_byte..end_byte, "");
-        self.input_cursor = start;
-        self.input_selection = None;
-        true
-    }
-
-    fn insert_text(&mut self, text: &str) {
-        let _ = self.delete_selection();
-        let index = self.char_to_byte_index(self.input_cursor);
-        self.input_buffer.insert_str(index, text);
-        self.input_cursor += text.chars().count();
-        self.clear_selection();
-    }
-
-    fn backspace(&mut self) {
-        if self.delete_selection() {
-            return;
+    fn build_rows(&self, messages: Vec<Message>, is_working: bool) -> Vec<ChatRow> {
+        let mut rows = messages
+            .into_iter()
+            .map(ChatRow::Message)
+            .collect::<Vec<_>>();
+        if is_working {
+            rows.push(ChatRow::Working);
         }
-        if self.input_cursor == 0 {
-            return;
-        }
-        let start = self.char_to_byte_index(self.input_cursor - 1);
-        let end = self.char_to_byte_index(self.input_cursor);
-        self.input_buffer.replace_range(start..end, "");
-        self.input_cursor -= 1;
+        rows
     }
 
-    fn delete_forward(&mut self) {
-        if self.delete_selection() {
-            return;
-        }
-        if self.input_cursor >= self.input_len_chars() {
-            return;
-        }
-        let start = self.char_to_byte_index(self.input_cursor);
-        let end = self.char_to_byte_index(self.input_cursor + 1);
-        self.input_buffer.replace_range(start..end, "");
-    }
-
-    fn move_cursor_left(&mut self) {
-        self.clear_selection();
-        self.input_cursor = self.input_cursor.saturating_sub(1);
-    }
-
-    fn move_cursor_right(&mut self) {
-        self.clear_selection();
-        self.input_cursor = (self.input_cursor + 1).min(self.input_len_chars());
-    }
-
-    fn select_all_input(&mut self) {
-        let len = self.input_len_chars();
-        self.input_selection = Some(0..len);
-        self.input_cursor = len;
-    }
-
-    fn input_display_text(&self) -> String {
-        if self.input_buffer.is_empty() {
-            return "|".to_string();
-        }
-        let mut rendered = String::new();
-        for (index, ch) in self.input_buffer.chars().enumerate() {
-            if index == self.input_cursor {
-                rendered.push('|');
+    fn estimate_row_size(row: &ChatRow) -> Size<Pixels> {
+        let line_height = 20.0;
+        let base = 24.0;
+        let height = match row {
+            ChatRow::Working => 56.0,
+            ChatRow::Message(message) => {
+                let lines = message.content.lines().count().max(1).min(14) as f32;
+                base + lines * line_height
             }
-            rendered.push(ch);
+        };
+        size(px(1.0), px(height))
+    }
+
+    fn render_readonly_code(
+        &self,
+        message_id: Uuid,
+        language: &str,
+        content: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let language = language.to_string();
+        let editor = window.use_keyed_state(
+            SharedString::from(format!("chat-code-{}", message_id)),
+            cx,
+            |window, cx| {
+                InputState::new(window, cx)
+                    .code_editor(language.clone())
+                    .line_number(true)
+                    .rows(10)
+            },
+        );
+        editor.update(cx, |state, cx| {
+            state.set_value(content, window, cx);
+        });
+        div()
+            .w_full()
+            .h(px(220.0))
+            .overflow_hidden()
+            .child(Input::new(&editor).h_full().disabled(true))
+            .into_any_element()
+    }
+
+    fn render_message_content(
+        &self,
+        message: &Message,
+        content: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if content.contains("\n--- before\n+++ after") {
+            return self.render_readonly_code(message.id, "diff", content, window, cx);
         }
-        if self.input_cursor >= self.input_len_chars() {
-            rendered.push('|');
+
+        TextView::markdown(
+            SharedString::from(format!("chat-md-{}", message.id)),
+            SharedString::from(content),
+            window,
+            cx,
+        )
+        .selectable(true)
+        .into_any_element()
+    }
+
+    fn render_row(
+        &self,
+        row_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(row) = self.rows.get(row_index).cloned() else {
+            return div().into_any_element();
+        };
+
+        match row {
+            ChatRow::Working => div()
+                .id(("chat-working", row_index))
+                .px_3()
+                .py_2()
+                .child(
+                    div()
+                        .p_3()
+                        .rounded_md()
+                        .bg(rgb(0x2d2d30))
+                        .child(Skeleton::new()),
+                )
+                .into_any_element(),
+            ChatRow::Message(message) => {
+                let bg = match message.role {
+                    Role::User => rgb(0x0e639c),
+                    Role::Agent => rgb(0x3c3c3c),
+                    Role::System => rgb(0x6b2f2f),
+                };
+                let line_count = message.content.lines().count();
+                let is_collapsible = line_count > 10;
+                let is_expanded = self.expanded_messages.contains(&message.id);
+                let display_content = if is_collapsible && !is_expanded {
+                    message
+                        .content
+                        .lines()
+                        .take(10)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    message.content.clone()
+                };
+                let copy_content = message.content.clone();
+
+                div()
+                    .id(("chat-message", row_index))
+                    .p_2()
+                    .cursor_text()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_content.clone()));
+                    }))
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w_full()
+                            .p_2()
+                            .rounded_md()
+                            .bg(bg)
+                            .text_color(white())
+                            .whitespace_normal()
+                            .child(self.render_message_content(
+                                &message,
+                                display_content,
+                                window,
+                                cx,
+                            ))
+                            .when(is_collapsible, |this| {
+                                let message_id = message.id;
+                                this.child(
+                                    div()
+                                        .id(("message-expand-toggle", row_index))
+                                        .mt_2()
+                                        .text_xs()
+                                        .text_color(rgb(0xbdbdbd))
+                                        .cursor_pointer()
+                                        .child(if is_expanded {
+                                            "Show less"
+                                        } else {
+                                            "Show more"
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if this.expanded_messages.contains(&message_id) {
+                                                this.expanded_messages.remove(&message_id);
+                                            } else {
+                                                this.expanded_messages.insert(message_id);
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+            }
         }
-        rendered
     }
 }
 
@@ -394,7 +512,7 @@ impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_scroll_lock();
 
-        let (active_thread_id, messages, permission_options, config_options, modes) = {
+        let (active_thread_id, messages, permission_options, config_options, modes, is_working) = {
             let state = self.app_state.read(cx);
             (
                 state.active_thread_id,
@@ -402,11 +520,14 @@ impl Render for ChatView {
                 state.active_thread_permission_options(),
                 state.active_thread_config_options(),
                 state.active_thread_modes(),
+                state.active_thread_is_working(),
             )
         };
 
+        self.rows = self.build_rows(messages, is_working);
+
         let chat_content: AnyElement = if active_thread_id.is_some() {
-            if messages.is_empty() {
+            if self.rows.is_empty() {
                 div()
                     .flex_1()
                     .flex()
@@ -416,40 +537,26 @@ impl Render for ChatView {
                     .child("Send a message to start")
                     .into_any_element()
             } else {
-                let rows = messages.into_iter().enumerate().map(|(index, msg)| {
-                    let bg = match msg.role {
-                        Role::User => rgb(0x0e639c),
-                        Role::Agent => rgb(0x3c3c3c),
-                        Role::System => rgb(0x6b2f2f),
-                    };
-                    let content = msg.content;
-                    let copy_content = content.clone();
-
-                    div()
-                        .id(("chat-message", index))
-                        .p_2()
-                        .cursor_text()
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(copy_content.clone()));
-                        }))
-                        .child(
-                            div()
-                                .p_2()
-                                .rounded_md()
-                                .bg(bg)
-                                .text_color(white())
-                                .child(content.clone()),
-                        )
-                });
-
-                div()
-                    .id("chat-message-list")
-                    .flex_1()
-                    .w_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll_handle)
-                    .children(rows)
-                    .into_any_element()
+                let item_sizes = Rc::new(
+                    self.rows
+                        .iter()
+                        .map(Self::estimate_row_size)
+                        .collect::<Vec<_>>(),
+                );
+                v_virtual_list(
+                    cx.entity().clone(),
+                    "chat-message-list",
+                    item_sizes,
+                    |this, range, window, cx| {
+                        range
+                            .map(|idx| this.render_row(idx, window, cx))
+                            .collect::<Vec<_>>()
+                    },
+                )
+                .track_scroll(&self.scroll_handle)
+                .flex_1()
+                .w_full()
+                .into_any_element()
             }
         } else {
             div()
@@ -462,14 +569,7 @@ impl Render for ChatView {
                 .into_any_element()
         };
 
-        let input_hint = if self.input_buffer.is_empty() {
-            "| Type and press Enter...".to_string()
-        } else {
-            self.input_display_text()
-        };
-
         let input_box = div()
-            .h(px(64.0))
             .w_full()
             .p_3()
             .bg(rgb(0x1e1e1e))
@@ -477,21 +577,13 @@ impl Render for ChatView {
             .border_color(rgb(0x3c3c3c))
             .flex()
             .gap_2()
-            .items_center()
+            .items_end()
             .child(
                 div()
                     .flex_1()
-                    .h_full()
-                    .bg(rgb(0x3c3c3c))
-                    .rounded_md()
-                    .px_3()
-                    .py_2()
-                    .text_color(if self.input_buffer.is_empty() {
-                        rgb(0x9a9a9a)
-                    } else {
-                        rgb(0xffffff)
-                    })
-                    .child(input_hint),
+                    .min_h(px(64.0))
+                    .max_h(px(200.0))
+                    .child(Input::new(&self.input_state).h_full()),
             )
             .child(
                 div()
@@ -503,8 +595,8 @@ impl Render for ChatView {
                     .py_2()
                     .cursor_pointer()
                     .child("Send")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.submit_input(cx);
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.submit_input(window, cx);
                     })),
             );
 

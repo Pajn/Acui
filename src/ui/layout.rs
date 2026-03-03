@@ -13,9 +13,9 @@ pub struct WorkspaceLayout {
 }
 
 impl WorkspaceLayout {
-    pub fn new(app_state: Entity<AppState>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(app_state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let sidebar = cx.new(|cx| SidebarView::new(app_state.clone(), cx));
-        let chat = cx.new(|cx| ChatView::new(app_state.clone(), cx));
+        let chat = cx.new(|cx| ChatView::new(app_state.clone(), window, cx));
         let plan_sidebar = cx.new(|cx| PlanSidebarView::new(app_state.clone(), cx));
         Self {
             app_state,
