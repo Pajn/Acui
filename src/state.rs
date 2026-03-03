@@ -18,6 +18,7 @@ use agent_client_protocol::{
     SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use ignore::WalkBuilder;
+use similar::TextDiff;
 
 struct ThreadAgentConnection {
     controller: Rc<AcpController>,
@@ -217,6 +218,69 @@ impl AppState {
         cx.notify();
     }
 
+    pub fn rename_thread(&mut self, cx: &mut Context<Self>, thread_id: Uuid, name: String) -> bool {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let Some(thread) = self.find_thread_mut(thread_id) else {
+            return false;
+        };
+        thread.name = trimmed.to_string();
+        thread.updated_at = chrono::Utc::now();
+        self.persist_state();
+        cx.notify();
+        true
+    }
+
+    pub fn delete_thread(&mut self, cx: &mut Context<Self>, thread_id: Uuid) -> bool {
+        let mut deleted = false;
+        for workspace in &mut self.workspaces {
+            if let Some(index) = workspace
+                .threads
+                .iter()
+                .position(|thread| thread.id == thread_id)
+            {
+                workspace.threads.remove(index);
+                deleted = true;
+                break;
+            }
+        }
+        if !deleted {
+            return false;
+        }
+
+        self.agent_tasks.remove(&thread_id);
+        self.mock_event_senders.remove(&thread_id);
+        self.agent_connections.remove(&thread_id);
+        self.pending_permissions.remove(&thread_id);
+        self.thread_config_options.remove(&thread_id);
+        self.thread_available_commands.remove(&thread_id);
+        self.thread_tool_calls.remove(&thread_id);
+        self.thread_tool_call_messages.remove(&thread_id);
+        self.thread_plans.remove(&thread_id);
+        self.thread_modes.remove(&thread_id);
+        self.prompt_started_at.remove(&thread_id);
+        self.unread_stopped_threads.remove(&thread_id);
+
+        if self.active_thread_id == Some(thread_id) {
+            self.active_thread_id = self
+                .workspaces
+                .iter()
+                .find_map(|workspace| workspace.threads.first())
+                .map(|thread| thread.id);
+        }
+
+        self.persist_state();
+        cx.notify();
+        true
+    }
+
+    pub fn mark_thread_unread(&mut self, cx: &mut Context<Self>, thread_id: Uuid) {
+        self.unread_stopped_threads.insert(thread_id);
+        cx.notify();
+    }
+
     pub fn workspace_cwd_for_thread(&self, thread_id: Uuid) -> Option<PathBuf> {
         self.workspaces.iter().find_map(|workspace| {
             workspace
@@ -275,6 +339,14 @@ impl AppState {
         thread_id: Uuid,
         option_id: Option<String>,
     ) {
+        self.append_log_line(
+            "to_agent.permission_outcome",
+            thread_id,
+            &serde_json::json!({
+                "selected_option_id": option_id.clone(),
+            })
+            .to_string(),
+        );
         if self.resolve_permission_choice(thread_id, option_id) {
             cx.notify();
         }
@@ -296,6 +368,17 @@ impl AppState {
             move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
                 let mut cx = cx.clone();
                 async move {
+                    let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                        state.append_log_line(
+                            "to_agent.set_session_config_option",
+                            thread_id,
+                            &serde_json::json!({
+                                "config_id": config_id.clone(),
+                                "value": value.clone(),
+                            })
+                            .to_string(),
+                        );
+                    });
                     let result = controller
                         .set_session_config_option(
                             session_id,
@@ -306,6 +389,14 @@ impl AppState {
                     match result {
                         Ok(config_options) => {
                             let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                state.append_log_line(
+                                    "from_agent.set_session_config_option",
+                                    thread_id,
+                                    &serde_json::json!({
+                                        "config_options": config_options,
+                                    })
+                                    .to_string(),
+                                );
                                 state
                                     .thread_config_options
                                     .insert(thread_id, config_options);
@@ -315,6 +406,11 @@ impl AppState {
                         Err(err) => {
                             let message = format!("Failed to set session option: {err}");
                             let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                state.append_log_line(
+                                    "from_agent.set_session_config_option_error",
+                                    thread_id,
+                                    &message,
+                                );
                                 state.push_system_message(cx, thread_id, message);
                             });
                         }
@@ -335,13 +431,29 @@ impl AppState {
             move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
                 let mut cx = cx.clone();
                 async move {
+                    let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                        state.append_log_line("to_agent.set_session_mode", thread_id, &mode_id);
+                    });
                     let result = controller
                         .set_session_mode(session_id, SessionModeId::new(mode_id.clone()))
                         .await;
                     if let Err(err) = result {
                         let message = format!("Failed to set session mode: {err}");
                         let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                            state.append_log_line(
+                                "from_agent.set_session_mode_error",
+                                thread_id,
+                                &message,
+                            );
                             state.push_system_message(cx, thread_id, message);
+                        });
+                    } else {
+                        let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                            state.append_log_line(
+                                "from_agent.set_session_mode_ok",
+                                thread_id,
+                                &mode_id,
+                            );
                         });
                     }
                 }
@@ -409,6 +521,11 @@ impl AppState {
         thread_id: Uuid,
         config_path: PathBuf,
     ) {
+        self.append_log_line(
+            "to_agent.connect_from_config",
+            thread_id,
+            &config_path.display().to_string(),
+        );
         cx.spawn(
             move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
                 let mut cx = cx.clone();
@@ -418,6 +535,13 @@ impl AppState {
 
                     match result {
                         Ok((controller, process)) => {
+                            let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                                state.append_log_line(
+                                    "from_agent.connect_ok",
+                                    thread_id,
+                                    "connected",
+                                );
+                            });
                             let (cwd, previous_session_id) = this
                                 .read_with(&cx, |state, _| {
                                     (
@@ -435,6 +559,17 @@ impl AppState {
                             });
                             let loaded_session_id = if let Some(session_id) = previous_session_id {
                                 let session_id = SessionId::new(session_id);
+                                let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                                    state.append_log_line(
+                                        "to_agent.load_session",
+                                        thread_id,
+                                        &serde_json::json!({
+                                            "session_id": session_id.to_string(),
+                                            "cwd": cwd.clone(),
+                                        })
+                                        .to_string(),
+                                    );
+                                });
                                 match controller
                                     .load_session(session_id.clone(), cwd.clone())
                                     .await
@@ -445,6 +580,11 @@ impl AppState {
                                     Err(err) => {
                                         let message = format!("Failed to load ACP session: {err}");
                                         let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                            state.append_log_line(
+                                                "from_agent.load_session_error",
+                                                thread_id,
+                                                &message,
+                                            );
                                             state.push_system_message(cx, thread_id, message);
                                         });
                                         None
@@ -457,12 +597,29 @@ impl AppState {
                             let session_result = if let Some(session_data) = loaded_session_id {
                                 Ok(session_data)
                             } else {
+                                let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                                    state.append_log_line(
+                                        "to_agent.initialize_session",
+                                        thread_id,
+                                        &cwd.display().to_string(),
+                                    );
+                                });
                                 controller.initialize_session(cwd).await
                             };
 
                             match session_result {
                                 Ok((session_id, config_options, modes)) => {
                                     let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                        state.append_log_line(
+                                            "from_agent.initialize_or_load_session_ok",
+                                            thread_id,
+                                            &serde_json::json!({
+                                                "session_id": session_id.to_string(),
+                                                "config_options_len": config_options.len(),
+                                                "has_modes": modes.is_some(),
+                                            })
+                                            .to_string(),
+                                        );
                                         state.attach_connection(
                                             cx,
                                             thread_id,
@@ -479,6 +636,11 @@ impl AppState {
                                     let message =
                                         format!("Failed to initialize ACP session: {err}");
                                     let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                        state.append_log_line(
+                                            "from_agent.initialize_session_error",
+                                            thread_id,
+                                            &message,
+                                        );
                                         state.push_system_message(cx, thread_id, message);
                                     });
                                 }
@@ -487,6 +649,11 @@ impl AppState {
                         Err(err) => {
                             let message = format!("Failed to connect ACP controller: {err}");
                             let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                state.append_log_line(
+                                    "from_agent.connect_error",
+                                    thread_id,
+                                    &message,
+                                );
                                 state.push_system_message(cx, thread_id, message);
                             });
                         }
@@ -572,6 +739,14 @@ impl AppState {
                 self.apply_session_update(thread_id, notification.update);
             }
             AgentEvent::PermissionRequest(request) => {
+                self.append_log_line(
+                    "from_agent.permission_request",
+                    thread_id,
+                    &serde_json::json!({
+                        "options": request.options.clone(),
+                    })
+                    .to_string(),
+                );
                 if let Some(existing) = self.pending_permissions.remove(&thread_id) {
                     let _ = existing
                         .response_tx
@@ -580,6 +755,7 @@ impl AppState {
                 self.pending_permissions.insert(thread_id, request);
             }
             AgentEvent::Disconnected => {
+                self.append_log_line("from_agent.disconnected", thread_id, "disconnected");
                 self.finalize_agent_message(thread_id);
             }
         }
@@ -599,6 +775,17 @@ impl AppState {
 
     pub fn active_thread_message_count(&self) -> usize {
         self.active_thread_messages().len()
+    }
+
+    pub fn active_thread_is_working(&self) -> bool {
+        let Some(thread_id) = self.active_thread_id else {
+            return false;
+        };
+        if self.prompt_started_at.contains_key(&thread_id) {
+            return true;
+        }
+        self.find_thread(thread_id)
+            .is_some_and(|thread| thread.messages.iter().any(|msg| msg.is_streaming))
     }
 
     fn find_thread_mut(&mut self, thread_id: Uuid) -> Option<&mut Thread> {
@@ -883,7 +1070,9 @@ fn render_tool_call_content(content: &ToolCallContent) -> String {
         },
         ToolCallContent::Diff(diff) => {
             let mut out = vec![format!("Diff: {}", diff.path.display())];
+            out.push("```diff".to_string());
             out.push(render_diff_text(diff.old_text.as_deref(), &diff.new_text));
+            out.push("```".to_string());
             out.join("\n")
         }
         ToolCallContent::Terminal(terminal) => {
@@ -894,32 +1083,14 @@ fn render_tool_call_content(content: &ToolCallContent) -> String {
 }
 
 fn render_diff_text(old: Option<&str>, new: &str) -> String {
-    let mut lines = vec!["--- before".to_string(), "+++ after".to_string()];
-    let old_lines = old.map(|text| text.lines().collect::<Vec<_>>());
-    let new_lines = new.lines().collect::<Vec<_>>();
-    let max_len = old_lines
-        .as_ref()
-        .map_or(new_lines.len(), |values| values.len().max(new_lines.len()));
-    for index in 0..max_len {
-        let before = old_lines
-            .as_ref()
-            .and_then(|values| values.get(index))
-            .copied();
-        let after = new_lines.get(index).copied();
-        if before == after {
-            continue;
-        }
-        if let Some(before) = before {
-            lines.push(format!("-{before}"));
-        }
-        if let Some(after) = after {
-            lines.push(format!("+{after}"));
-        }
+    let before = old.unwrap_or_default();
+    if before == new {
+        return "--- before\n+++ after\n(no changes)".to_string();
     }
-    if lines.len() == 2 {
-        lines.push("(no changes)".to_string());
-    }
-    lines.join("\n")
+    TextDiff::from_lines(before, new)
+        .unified_diff()
+        .header("before", "after")
+        .to_string()
 }
 
 fn collect_workspace_files(root: &PathBuf, limit: usize) -> Vec<String> {

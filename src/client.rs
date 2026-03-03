@@ -12,6 +12,7 @@ use agent_client_protocol::{
 };
 use async_trait::async_trait;
 use serde::Deserialize;
+use similar::TextDiff;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -142,7 +143,7 @@ impl acp::Client for GpuiAcpClient {
         let diff = render_text_diff(previous.as_deref(), &args.content);
         self.send_agent_message(
             args.session_id,
-            format!("Wrote {}.\n{}", args.path.display(), diff),
+            format!("Wrote {}.\n```diff\n{}\n```", args.path.display(), diff),
         );
         Ok(WriteTextFileResponse::new())
     }
@@ -333,38 +334,14 @@ fn format_read_result(path: &Path, content: &str, start_line: u32) -> String {
 }
 
 fn render_text_diff(old: Option<&str>, new: &str) -> String {
-    let old_lines = old.map(|value| value.lines().collect::<Vec<_>>());
-    let new_lines = new.lines().collect::<Vec<_>>();
-    let max_len = old_lines
-        .as_ref()
-        .map_or(new_lines.len(), |old| old.len().max(new_lines.len()));
-    let mut out = Vec::new();
-    out.push("--- before".to_string());
-    out.push("+++ after".to_string());
-    if max_len == 0 {
-        out.push("(no changes)".to_string());
-        return out.join("\n");
+    let before = old.unwrap_or_default();
+    if before == new {
+        return "--- before\n+++ after\n(no changes)".to_string();
     }
-    for index in 0..max_len {
-        let before = old_lines
-            .as_ref()
-            .and_then(|lines| lines.get(index))
-            .copied();
-        let after = new_lines.get(index).copied();
-        if before == after {
-            continue;
-        }
-        if let Some(before) = before {
-            out.push(format!("-{before}"));
-        }
-        if let Some(after) = after {
-            out.push(format!("+{after}"));
-        }
-    }
-    if out.len() == 2 {
-        out.push("(no changes)".to_string());
-    }
-    out.join("\n")
+    TextDiff::from_lines(before, new)
+        .unified_diff()
+        .header("before", "after")
+        .to_string()
 }
 
 fn append_with_limit(output: &mut String, chunk: &str, output_limit: Option<usize>) -> bool {

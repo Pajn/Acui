@@ -44,18 +44,7 @@ impl AppConfig {
 }
 
 fn default_data_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    #[cfg(target_os = "macos")]
-    {
-        return home
-            .join("Library")
-            .join("Application Support")
-            .join("acui");
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        home.join(".local").join("share").join("acui")
-    }
+    directories::ProjectDirs::from("", "", "acui")
+        .map(|dirs| dirs.data_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(".acui"))
 }

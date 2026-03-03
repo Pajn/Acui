@@ -42,9 +42,9 @@ fn main() {
     let headless =
         std::env::var("ACUI_HEADLESS").as_deref() == Ok("1") || e2e_duration_secs.is_some();
     let application = if headless {
-        Application::headless()
+        Application::headless().with_assets(gpui_component_assets::Assets)
     } else {
-        Application::new()
+        Application::new().with_assets(gpui_component_assets::Assets)
     };
     application.on_reopen(|cx: &mut App| {
         if cx.windows().is_empty()
@@ -56,6 +56,7 @@ fn main() {
     });
 
     application.run(move |cx: &mut App| {
+        gpui_component::init(cx);
         let app_state = cx.new(|cx| {
             let config = AppConfig::load().unwrap_or_else(|err| {
                 eprintln!("failed to load acui.toml, using defaults: {err}");
