@@ -153,9 +153,22 @@ impl ChatView {
         })
         .detach();
 
+        let list_state = {
+            let this = cx.entity();
+            let state = ListState::new(0, ListAlignment::Top, px(512.0));
+            let weak = this.downgrade();
+            state.set_scroll_handler(move |_event, _window, app| {
+                let _ = weak.update(app, |this, cx| {
+                    this.update_scroll_lock();
+                    cx.notify();
+                });
+            });
+            state
+        };
+
         Self {
             app_state,
-            list_state: ListState::new(0, ListAlignment::Top, px(512.0)),
+            list_state,
             listed_thread_id: None,
             listed_count: 0,
             suggestion_scroll_handle: ScrollHandle::new(),
@@ -600,8 +613,14 @@ impl ChatView {
 
     #[doc(hidden)]
     #[allow(dead_code)]
-    pub fn debug_message_set_scroll_offset(&self, offset: Point<Pixels>) {
+    pub fn debug_message_set_scroll_offset(
+        &mut self,
+        offset: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
         self.list_state.set_offset_from_scrollbar(offset);
+        self.update_scroll_lock();
+        cx.notify();
     }
 
     #[doc(hidden)]
@@ -632,11 +651,28 @@ impl ChatView {
             false
         }
     }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn debug_is_locked_to_bottom(&self) -> bool {
+        self.locked_to_bottom
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn debug_app_state(&self) -> Entity<AppState> {
+        self.app_state.clone()
+    }
 }
 
 impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.update_scroll_lock();
+        // Maintain the bottom-lock invariant: keep scroll at the end of content
+        // while locked. update_scroll_lock() is driven by the list scroll_handler
+        // (user scrolls) and debug_message_set_scroll_offset (tests).
+        if self.locked_to_bottom {
+            self.scroll_to_bottom();
+        }
 
         let (
             active_thread_id,
