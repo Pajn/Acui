@@ -41,6 +41,8 @@ struct ThreadState {
     plan: Option<Plan>,
     mode: Option<SessionModeState>,
     prompt_started_at: Option<Instant>,
+    /// Agent selected for this thread but not yet connected (pre-first-message).
+    selected_agent_name: Option<String>,
 }
 
 impl ThreadState {
@@ -57,6 +59,7 @@ impl ThreadState {
             plan: None,
             mode: None,
             prompt_started_at: None,
+            selected_agent_name: None,
         }
     }
 }
@@ -234,11 +237,10 @@ impl AppState {
             self.ts_mut(thread_id).mock_event_sender = Some(tx);
         }
 
-        // Auto-connect new threads to the first configured agent when available.
-        // (Lazy per-message selection is handled in a later flow.)
-        if let Some(agent) = self.agents.first().cloned() {
-            self.connect_thread_to_agent(cx, thread_id, agent);
-        }
+        // Pre-select the first configured agent for the thread; the connection
+        // is established lazily on the first `send_user_message` call.
+        let first_agent_name = self.agents.first().map(|a| a.name.clone());
+        self.ts_mut(thread_id).selected_agent_name = first_agent_name;
 
         self.persist_state();
         cx.notify();
@@ -368,6 +370,43 @@ impl AppState {
 
     pub fn thread_has_unread_stop(&self, thread_id: Uuid) -> bool {
         self.unread_stopped_threads.contains(&thread_id)
+    }
+
+    /// All configured named agents.
+    pub fn configured_agents(&self) -> &[crate::config::AgentConfig] {
+        &self.agents
+    }
+
+    /// Select a named agent for the active thread (before first message).
+    pub fn select_agent_for_thread(
+        &mut self,
+        cx: &mut Context<Self>,
+        thread_id: Uuid,
+        agent_name: String,
+    ) {
+        self.ts_mut(thread_id).selected_agent_name = Some(agent_name);
+        cx.notify();
+    }
+
+    /// The agent name pre-selected for the active thread (before it is locked).
+    pub fn active_thread_selected_agent(&self) -> Option<String> {
+        let thread_id = self.active_thread_id?;
+        self.ts(thread_id)
+            .and_then(|ts| ts.selected_agent_name.clone())
+    }
+
+    /// Whether the active thread is locked to an agent (first message already sent).
+    pub fn active_thread_is_agent_locked(&self) -> bool {
+        self.active_thread_id
+            .and_then(|id| self.find_thread(id))
+            .is_some_and(|t| t.agent_name.is_some())
+    }
+
+    /// The agent name the active thread is locked to (after first message).
+    pub fn active_thread_locked_agent(&self) -> Option<String> {
+        self.active_thread_id
+            .and_then(|id| self.find_thread(id))
+            .and_then(|t| t.agent_name.clone())
     }
 
     pub fn resolve_permission(
@@ -542,20 +581,151 @@ impl AppState {
                 },
             )
             .detach();
-        } else if let Some(event_tx) = mock_tx {
-            let content = content.to_owned();
-            let chunks = ["Mock reply: ", &content];
-            for chunk in chunks {
-                let update = SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                    ContentBlock::from(chunk.to_owned()),
-                ));
-                let notification = SessionNotification::new(SessionId::new("mock-session"), update);
-                let _ = event_tx.send(AgentEvent::Notification(notification));
+        } else {
+            // No connection yet — try to lazily connect to the selected/locked agent.
+            let agent = self
+                .ts(thread_id)
+                .and_then(|ts| ts.selected_agent_name.as_ref())
+                .or_else(|| {
+                    self.find_thread(thread_id)
+                        .and_then(|t| t.agent_name.as_ref())
+                })
+                .and_then(|name| self.agents.iter().find(|a| a.name == *name))
+                .cloned();
+
+            if let Some(agent) = agent {
+                let content = content.to_owned();
+                self.ts_mut(thread_id).prompt_started_at = Some(Instant::now());
+                self.connect_and_send(cx, thread_id, agent, content);
+            } else if let Some(event_tx) = mock_tx {
+                let content = content.to_owned();
+                let chunks = ["Mock reply: ", &content];
+                for chunk in chunks {
+                    let update = SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                        ContentBlock::from(chunk.to_owned()),
+                    ));
+                    let notification =
+                        SessionNotification::new(SessionId::new("mock-session"), update);
+                    let _ = event_tx.send(AgentEvent::Notification(notification));
+                }
+                let _ = event_tx.send(AgentEvent::Disconnected);
             }
-            let _ = event_tx.send(AgentEvent::Disconnected);
         }
 
         cx.notify();
+    }
+
+    /// Connect to an agent and send a prompt in a single async task.
+    /// Used for the first message on an unlocked thread (lazy connect).
+    fn connect_and_send(
+        &mut self,
+        cx: &mut Context<Self>,
+        thread_id: Uuid,
+        agent: crate::config::AgentConfig,
+        content: String,
+    ) {
+        self.append_log_line("to_agent.connect_and_send", thread_id, &agent.name);
+        cx.spawn(
+            move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let (event_tx, event_rx) = mpsc::unbounded_channel();
+                    let connect_result =
+                        AcpController::connect_from_agent_config(&agent, event_tx).await;
+                    let (controller, process) = match connect_result {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            let message = format!("Failed to connect ACP controller: {err}");
+                            let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                state.append_log_line(
+                                    "from_agent.connect_error",
+                                    thread_id,
+                                    &message,
+                                );
+                                state.ts_mut(thread_id).prompt_started_at = None;
+                                state.push_system_message(cx, thread_id, message);
+                            });
+                            return;
+                        }
+                    };
+
+                    let cwd = this
+                        .read_with(&cx, |state, _| state.workspace_cwd_for_thread(thread_id))
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| {
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                        });
+
+                    let session_result = controller.initialize_session(cwd).await;
+                    let (session_id, config_options, modes) = match session_result {
+                        Ok(data) => data,
+                        Err(err) => {
+                            let message = format!("Failed to initialize ACP session: {err}");
+                            let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                state.append_log_line(
+                                    "from_agent.initialize_session_error",
+                                    thread_id,
+                                    &message,
+                                );
+                                state.ts_mut(thread_id).prompt_started_at = None;
+                                state.push_system_message(cx, thread_id, message);
+                            });
+                            return;
+                        }
+                    };
+
+                    // Lock thread, attach connection, and retrieve Rc'd controller + session_id
+                    // for the send step — all within the same update to avoid races.
+                    let send_conn = this.update(&mut cx, |state: &mut AppState, cx| {
+                        if let Some(thread) = state.find_thread_mut(thread_id) {
+                            if thread.agent_name.is_none() {
+                                thread.agent_name = Some(agent.name.clone());
+                            }
+                        }
+                        state.append_log_line(
+                            "from_agent.initialize_session_ok",
+                            thread_id,
+                            &session_id.to_string(),
+                        );
+                        state.attach_connection(
+                            cx,
+                            thread_id,
+                            controller,
+                            session_id,
+                            config_options,
+                            modes,
+                            Some(process),
+                            event_rx,
+                        );
+                        state
+                            .ts(thread_id)
+                            .and_then(|ts| ts.connection.as_ref())
+                            .map(|c| (Rc::clone(&c.controller), c.session_id.clone()))
+                    });
+
+                    let Ok(Some((controller, session_id))) = send_conn else {
+                        return;
+                    };
+
+                    match controller.send_prompt(session_id, content).await {
+                        Ok(stop_reason) => {
+                            let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                state.apply_prompt_stop_reason(cx, thread_id, stop_reason);
+                            });
+                        }
+                        Err(err) => {
+                            let message = format!("Prompt failed: {err}");
+                            let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                state.ts_mut(thread_id).prompt_started_at = None;
+                                state.push_system_message(cx, thread_id, message);
+                            });
+                        }
+                    }
+                }
+            },
+        )
+        .detach();
     }
 
     pub fn connect_thread_to_agent(

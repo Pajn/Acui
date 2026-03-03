@@ -40,22 +40,15 @@ async fn mock_agent_subprocess_handles_cwd_and_permission(cx: &mut TestAppContex
     fs::create_dir_all(&workspace).expect("should create workspace");
     fs::create_dir_all(&data_dir).expect("should create data dir");
 
-    let state = create_state_entity(cx, data_dir.clone(), make_agent_config(&workspace));
+    let agent = make_agent_config(&workspace);
+    let state = create_state_entity(cx, data_dir.clone(), agent.clone());
     let thread_id = state.update(cx, |state, cx| {
         let workspace_id = state.add_workspace_from_path(cx, workspace.clone());
-        state
+        let tid = state
             .add_thread(cx, workspace_id, "Thread 1")
-            .expect("thread should be created")
-    });
-
-    wait_for_state(cx, &state, |state| {
-        state
-            .workspaces
-            .iter()
-            .flat_map(|workspace| workspace.threads.iter())
-            .find(|thread| thread.id == thread_id)
-            .and_then(|thread| thread.session_id.clone())
-            .is_some()
+            .expect("thread should be created");
+        state.select_agent_for_thread(cx, tid, agent.name.clone());
+        tid
     });
 
     state.update(cx, |state, cx| {
@@ -110,9 +103,15 @@ async fn persisted_thread_reconnect_uses_load_session(cx: &mut TestAppContext) {
     let state_a = create_state_entity(cx, data_dir.clone(), agent.clone());
     let thread_id = state_a.update(cx, |state, cx| {
         let workspace_id = state.add_workspace_from_path(cx, workspace.clone());
-        state
+        let tid = state
             .add_thread(cx, workspace_id, "Thread 1")
-            .expect("thread should be created")
+            .expect("thread should be created");
+        state.select_agent_for_thread(cx, tid, agent.name.clone());
+        tid
+    });
+    // Send a first message so the agent connects and a session_id is established.
+    state_a.update(cx, |state, cx| {
+        state.send_user_message(cx, thread_id, "hello");
     });
     wait_for_state(cx, &state_a, |state| {
         state
@@ -185,9 +184,21 @@ async fn mock_agent_exposes_modes_and_plan_updates(cx: &mut TestAppContext) {
     let state = create_state_entity(cx, data_dir.clone(), make_agent_config(&workspace));
     let thread_id = state.update(cx, |state, cx| {
         let workspace_id = state.add_workspace_from_path(cx, workspace.clone());
-        state
+        let tid = state
             .add_thread(cx, workspace_id, "Thread 1")
-            .expect("thread should be created")
+            .expect("thread should be created");
+        let agent_name = state
+            .configured_agents()
+            .first()
+            .map(|a| a.name.clone())
+            .unwrap();
+        state.select_agent_for_thread(cx, tid, agent_name);
+        tid
+    });
+
+    // Send a first message so the agent connects and we receive the initial modes.
+    state.update(cx, |state, cx| {
+        state.send_user_message(cx, thread_id, "hello");
     });
 
     wait_for_state(cx, &state, |state| {
