@@ -1,15 +1,12 @@
-use crate::domain::Role;
+use crate::domain::{MessageContent, Role};
 use crate::state::AppState;
 use agent_client_protocol::{AvailableCommand, SessionModeState};
 use gpui::prelude::*;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState, RopeExt};
-use gpui_component::scroll::Scrollbar;
 use gpui_component::skeleton::Skeleton;
 use gpui_component::text::TextView;
-use std::cell::RefCell;
 use std::collections::HashSet;
-use std::rc::Rc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -56,7 +53,6 @@ pub struct ChatView {
     history_cursor: Option<usize>,
     history_draft: String,
     expanded_messages: HashSet<Uuid>,
-    diff_scroll_handles: Rc<RefCell<std::collections::HashMap<Uuid, ScrollHandle>>>,
 }
 
 impl ChatView {
@@ -195,7 +191,6 @@ impl ChatView {
             history_cursor: None,
             history_draft: String::new(),
             expanded_messages: HashSet::new(),
-            diff_scroll_handles: Rc::new(RefCell::new(std::collections::HashMap::new())),
         }
     }
 
@@ -398,113 +393,156 @@ impl ChatView {
 
     fn render_readonly_code(
         message_id: Uuid,
-        _language: &str,
+        language: &str,
         content: String,
-        diff_scroll_handles: &Rc<RefCell<std::collections::HashMap<Uuid, ScrollHandle>>>,
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        let scroll_handle = window
+        let language = SharedString::from(language.to_string());
+        let input_state = window
             .use_keyed_state(
-                SharedString::from(format!("chat-diff-scroll-{message_id}")),
+                SharedString::from(format!("chat-diff-input-{}", message_id)),
                 cx,
-                |_, _| ScrollHandle::new(),
+                |window, cx| {
+                    cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .multi_line(true)
+                            .code_editor(language)
+                            .line_number(true)
+                            .default_value(content.clone())
+                    })
+                },
             )
             .read(cx)
             .clone();
-        diff_scroll_handles
-            .borrow_mut()
-            .insert(message_id, scroll_handle.clone());
-        let mut lines = Vec::new();
-        let mut max_chars = 1usize;
-        for (index, line) in content.lines().enumerate() {
-            let text = if line.is_empty() { " " } else { line };
-            max_chars = max_chars.max(text.chars().count());
-            let row = div()
-                .whitespace_nowrap()
-                .child(text.to_owned())
-                .when_some(diff_line_debug_selector(index), |this, selector| {
-                    this.debug_selector(move || selector.to_string())
-                });
-            lines.push(row.into_any_element());
-        }
-        let content_width = px((max_chars as f32 * 8.0).max(480.0));
+
+        input_state.update(cx, |state, cx| {
+            if state.value().as_ref() != content {
+                state.set_value(content, window, cx);
+            }
+        });
+
         div()
             .w_full()
             .h(px(220.0))
-            .relative()
+            .debug_selector(|| "chat-diff-input".to_string())
             .child(
-                div()
-                    .id(SharedString::from(format!("chat-diff-scroll-{message_id}")))
-                    .size_full()
-                    .min_w(px(0.0))
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .overflow_x_scroll()
-                    .track_scroll(&scroll_handle)
-                    .debug_selector(|| "chat-diff-scrollable".to_string())
-                    .child(
-                        div()
-                            .w(content_width)
-                            .min_w_full()
-                            .flex()
-                            .flex_col()
-                            .p_2()
-                            .font_family(".SystemUIFontMonospaced")
-                            .text_sm()
-                            .debug_selector(|| "chat-diff-content".to_string())
-                            .children(lines),
-                    ),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .debug_selector(|| "chat-diff-scrollbar-v".to_string())
-                    .child(Scrollbar::vertical(&scroll_handle)),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .debug_selector(|| "chat-diff-scrollbar-h".to_string())
-                    .child(Scrollbar::horizontal(&scroll_handle)),
+                Input::new(&input_state)
+                    .disabled(true)
+                    .appearance(false)
+                    .h_full(),
             )
             .into_any_element()
     }
 
     fn render_message_content(
         message_id: Uuid,
-        content: String,
-        diff_scroll_handles: &Rc<RefCell<std::collections::HashMap<Uuid, ScrollHandle>>>,
+        content: &MessageContent,
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        if content.contains("--- before\n+++ after") {
-            return Self::render_readonly_code(
-                message_id,
-                "diff",
-                content,
-                diff_scroll_handles,
-                window,
-                cx,
-            );
-        }
+        match content {
+            MessageContent::Text(text) => {
+                if text.contains("--- before\n+++ after") {
+                    return Self::render_readonly_code(
+                        message_id,
+                        "diff",
+                        text.clone(),
+                        window,
+                        cx,
+                    );
+                }
 
-        TextView::markdown(
-            SharedString::from(format!("chat-md-{}", message_id)),
-            SharedString::from(content),
-            window,
-            cx,
-        )
-        .selectable(true)
-        .into_any_element()
+                TextView::markdown(
+                    SharedString::from(format!("chat-md-{}", message_id)),
+                    SharedString::from(text.clone()),
+                    window,
+                    cx,
+                )
+                .selectable(true)
+                .into_any_element()
+            }
+            MessageContent::ToolCall(tool_call) => {
+                let mut lines = vec![
+                    format!("Tool: {}", tool_call.title),
+                    format!(
+                        "Kind: {}",
+                        match tool_call.kind {
+                            agent_client_protocol::ToolKind::Read => "read",
+                            agent_client_protocol::ToolKind::Edit => "edit",
+                            agent_client_protocol::ToolKind::Delete => "delete",
+                            agent_client_protocol::ToolKind::Move => "move",
+                            agent_client_protocol::ToolKind::Search => "search",
+                            agent_client_protocol::ToolKind::Execute => "execute",
+                            agent_client_protocol::ToolKind::Think => "think",
+                            agent_client_protocol::ToolKind::Fetch => "fetch",
+                            agent_client_protocol::ToolKind::SwitchMode => "switch_mode",
+                            _ => "other",
+                        }
+                    ),
+                    format!(
+                        "Status: {}",
+                        match tool_call.status {
+                            agent_client_protocol::ToolCallStatus::Pending => "pending",
+                            agent_client_protocol::ToolCallStatus::InProgress => "in_progress",
+                            agent_client_protocol::ToolCallStatus::Completed => "completed",
+                            agent_client_protocol::ToolCallStatus::Failed => "failed",
+                            _ => "unknown",
+                        }
+                    ),
+                ];
+
+                let mut diff_block = None;
+                let mut other_content = Vec::new();
+
+                for content in &tool_call.content {
+                    match content {
+                        agent_client_protocol::ToolCallContent::Content(c) => {
+                            if let agent_client_protocol::ContentBlock::Text(t) = &c.content {
+                                other_content.push(t.text.clone());
+                            }
+                        }
+                        agent_client_protocol::ToolCallContent::Diff(d) => {
+                            lines.push(format!("Diff: {}", d.path.display()));
+                            diff_block = Some(crate::state::render_diff_text(
+                                d.old_text.as_deref(),
+                                &d.new_text,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        TextView::markdown(
+                            SharedString::from(format!("chat-tool-meta-{}", message_id)),
+                            SharedString::from(lines.join("\n")),
+                            window,
+                            cx,
+                        )
+                        .selectable(true),
+                    )
+                    .when_some(diff_block, |this, diff| {
+                        this.child(Self::render_readonly_code(
+                            message_id, "diff", diff, window, cx,
+                        ))
+                    })
+                    .children(other_content.into_iter().enumerate().map(|(i, text)| {
+                        TextView::markdown(
+                            SharedString::from(format!("chat-tool-extra-{}-{}", message_id, i)),
+                            SharedString::from(text),
+                            window,
+                            cx,
+                        )
+                        .selectable(true)
+                    }))
+                    .into_any_element()
+            }
+        }
     }
 
     /// Renders a single message row. Called from the list() render callback so it
@@ -514,19 +552,18 @@ impl ChatView {
         app_state: &Entity<AppState>,
         this: &Entity<ChatView>,
         expanded_messages: &HashSet<Uuid>,
-        diff_scroll_handles: &Rc<RefCell<std::collections::HashMap<Uuid, ScrollHandle>>>,
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
         let (
             bg,
             text_color,
-            display_content,
+            message_content,
             copy_content,
             message_id,
             is_collapsible,
             is_expanded,
-        ): (Rgba, Rgba, String, String, Uuid, bool, bool) = {
+        ): (Rgba, Rgba, MessageContent, String, Uuid, bool, bool) = {
             let state = app_state.read(cx);
             let Some(thread) = state.active_thread() else {
                 return div().into_any_element();
@@ -546,38 +583,40 @@ impl ChatView {
             } else {
                 rgb(0xffffff)
             };
-            let line_count = message.content.lines().count();
-            let is_diff_message = message.content.contains("--- before\n+++ after");
-            let is_collapsible = line_count > COLLAPSE_LINE_LIMIT && !is_diff_message;
+
+            let raw_content = message.content.clone();
+            let copy_content = raw_content.to_string();
+
+            // For now, we only collapse Text messages.
+            let mut is_collapsible = false;
             let is_expanded = expanded_messages.contains(&message.id);
-            let display_content = if is_collapsible && !is_expanded {
-                message
-                    .content
-                    .lines()
-                    .take(COLLAPSE_LINE_LIMIT)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                message.content.clone()
-            };
+            let mut display_content = raw_content.clone();
+
+            if let MessageContent::Text(text) = &raw_content {
+                let line_count = text.lines().count();
+                is_collapsible = line_count > COLLAPSE_LINE_LIMIT;
+                if is_collapsible && !is_expanded {
+                    display_content = MessageContent::Text(
+                        text.lines()
+                            .take(COLLAPSE_LINE_LIMIT)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+                }
+            }
+
             (
                 bg,
                 text_color,
                 display_content,
-                message.content.clone(),
+                copy_content,
                 message.id,
                 is_collapsible,
                 is_expanded,
             )
         };
 
-        let content_el = Self::render_message_content(
-            message_id,
-            display_content,
-            diff_scroll_handles,
-            window,
-            cx,
-        );
+        let content_el = Self::render_message_content(message_id, &message_content, window, cx);
 
         let this_expand = this.clone();
         div()
@@ -660,31 +699,20 @@ impl ChatView {
 
     #[doc(hidden)]
     #[allow(dead_code)]
-    pub fn debug_diff_scroll_offset(&self, message_id: Uuid) -> Option<Point<Pixels>> {
-        self.diff_scroll_handles
-            .borrow()
-            .get(&message_id)
-            .map(ScrollHandle::offset)
+    pub fn debug_diff_scroll_offset(&self, _message_id: Uuid) -> Option<Point<Pixels>> {
+        None
     }
 
     #[doc(hidden)]
     #[allow(dead_code)]
-    pub fn debug_diff_max_offset(&self, message_id: Uuid) -> Option<Size<Pixels>> {
-        self.diff_scroll_handles
-            .borrow()
-            .get(&message_id)
-            .map(ScrollHandle::max_offset)
+    pub fn debug_diff_max_offset(&self, _message_id: Uuid) -> Option<Size<Pixels>> {
+        None
     }
 
     #[doc(hidden)]
     #[allow(dead_code)]
-    pub fn debug_diff_set_scroll_offset(&self, message_id: Uuid, offset: Point<Pixels>) -> bool {
-        if let Some(handle) = self.diff_scroll_handles.borrow().get(&message_id) {
-            handle.set_offset(offset);
-            true
-        } else {
-            false
-        }
+    pub fn debug_diff_set_scroll_offset(&self, _message_id: Uuid, _offset: Point<Pixels>) -> bool {
+        false
     }
 
     #[doc(hidden)]
@@ -819,7 +847,6 @@ impl Render for ChatView {
         let app_state = self.app_state.clone();
         let this = cx.entity();
         let expanded_messages = self.expanded_messages.clone();
-        let diff_scroll_handles = self.diff_scroll_handles.clone();
 
         let chat_content: AnyElement = if active_thread_id.is_some() {
             if total_count == 0 {
@@ -870,7 +897,6 @@ impl Render for ChatView {
                                             &app_state,
                                             &this,
                                             &expanded_messages,
-                                            &diff_scroll_handles,
                                             window,
                                             cx,
                                         )
@@ -1277,14 +1303,6 @@ pub fn row_debug_selector(index: usize) -> Option<&'static str> {
         "chat-row-63",
     ];
     SELECTORS.get(index).copied()
-}
-
-fn diff_line_debug_selector(index: usize) -> Option<&'static str> {
-    match index {
-        0 => Some("chat-diff-line-0"),
-        8 => Some("chat-diff-line-8"),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

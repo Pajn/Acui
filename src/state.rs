@@ -9,13 +9,13 @@ use uuid::Uuid;
 
 use crate::client::{AcpController, AgentEvent, PermissionRequestEvent};
 use crate::config::AppConfig;
-use crate::domain::{Message, Role, Thread, Workspace};
+use crate::domain::{Message, MessageContent, Role, Thread, Workspace};
 use crate::persistence::AppPersistence;
 use agent_client_protocol::{
     AvailableCommand, ContentBlock, ContentChunk, PermissionOption, PermissionOptionId, Plan,
     RequestPermissionOutcome, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
     SessionConfigValueId, SessionId, SessionModeId, SessionModeState, SessionNotification,
-    SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolKind,
+    SessionUpdate, StopReason, ToolCall, ToolCallUpdate,
 };
 use ignore::WalkBuilder;
 use similar::TextDiff;
@@ -1117,13 +1117,12 @@ impl AppState {
 
     fn record_tool_call(&mut self, thread_id: Uuid, tool_call: ToolCall) {
         let tool_call_id = tool_call.tool_call_id.to_string();
-        let rendered = render_tool_call_message(&tool_call);
         self.ts_mut(thread_id)
             .tool_calls
-            .insert(tool_call_id.clone(), tool_call);
+            .insert(tool_call_id.clone(), tool_call.clone());
         let mut message_id = None;
         if let Some(thread) = self.find_thread_mut(thread_id) {
-            let message = Message::new(thread_id, Role::Agent, rendered);
+            let message = Message::new(thread_id, Role::Agent, tool_call);
             message_id = Some(message.id);
             thread.add_message(message);
             if let Some(active_message) = thread.get_active_agent_message_mut() {
@@ -1139,26 +1138,26 @@ impl AppState {
 
     fn apply_tool_call_update(&mut self, thread_id: Uuid, update: ToolCallUpdate) {
         let tool_call_id = update.tool_call_id.to_string();
-        let (rendered, existing_message_id) = {
+        let (updated_tool_call, existing_message_id) = {
             let ts = self.ts_mut(thread_id);
             let entry = ts
                 .tool_calls
                 .entry(tool_call_id.clone())
                 .or_insert_with(|| ToolCall::new(update.tool_call_id.clone(), "Tool call"));
             entry.update(update.fields);
-            let rendered = render_tool_call_message(entry);
+            let updated_tool_call = entry.clone();
             let existing_message_id = ts.tool_call_messages.get(&tool_call_id).copied();
-            (rendered, existing_message_id)
+            (updated_tool_call, existing_message_id)
         };
         let mut inserted_message_id = None;
         if let Some(thread) = self.find_thread_mut(thread_id) {
             if let Some(message_id) = existing_message_id
                 && let Some(message) = thread.get_message_mut(message_id)
             {
-                message.content = rendered;
+                message.content = MessageContent::ToolCall(Box::new(updated_tool_call));
                 message.is_streaming = false;
             } else {
-                let message = Message::new(thread_id, Role::Agent, rendered);
+                let message = Message::new(thread_id, Role::Agent, updated_tool_call);
                 inserted_message_id = Some(message.id);
                 thread.add_message(message);
                 if let Some(active_message) = thread.get_active_agent_message_mut() {
@@ -1277,65 +1276,7 @@ pub fn extract_config_options_from_notification(
     }
 }
 
-fn render_tool_call_message(tool_call: &ToolCall) -> String {
-    let mut lines = vec![
-        format!("Tool: {}", tool_call.title),
-        format!("Kind: {}", tool_kind_label(tool_call.kind)),
-        format!(
-            "Status: {}",
-            match tool_call.status {
-                ToolCallStatus::Pending => "pending",
-                ToolCallStatus::InProgress => "in_progress",
-                ToolCallStatus::Completed => "completed",
-                ToolCallStatus::Failed => "failed",
-                _ => "unknown",
-            }
-        ),
-    ];
-    if !tool_call.content.is_empty() {
-        for content in &tool_call.content {
-            lines.push(render_tool_call_content(content));
-        }
-    }
-    lines.join("\n")
-}
-
-fn tool_kind_label(kind: ToolKind) -> &'static str {
-    match kind {
-        ToolKind::Read => "read",
-        ToolKind::Edit => "edit",
-        ToolKind::Delete => "delete",
-        ToolKind::Move => "move",
-        ToolKind::Search => "search",
-        ToolKind::Execute => "execute",
-        ToolKind::Think => "think",
-        ToolKind::Fetch => "fetch",
-        ToolKind::SwitchMode => "switch_mode",
-        _ => "other",
-    }
-}
-
-fn render_tool_call_content(content: &ToolCallContent) -> String {
-    match content {
-        ToolCallContent::Content(content) => match &content.content {
-            ContentBlock::Text(text) => text.text.clone(),
-            _ => "[non-text content]".to_string(),
-        },
-        ToolCallContent::Diff(diff) => {
-            let mut out = vec![format!("Diff: {}", diff.path.display())];
-            out.push("```diff".to_string());
-            out.push(render_diff_text(diff.old_text.as_deref(), &diff.new_text));
-            out.push("```".to_string());
-            out.join("\n")
-        }
-        ToolCallContent::Terminal(terminal) => {
-            format!("Terminal: {}", terminal.terminal_id)
-        }
-        _ => "[unsupported tool content]".to_string(),
-    }
-}
-
-fn render_diff_text(old: Option<&str>, new: &str) -> String {
+pub fn render_diff_text(old: Option<&str>, new: &str) -> String {
     let before = old.unwrap_or_default();
     if before == new {
         return "--- before\n+++ after\n(no changes)".to_string();
@@ -1442,7 +1383,7 @@ mod tests {
             .expect("thread should exist");
 
         assert_eq!(thread.messages.len(), 1);
-        assert_eq!(thread.messages[0].content, "hello");
+        assert_eq!(thread.messages[0].content.to_string(), "hello");
         assert!(!thread.messages[0].is_streaming);
     }
 
@@ -1613,7 +1554,7 @@ mod tests {
             .expect("thread should exist");
         assert_eq!(thread.messages.len(), 1);
         assert_eq!(thread.messages[0].role, Role::Thought);
-        assert_eq!(thread.messages[0].content, "thinking more");
+        assert_eq!(thread.messages[0].content.to_string(), "thinking more");
         assert!(thread.messages[0].is_streaming);
 
         // Finalize
@@ -1674,14 +1615,10 @@ mod tests {
         let rendered = thread
             .messages
             .iter()
-            .map(|message| message.content.clone())
+            .map(|message| message.content.to_string())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("Tool: Read file"));
-        assert!(rendered.contains("Kind: other"));
-        assert!(rendered.contains("Diff: src/main.rs"));
-        assert!(rendered.contains("-old line"));
-        assert!(rendered.contains("+new line"));
     }
 
     #[test]

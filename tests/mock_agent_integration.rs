@@ -59,7 +59,7 @@ async fn mock_agent_subprocess_handles_cwd_and_permission(cx: &mut TestAppContex
         state
             .active_thread_messages()
             .iter()
-            .any(|message| message.content.contains(&expected_cwd))
+            .any(|message| message.content.to_string().contains(&expected_cwd))
     });
 
     state.update(cx, |state, cx| {
@@ -85,7 +85,7 @@ async fn mock_agent_subprocess_handles_cwd_and_permission(cx: &mut TestAppContex
         state
             .active_thread_messages()
             .iter()
-            .any(|message| message.content.contains("permission outcome:"))
+            .any(|message| message.content.to_string().contains("permission outcome:"))
     });
 
     let _ = fs::remove_dir_all(temp_dir);

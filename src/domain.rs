@@ -1,3 +1,4 @@
+use agent_client_protocol::ToolCall;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -13,21 +14,73 @@ pub enum Role {
     System,  // Useful for connection errors or app-level notifications
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "lowercase")]
+pub enum MessageContent {
+    Text(String),
+    ToolCall(Box<ToolCall>),
+}
+
+impl MessageContent {
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    pub fn append_text(&mut self, chunk: &str) {
+        if let Self::Text(text) = self {
+            text.push_str(chunk);
+        }
+    }
+}
+
+impl std::fmt::Display for MessageContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(text) => write!(f, "{}", text),
+            Self::ToolCall(tool_call) => {
+                // Fallback string representation for ToolCall if needed
+                write!(f, "Tool: {}", tool_call.title)
+            }
+        }
+    }
+}
+
+impl From<String> for MessageContent {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl From<&str> for MessageContent {
+    fn from(text: &str) -> Self {
+        Self::Text(text.to_string())
+    }
+}
+
+impl From<ToolCall> for MessageContent {
+    fn from(tool_call: ToolCall) -> Self {
+        Self::ToolCall(Box::new(tool_call))
+    }
+}
+
 /// A UI-level representation of a message.
 /// We use this to aggregate the streaming chunks sent from the ACP connection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub id: Uuid,
     pub thread_id: Uuid,
     pub role: Role,
-    pub content: String,
+    pub content: MessageContent,
     pub timestamp: DateTime<Utc>,
     /// True if the agent is currently streaming this message via ACP
     pub is_streaming: bool,
 }
 
 impl Message {
-    pub fn new(thread_id: Uuid, role: Role, content: impl Into<String>) -> Self {
+    pub fn new(thread_id: Uuid, role: Role, content: impl Into<MessageContent>) -> Self {
         Self {
             id: Uuid::new_v4(),
             thread_id,
@@ -40,7 +93,7 @@ impl Message {
 
     /// Folds incoming ACP text chunks into this message.
     pub fn append_text(&mut self, chunk: &str) {
-        self.content.push_str(chunk);
+        self.content.append_text(chunk);
     }
 
     /// Marks the message as complete when the ACP stop reason is received.

@@ -1,4 +1,4 @@
-use crate::domain::{Message, Role, Thread, Workspace};
+use crate::domain::{Message, MessageContent, Role, Thread, Workspace};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -23,7 +23,7 @@ struct WorkspaceRecord {
 struct MessageRecord {
     id: Uuid,
     role: Role,
-    content: String,
+    content: MessageContent,
     timestamp: DateTime<Utc>,
 }
 
@@ -226,7 +226,7 @@ fn cleanup_stale_records(dir: &Path, keep_files: &HashSet<String>) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::AppPersistence;
-    use crate::domain::{Message, Role, Thread, Workspace};
+    use crate::domain::{Message, MessageContent, Role, Thread, Workspace};
     use std::path::PathBuf;
     use uuid::Uuid;
 
@@ -269,7 +269,7 @@ mod tests {
             id: Uuid::new_v4(),
             thread_id,
             role: Role::User,
-            content: "Hello agent".to_string(),
+            content: MessageContent::from("Hello agent"),
             timestamp: chrono::Utc::now(),
             is_streaming: false,
         });
@@ -277,7 +277,7 @@ mod tests {
             id: Uuid::new_v4(),
             thread_id,
             role: Role::Agent,
-            content: "Hello user".to_string(),
+            content: MessageContent::from("Hello user"),
             timestamp: chrono::Utc::now(),
             is_streaming: false,
         });
@@ -286,7 +286,7 @@ mod tests {
             id: Uuid::new_v4(),
             thread_id,
             role: Role::Agent,
-            content: "still typing…".to_string(),
+            content: MessageContent::from("still typing…"),
             timestamp: chrono::Utc::now(),
             is_streaming: true,
         });
@@ -298,7 +298,7 @@ mod tests {
         let msgs = &loaded[0].threads[0].messages;
         assert_eq!(msgs.len(), 2, "streaming message must not be persisted");
         assert_eq!(msgs[0].role, Role::User);
-        assert_eq!(msgs[0].content, "Hello agent");
+        assert_eq!(msgs[0].content.to_string(), "Hello agent");
         assert_eq!(msgs[1].role, Role::Agent);
         assert!(
             !msgs[1].is_streaming,
