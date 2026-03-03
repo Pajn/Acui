@@ -33,6 +33,8 @@ struct ThreadState {
     agent_task: Option<Task<()>>,
     mock_event_sender: Option<mpsc::UnboundedSender<AgentEvent>>,
     connection: Option<ThreadAgentConnection>,
+    /// True while a `connect_thread_to_agent` task is in flight.
+    connecting: bool,
     pending_permission: Option<PermissionRequestEvent>,
     config_options: Vec<SessionConfigOption>,
     available_commands: Vec<AvailableCommand>,
@@ -51,6 +53,7 @@ impl ThreadState {
             agent_task: None,
             mock_event_sender: None,
             connection: None,
+            connecting: false,
             pending_permission: None,
             config_options: Vec::new(),
             available_commands: Vec::new(),
@@ -123,6 +126,26 @@ impl AppState {
             .iter()
             .find_map(|workspace| workspace.threads.first())
             .map(|thread| thread.id);
+
+        // Asynchronously resume sessions for all locked threads that have a
+        // persisted session_id — this lets the UI show history immediately and
+        // reconnects to the agent in the background.
+        let locked_threads: Vec<(Uuid, crate::config::AgentConfig)> = self
+            .workspaces
+            .iter()
+            .flat_map(|w| w.threads.iter())
+            .filter(|t| t.session_id.is_some())
+            .filter_map(|t| {
+                let name = t.agent_name.as_ref()?;
+                let agent = self.agents.iter().find(|a| &a.name == name)?.clone();
+                Some((t.id, agent))
+            })
+            .collect();
+
+        for (thread_id, agent) in locked_threads {
+            self.connect_thread_to_agent(cx, thread_id, agent);
+        }
+
         cx.notify();
         Ok(())
     }
@@ -250,16 +273,18 @@ impl AppState {
     pub fn set_active_thread(&mut self, cx: &mut Context<Self>, thread_id: Uuid) {
         self.active_thread_id = Some(thread_id);
         self.unread_stopped_threads.remove(&thread_id);
-        // Auto-connect if the thread is locked to a specific agent and not yet connected.
+        // Auto-connect if the thread is locked to a specific agent and neither a
+        // connection nor an in-flight connect task already exists (the startup
+        // background load may have already spawned one).
         let locked_agent = self
             .find_thread(thread_id)
             .and_then(|t| t.agent_name.clone())
             .and_then(|name| self.agents.iter().find(|a| a.name == name).cloned());
-        if !self
+        let already_connecting = self
             .thread_state
             .get(&thread_id)
-            .is_some_and(|ts| ts.connection.is_some())
-        {
+            .is_some_and(|ts| ts.connection.is_some() || ts.connecting);
+        if !already_connecting {
             if let Some(agent) = locked_agent {
                 self.connect_thread_to_agent(cx, thread_id, agent);
             }
@@ -735,6 +760,7 @@ impl AppState {
         agent: crate::config::AgentConfig,
     ) {
         self.append_log_line("to_agent.connect", thread_id, &agent.name);
+        self.ts_mut(thread_id).connecting = true;
         cx.spawn(
             move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
                 let mut cx = cx.clone();
@@ -835,6 +861,7 @@ impl AppState {
                                                 thread.agent_name = Some(agent.name.clone());
                                             }
                                         }
+                                        state.ts_mut(thread_id).connecting = false;
                                         state.attach_connection(
                                             cx,
                                             thread_id,
@@ -856,6 +883,7 @@ impl AppState {
                                             thread_id,
                                             &message,
                                         );
+                                        state.ts_mut(thread_id).connecting = false;
                                         state.push_system_message(cx, thread_id, message);
                                     });
                                 }
@@ -869,6 +897,7 @@ impl AppState {
                                     thread_id,
                                     &message,
                                 );
+                                state.ts_mut(thread_id).connecting = false;
                                 state.push_system_message(cx, thread_id, message);
                             });
                         }
