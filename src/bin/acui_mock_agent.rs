@@ -1,12 +1,12 @@
 use agent_client_protocol::{
     self as acp, Agent, AgentCapabilities, AgentSideConnection, AuthenticateRequest,
     AuthenticateResponse, AvailableCommand, AvailableCommandsUpdate, CancelNotification, Client,
-    ContentBlock, ContentChunk, Cost, CurrentModeUpdate, ForkSessionRequest, ForkSessionResponse,
-    Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, ModelId, ModelInfo,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse, ReadTextFileRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
+    ContentBlock, ContentChunk, Cost, CurrentModeUpdate, Diff, ForkSessionRequest,
+    ForkSessionResponse, Implementation, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, ModelId,
+    ModelInfo, NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan,
+    PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse,
+    ReadTextFileRequest, RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
     ResumeSessionResponse, SessionCapabilities, SessionConfigOption, SessionConfigSelectOption,
     SessionForkCapabilities, SessionInfo, SessionListCapabilities, SessionMode, SessionModeId,
     SessionModeState, SessionModelState, SessionNotification, SessionResumeCapabilities,
@@ -16,7 +16,7 @@ use agent_client_protocol::{
 };
 use async_trait::async_trait;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -27,6 +27,7 @@ struct MockAgent {
     session_modes: Rc<RefCell<HashMap<String, String>>>,
     session_models: Rc<RefCell<HashMap<String, String>>>,
     session_cwds: Rc<RefCell<HashMap<String, PathBuf>>>,
+    profile_replayed_sessions: Rc<RefCell<HashSet<String>>>,
 }
 
 impl MockAgent {
@@ -57,6 +58,118 @@ impl MockAgent {
             .borrow_mut()
             .insert(session_id.clone(), "gpt-5".to_string());
         self.session_cwds.borrow_mut().insert(session_id, cwd);
+    }
+
+    fn profile_enabled(&self) -> bool {
+        std::env::var("ACUI_MOCK_PROFILE_LONG_THREAD").as_deref() == Ok("1")
+    }
+
+    fn profile_iterations(&self) -> usize {
+        std::env::var("ACUI_MOCK_PROFILE_ITERATIONS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .map(|count| count.clamp(1, 500))
+            .unwrap_or(120)
+    }
+
+    async fn maybe_emit_profile_history(&self, session_id: &acp::SessionId) -> acp::Result<()> {
+        if !self.profile_enabled() {
+            return Ok(());
+        }
+        let session_key = session_id.to_string();
+        {
+            let mut replayed = self.profile_replayed_sessions.borrow_mut();
+            if replayed.contains(&session_key) {
+                return Ok(());
+            }
+            replayed.insert(session_key);
+        }
+
+        let source_paths = profile_source_paths(&self.cwd);
+        for index in 0..self.profile_iterations() {
+            let source_path = &source_paths[index % source_paths.len()];
+            let source_label = source_path.display().to_string();
+            let source_snippet = read_source_snippet(source_path, 360, 10_000);
+
+            self.send_text(session_id, long_profile_message(index))
+                .await?;
+
+            let read_id = format!("profile-read-{index}");
+            self.client()?
+                .session_notification(SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::ToolCall(
+                        ToolCall::new(read_id.clone(), format!("Read {source_label}"))
+                            .kind(ToolKind::Read)
+                            .status(ToolCallStatus::InProgress)
+                            .content(vec![ToolCallContent::from(format!(
+                                "Reading {source_label}..."
+                            ))]),
+                    ),
+                ))
+                .await?;
+            self.client()?
+                .session_notification(SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                        read_id,
+                        ToolCallUpdateFields::new()
+                            .status(ToolCallStatus::Completed)
+                            .content(vec![ToolCallContent::from(format!(
+                                "```rust\n{source_snippet}\n```"
+                            ))]),
+                    )),
+                ))
+                .await?;
+
+            let write_id = format!("profile-write-{index}");
+            let new_text = format!("{source_snippet}\n// profile rewrite marker {index}\n");
+            self.client()?
+                .session_notification(SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::ToolCall(
+                        ToolCall::new(write_id.clone(), format!("Write {source_label}"))
+                            .kind(ToolKind::Edit)
+                            .status(ToolCallStatus::InProgress)
+                            .content(vec![ToolCallContent::from(format!(
+                                "Applying edit to {source_label}..."
+                            ))]),
+                    ),
+                ))
+                .await?;
+            self.client()?
+                .session_notification(SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                        write_id,
+                        ToolCallUpdateFields::new()
+                            .status(ToolCallStatus::Completed)
+                            .content(vec![ToolCallContent::Diff(
+                                Diff::new(source_path.clone(), new_text).old_text(source_snippet),
+                            )]),
+                    )),
+                ))
+                .await?;
+        }
+
+        self.client()?
+            .session_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new().title(format!(
+                    "Mock profile replay ({})",
+                    self.profile_iterations()
+                ))),
+            ))
+            .await?;
+        self.client()?
+            .session_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::UsageUpdate(
+                    UsageUpdate::new(95_000, 128_000).cost(Cost::new(7.42, "USD")),
+                ),
+            ))
+            .await?;
+        Ok(())
     }
 
     async fn send_text(
@@ -269,6 +382,7 @@ impl Agent for MockAgent {
             .borrow_mut()
             .insert(session_id.to_string(), args.cwd.clone());
         self.send_available_commands(&session_id).await?;
+        self.maybe_emit_profile_history(&session_id).await?;
         Ok(NewSessionResponse::new(session_id.clone())
             .modes(mode_state("ask"))
             .models(model_state("gpt-5"))
@@ -295,6 +409,7 @@ impl Agent for MockAgent {
             .borrow_mut()
             .insert(args.session_id.to_string(), args.cwd.clone());
         self.send_available_commands(&args.session_id).await?;
+        self.maybe_emit_profile_history(&args.session_id).await?;
         Ok(LoadSessionResponse::new()
             .modes(mode_state(current_mode))
             .models(model_state(current_model))
@@ -372,6 +487,7 @@ impl Agent for MockAgent {
             .borrow_mut()
             .insert(session_key, args.cwd.clone());
         self.send_available_commands(&args.session_id).await?;
+        self.maybe_emit_profile_history(&args.session_id).await?;
         Ok(ResumeSessionResponse::new()
             .modes(mode_state(current_mode))
             .models(model_state(current_model))
@@ -532,6 +648,54 @@ fn model_state(current_model: impl Into<ModelId>) -> SessionModelState {
     )
 }
 
+fn profile_source_paths(cwd: &Path) -> Vec<PathBuf> {
+    let candidates = ["src/state.rs", "src/ui/chat.rs", "src/client.rs"];
+    let mut paths: Vec<PathBuf> = candidates
+        .iter()
+        .map(|relative| cwd.join(relative))
+        .filter(|path| path.exists())
+        .collect();
+    if paths.is_empty() {
+        paths.push(cwd.join("src/main.rs"));
+    }
+    paths
+}
+
+fn read_source_snippet(path: &Path, max_lines: usize, max_chars: usize) -> String {
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return format!("// missing source: {}", path.display());
+    };
+    let mut result = String::new();
+    for (index, line) in source.lines().take(max_lines).enumerate() {
+        if index > 0 {
+            result.push('\n');
+        }
+        result.push_str(line);
+        if result.len() >= max_chars {
+            result.truncate(max_chars);
+            break;
+        }
+    }
+    result
+}
+
+fn long_profile_message(index: usize) -> String {
+    let paragraph = "This is a deliberately long mock profile message used to stress rendering and scrolling performance in the real non-headless app path.";
+    format!(
+        "Profile replay message #{index}\n{} {}\n{} {}\n{} {} \n{} {}\n{} {}\n",
+        paragraph,
+        paragraph,
+        paragraph,
+        paragraph,
+        paragraph,
+        paragraph,
+        paragraph,
+        paragraph,
+        paragraph,
+        paragraph
+    )
+}
+
 fn main() {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let client = Rc::new(RefCell::new(None));
@@ -541,6 +705,7 @@ fn main() {
         session_modes: Rc::new(RefCell::new(HashMap::new())),
         session_models: Rc::new(RefCell::new(HashMap::new())),
         session_cwds: Rc::new(RefCell::new(HashMap::new())),
+        profile_replayed_sessions: Rc::new(RefCell::new(HashSet::new())),
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()

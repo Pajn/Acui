@@ -109,11 +109,19 @@ struct TerminalWidgetState {
 
 const COLLAPSE_LINE_LIMIT: usize = 10;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MessageTailSignature {
+    message_id: Uuid,
+    content_size: usize,
+    is_streaming: bool,
+}
+
 pub struct ChatView {
     app_state: Entity<AppState>,
     list_state: ListState,
     listed_thread_id: Option<Uuid>,
     listed_count: usize,
+    last_tail_signature: Option<MessageTailSignature>,
     suggestion_scroll_handle: ScrollHandle,
     input_state: Entity<InputState>,
     mode_select_state: Entity<SelectState<Vec<PickerOption>>>,
@@ -300,6 +308,7 @@ impl ChatView {
             list_state,
             listed_thread_id: None,
             listed_count: 0,
+            last_tail_signature: None,
             suggestion_scroll_handle: ScrollHandle::new(),
             input_state,
             mode_select_state,
@@ -772,12 +781,11 @@ impl ChatView {
             bg,
             text_color,
             message_content,
-            copy_content,
             thread_id,
             message_id,
             is_collapsible,
             is_expanded,
-        ): (Rgba, Rgba, MessageContent, String, Uuid, Uuid, bool, bool) = {
+        ): (Rgba, Rgba, MessageContent, Uuid, Uuid, bool, bool) = {
             let state = app_state.read(cx);
             let Some(thread) = state.active_thread() else {
                 return div().into_any_element();
@@ -799,23 +807,17 @@ impl ChatView {
             };
 
             let raw_content = message.content.clone();
-            let copy_content = raw_content.to_string();
 
             // For now, we only collapse Text messages.
-            let mut is_collapsible = false;
             let is_expanded = expanded_messages.contains(&message.id);
             let mut display_content = raw_content.clone();
+            let mut is_collapsible = false;
 
             if let MessageContent::Text(text) = &raw_content {
-                let line_count = text.lines().count();
-                is_collapsible = line_count > COLLAPSE_LINE_LIMIT;
-                if is_collapsible && !is_expanded {
-                    display_content = MessageContent::Text(
-                        text.lines()
-                            .take(COLLAPSE_LINE_LIMIT)
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    );
+                let collapsed_preview = collapsed_text_preview(text, COLLAPSE_LINE_LIMIT);
+                is_collapsible = collapsed_preview.is_some();
+                if !is_expanded && let Some(preview) = collapsed_preview {
+                    display_content = MessageContent::Text(preview);
                 }
             }
 
@@ -823,7 +825,6 @@ impl ChatView {
                 bg,
                 text_color,
                 display_content,
-                copy_content,
                 message.thread_id,
                 message.id,
                 is_collapsible,
@@ -841,6 +842,7 @@ impl ChatView {
         );
 
         let this_expand = this.clone();
+        let app_state_for_copy = app_state.clone();
         div()
             .id(("chat-message", index))
             .when_some(row_debug_selector(index), |this, selector| {
@@ -851,7 +853,19 @@ impl ChatView {
             .p_2()
             .cursor_text()
             .on_click(move |_, _, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(copy_content.clone()));
+                let copied = app_state_for_copy
+                    .read(cx)
+                    .active_thread()
+                    .and_then(|thread| {
+                        thread
+                            .messages
+                            .iter()
+                            .find(|message| message.id == message_id)
+                    })
+                    .map(|message| message.content.to_string());
+                if let Some(copied) = copied {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copied));
+                }
             })
             .child(
                 div()
@@ -1005,6 +1019,7 @@ impl Render for ChatView {
         let (
             active_thread_id,
             message_count,
+            tail_signature,
             permission_options,
             config_options,
             modes,
@@ -1020,6 +1035,10 @@ impl Render for ChatView {
             (
                 state.active_thread_id,
                 state.active_thread_message_count(),
+                state
+                    .active_thread()
+                    .and_then(|thread| thread.messages.last())
+                    .map(message_tail_signature),
                 state.active_thread_permission_options(),
                 state.active_thread_config_options(),
                 state.active_thread_modes(),
@@ -1034,6 +1053,7 @@ impl Render for ChatView {
         };
 
         let total_count = message_count + is_working as usize;
+        let tail_changed = tail_signature != self.last_tail_signature;
 
         // Update the ListState only when the thread or item count changes so we
         // don't invalidate cached item heights unnecessarily on every render.
@@ -1087,12 +1107,13 @@ impl Render for ChatView {
             _ => {
                 // Same thread, same count: streaming chunk landed in the last
                 // message. Invalidate just that item's cached height.
-                if message_count > 0 {
+                if message_count > 0 && tail_changed {
                     self.list_state.splice(message_count - 1..message_count, 1);
                 }
             }
         }
         self.listed_count = total_count;
+        self.last_tail_signature = tail_signature;
 
         // Build list render closure — captures cheap handles, not the full messages.
         let app_state = self.app_state.clone();
@@ -1549,6 +1570,58 @@ fn usage_progress_percent(usage: &UsageUpdate) -> f32 {
         return 0.0;
     }
     ((usage.used as f32 / usage.size as f32) * 100.0).clamp(0.0, 100.0)
+}
+
+fn message_tail_signature(message: &crate::domain::Message) -> MessageTailSignature {
+    let content_size = match &message.content {
+        MessageContent::Text(text) => text.len(),
+        MessageContent::ToolCall(tool_call) => {
+            let mut size = tool_call.title.len() + tool_call.content.len() + 16;
+            for content in &tool_call.content {
+                match content {
+                    agent_client_protocol::ToolCallContent::Content(content_block) => {
+                        if let agent_client_protocol::ContentBlock::Text(text) =
+                            &content_block.content
+                        {
+                            size += text.text.len();
+                        }
+                    }
+                    agent_client_protocol::ToolCallContent::Diff(diff) => {
+                        size += diff.new_text.len();
+                        if let Some(old_text) = diff.old_text.as_ref() {
+                            size += old_text.len();
+                        }
+                    }
+                    agent_client_protocol::ToolCallContent::Terminal(_) => size += 32,
+                    _ => {}
+                }
+            }
+            size
+        }
+    };
+
+    MessageTailSignature {
+        message_id: message.id,
+        content_size,
+        is_streaming: message.is_streaming,
+    }
+}
+
+fn collapsed_text_preview(text: &str, max_lines: usize) -> Option<String> {
+    let mut parts = text.splitn(max_lines + 1, '\n');
+    let mut preview = String::new();
+    for line_index in 0..max_lines {
+        let part = parts.next()?;
+        if line_index > 0 {
+            preview.push('\n');
+        }
+        preview.push_str(part);
+    }
+    if parts.next().is_some() {
+        Some(preview)
+    } else {
+        None
+    }
 }
 
 fn format_cost_label(cost: Option<&Cost>) -> Option<String> {

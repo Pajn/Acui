@@ -52,3 +52,8 @@ toml = "0.8"
 
 [dev-dependencies]
 gpui = { version = "0.2.2", features = ["runtime_shaders", "test-support"] }
+criterion = "0.5"
+
+[[bench]]
+name = "thread_performance"
+harness = false

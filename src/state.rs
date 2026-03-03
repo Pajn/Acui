@@ -1,8 +1,9 @@
 use gpui::{Context, Pixels, Point, Task};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{LineWriter, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -21,6 +22,8 @@ use agent_client_protocol::{
 };
 use ignore::WalkBuilder;
 use similar::TextDiff;
+
+const AUTO_CONNECT_MESSAGE_LIMIT: usize = 400;
 
 struct ThreadAgentConnection {
     controller: Rc<AcpController>,
@@ -98,7 +101,7 @@ pub struct AppState {
     unread_stopped_threads: HashSet<Uuid>,
     agent_capabilities: HashMap<String, AgentCapabilities>,
     workspace_session_syncing: HashSet<(Uuid, String)>,
-    log_file: Option<PathBuf>,
+    log_writer: Option<Mutex<LineWriter<std::fs::File>>>,
     persistence: Option<AppPersistence>,
     agents: Vec<crate::config::AgentConfig>,
     enable_mock_agent: bool,
@@ -136,6 +139,18 @@ impl AppState {
         enable_mock_agent: bool,
         log_file: Option<PathBuf>,
     ) -> Self {
+        let log_writer = log_file.as_ref().and_then(|path| {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()?;
+            Some(Mutex::new(LineWriter::new(file)))
+        });
+
         Self {
             workspaces: Vec::new(),
             active_thread_id: None,
@@ -143,7 +158,7 @@ impl AppState {
             unread_stopped_threads: HashSet::new(),
             agent_capabilities: HashMap::new(),
             workspace_session_syncing: HashSet::new(),
-            log_file,
+            log_writer,
             persistence,
             agents,
             enable_mock_agent,
@@ -161,23 +176,19 @@ impl AppState {
             .find_map(|workspace| workspace.threads.first())
             .map(|thread| thread.id);
 
-        // Asynchronously resume sessions for all locked threads that have a
-        // persisted session_id — this lets the UI show history immediately and
-        // reconnects to the agent in the background.
-        let locked_threads: Vec<(Uuid, crate::config::AgentConfig)> = self
-            .workspaces
-            .iter()
-            .flat_map(|w| w.threads.iter())
-            .filter(|t| t.session_id.is_some())
-            .filter_map(|t| {
-                let name = t.agent_name.as_ref()?;
-                let agent = self.agents.iter().find(|a| &a.name == name)?.clone();
-                Some((t.id, agent))
-            })
-            .collect();
-
-        for (thread_id, agent) in locked_threads {
-            self.connect_thread_to_agent(cx, thread_id, agent);
+        // Reconnect only the initially active thread at startup to avoid a
+        // thundering-herd of background reconnects for large histories.
+        if let Some(active_thread_id) = self.active_thread_id
+            && self.should_auto_connect_thread(active_thread_id)
+        {
+            let locked_agent = self
+                .find_thread(active_thread_id)
+                .and_then(|t| t.agent_name.as_ref())
+                .and_then(|name| self.agents.iter().find(|a| &a.name == name))
+                .cloned();
+            if let Some(agent) = locked_agent {
+                self.connect_thread_to_agent(cx, active_thread_id, agent);
+            }
         }
 
         self.sync_unsynced_workspace_sessions(cx);
@@ -321,7 +332,10 @@ impl AppState {
             .thread_state
             .get(&thread_id)
             .is_some_and(|ts| ts.connection.is_some() || ts.connecting);
-        if !already_connecting && let Some(agent) = locked_agent {
+        if !already_connecting
+            && self.should_auto_connect_thread(thread_id)
+            && let Some(agent) = locked_agent
+        {
             self.connect_thread_to_agent(cx, thread_id, agent);
         }
         cx.notify();
@@ -1526,14 +1540,26 @@ impl AppState {
         thread_id: Uuid,
         mut rx: mpsc::UnboundedReceiver<AgentEvent>,
     ) {
+        const AGENT_EVENT_BATCH_SIZE: usize = 128;
         let task = cx.spawn(
             move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
                 let mut cx = cx.clone();
                 async move {
                     while let Some(event) = rx.recv().await {
+                        let mut batch = Vec::with_capacity(AGENT_EVENT_BATCH_SIZE);
+                        batch.push(event);
+                        while batch.len() < AGENT_EVENT_BATCH_SIZE {
+                            let Ok(event) = rx.try_recv() else {
+                                break;
+                            };
+                            batch.push(event);
+                        }
                         if this
                             .update(&mut cx, |state: &mut AppState, cx| {
-                                state.handle_agent_event(cx, thread_id, event)
+                                for event in batch {
+                                    state.apply_agent_event(thread_id, event);
+                                }
+                                cx.notify();
                             })
                             .is_err()
                         {
@@ -1545,16 +1571,6 @@ impl AppState {
         );
 
         self.ts_mut(thread_id).agent_task = Some(task);
-    }
-
-    pub fn handle_agent_event(
-        &mut self,
-        cx: &mut Context<Self>,
-        thread_id: Uuid,
-        event: AgentEvent,
-    ) {
-        self.apply_agent_event(thread_id, event);
-        cx.notify();
     }
 
     pub fn apply_agent_event(&mut self, thread_id: Uuid, event: AgentEvent) {
@@ -1621,6 +1637,12 @@ impl AppState {
         self.workspaces
             .iter()
             .find_map(|workspace| workspace.get_thread(thread_id))
+    }
+
+    fn should_auto_connect_thread(&self, thread_id: Uuid) -> bool {
+        self.find_thread(thread_id)
+            .map(|thread| thread.messages.len() <= AUTO_CONNECT_MESSAGE_LIMIT)
+            .unwrap_or(false)
     }
 
     fn append_agent_chunk(&mut self, thread_id: Uuid, chunk: &str) {
@@ -1859,17 +1881,10 @@ impl AppState {
     }
 
     fn append_log_line(&self, direction: &str, thread_id: Uuid, payload: &str) {
-        let Some(log_file) = &self.log_file else {
+        let Some(log_writer) = &self.log_writer else {
             return;
         };
-        if let Some(parent) = log_file.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_file)
-        else {
+        let Ok(mut writer) = log_writer.lock() else {
             return;
         };
         let record = serde_json::json!({
@@ -1878,10 +1893,13 @@ impl AppState {
             "thread_id": thread_id.to_string(),
             "payload": payload,
         });
-        let _ = writeln!(file, "{record}");
+        let _ = writeln!(writer, "{record}");
     }
 
     fn log_session_update(&self, thread_id: Uuid, update: &SessionUpdate) {
+        if self.log_writer.is_none() {
+            return;
+        }
         if let Ok(payload) = serde_json::to_string(update) {
             self.append_log_line("from_agent", thread_id, &payload);
         }
