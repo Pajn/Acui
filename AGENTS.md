@@ -3,7 +3,7 @@
 ## Engineering rules
 
 - Prefer established ecosystem crates over custom implementations when a stable crate exists.
-- Keep code changes small, focused, and covered by tests at the seam being changed.
+- Refactor heavily if repeated patterns or potential issues are discovered. We are still in an exploratory phase and need to find a solid architecture.
 
 ## Testing strategy
 

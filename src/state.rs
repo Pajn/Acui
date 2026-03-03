@@ -762,20 +762,18 @@ impl AppState {
         }
     }
 
-    pub fn active_thread_messages(&self) -> Vec<Message> {
-        let Some(thread_id) = self.active_thread_id else {
-            return Vec::new();
-        };
+    pub fn active_thread(&self) -> Option<&Thread> {
+        self.active_thread_id.and_then(|id| self.find_thread(id))
+    }
 
-        self.workspaces
-            .iter()
-            .find_map(|workspace| workspace.get_thread(thread_id))
+    pub fn active_thread_messages(&self) -> Vec<Message> {
+        self.active_thread()
             .map(|thread| thread.messages.clone())
             .unwrap_or_default()
     }
 
     pub fn active_thread_message_count(&self) -> usize {
-        self.active_thread_messages().len()
+        self.active_thread().map(|t| t.messages.len()).unwrap_or(0)
     }
 
     pub fn active_thread_is_working(&self) -> bool {
