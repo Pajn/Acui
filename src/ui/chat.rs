@@ -6,7 +6,10 @@ use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState, RopeExt};
 use gpui_component::skeleton::Skeleton;
 use gpui_component::text::TextView;
+use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
 use std::collections::HashSet;
+use std::io::Read;
+use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -30,6 +33,48 @@ struct SuggestionState {
     start: usize,
     items: Vec<SuggestionItem>,
     selected: usize,
+}
+
+struct TerminalReader {
+    rx: std_mpsc::Receiver<Vec<u8>>,
+    chunk: Vec<u8>,
+    offset: usize,
+}
+
+impl TerminalReader {
+    fn new(rx: std_mpsc::Receiver<Vec<u8>>) -> Self {
+        Self {
+            rx,
+            chunk: Vec::new(),
+            offset: 0,
+        }
+    }
+}
+
+impl Read for TerminalReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.offset >= self.chunk.len() {
+            match self.rx.recv() {
+                Ok(chunk) if !chunk.is_empty() => {
+                    self.chunk = chunk;
+                    self.offset = 0;
+                }
+                Ok(_) => {}
+                Err(_) => return Ok(0),
+            }
+        }
+        let remaining = &self.chunk[self.offset..];
+        let len = remaining.len().min(buf.len());
+        buf[..len].copy_from_slice(&remaining[..len]);
+        self.offset += len;
+        Ok(len)
+    }
+}
+
+struct TerminalWidgetState {
+    terminal: Entity<TerminalView>,
+    tx: std_mpsc::Sender<Vec<u8>>,
+    transcript: String,
 }
 
 const COLLAPSE_LINE_LIMIT: usize = 10;
@@ -438,6 +483,8 @@ impl ChatView {
     }
 
     fn render_message_content(
+        app_state: &Entity<AppState>,
+        thread_id: Uuid,
         message_id: Uuid,
         content: &MessageContent,
         window: &mut Window,
@@ -496,6 +543,7 @@ impl ChatView {
 
                 let mut diff_block = None;
                 let mut other_content = Vec::new();
+                let mut terminal_ids = Vec::new();
 
                 for content in &tool_call.content {
                     match content {
@@ -510,6 +558,9 @@ impl ChatView {
                                 d.old_text.as_deref(),
                                 &d.new_text,
                             ));
+                        }
+                        agent_client_protocol::ToolCallContent::Terminal(terminal) => {
+                            terminal_ids.push(terminal.terminal_id.to_string());
                         }
                         _ => {}
                     }
@@ -533,6 +584,19 @@ impl ChatView {
                             message_id, "diff", diff, window, cx,
                         ))
                     })
+                    .children(terminal_ids.into_iter().map(|terminal_id| {
+                        let transcript = app_state
+                            .read(cx)
+                            .terminal_transcript_for_thread(thread_id, &terminal_id)
+                            .unwrap_or_default();
+                        Self::render_terminal_widget(
+                            message_id,
+                            terminal_id,
+                            transcript,
+                            window,
+                            cx,
+                        )
+                    }))
                     .children(other_content.into_iter().enumerate().map(|(i, text)| {
                         TextView::markdown(
                             SharedString::from(format!("chat-tool-extra-{}-{}", message_id, i)),
@@ -545,6 +609,72 @@ impl ChatView {
                     .into_any_element()
             }
         }
+    }
+
+    fn terminal_config() -> TerminalConfig {
+        TerminalConfig {
+            cols: 120,
+            rows: 12,
+            font_family: "monospace".to_string(),
+            font_size: px(12.0),
+            scrollback: 10_000,
+            line_height_multiplier: 1.2,
+            padding: Edges::all(px(8.0)),
+            colors: ColorPalette::default(),
+        }
+    }
+
+    fn render_terminal_widget(
+        message_id: Uuid,
+        terminal_id: String,
+        transcript: String,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let terminal_state = window.use_keyed_state(
+            SharedString::from(format!("chat-terminal-{}-{}", message_id, terminal_id)),
+            cx,
+            |_window, cx| {
+                let (tx, rx) = std_mpsc::channel::<Vec<u8>>();
+                let terminal = cx.new(|cx| {
+                    TerminalView::new(
+                        std::io::sink(),
+                        TerminalReader::new(rx),
+                        Self::terminal_config(),
+                        cx,
+                    )
+                });
+                TerminalWidgetState {
+                    terminal,
+                    tx,
+                    transcript: String::new(),
+                }
+            },
+        );
+        terminal_state.update(cx, move |state, _| {
+            if state.transcript == transcript {
+                return;
+            }
+            if let Some(delta) = transcript.strip_prefix(&state.transcript) {
+                if !delta.is_empty() {
+                    let _ = state.tx.send(delta.as_bytes().to_vec());
+                }
+            } else {
+                let _ = state.tx.send(b"\x1bc".to_vec());
+                if !transcript.is_empty() {
+                    let _ = state.tx.send(transcript.as_bytes().to_vec());
+                }
+            }
+            state.transcript = transcript;
+        });
+        let terminal = terminal_state.read(cx).terminal.clone();
+        div()
+            .w_full()
+            .h(px(220.0))
+            .rounded_md()
+            .overflow_hidden()
+            .child(terminal)
+            .into_any_element()
     }
 
     /// Renders a single message row. Called from the list() render callback so it
@@ -562,10 +692,11 @@ impl ChatView {
             text_color,
             message_content,
             copy_content,
+            thread_id,
             message_id,
             is_collapsible,
             is_expanded,
-        ): (Rgba, Rgba, MessageContent, String, Uuid, bool, bool) = {
+        ): (Rgba, Rgba, MessageContent, String, Uuid, Uuid, bool, bool) = {
             let state = app_state.read(cx);
             let Some(thread) = state.active_thread() else {
                 return div().into_any_element();
@@ -612,13 +743,21 @@ impl ChatView {
                 text_color,
                 display_content,
                 copy_content,
+                message.thread_id,
                 message.id,
                 is_collapsible,
                 is_expanded,
             )
         };
 
-        let content_el = Self::render_message_content(message_id, &message_content, window, cx);
+        let content_el = Self::render_message_content(
+            app_state,
+            thread_id,
+            message_id,
+            &message_content,
+            window,
+            cx,
+        );
 
         let this_expand = this.clone();
         div()

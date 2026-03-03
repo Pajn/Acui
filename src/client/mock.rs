@@ -95,6 +95,7 @@ async fn mock_agent_notifications_flow_to_client_events() {
                     assert_eq!(received.session_id, notification.session_id);
                 }
                 AgentEvent::PermissionRequest(_) => panic!("expected notification event"),
+                AgentEvent::Terminal(_) => panic!("expected notification event"),
                 AgentEvent::Disconnected => panic!("expected notification event"),
             }
         })
@@ -249,11 +250,15 @@ async fn terminal_requests_capture_output_and_exit_status() {
                 Some(0)
             );
 
-            let chunks = collect_text_chunks(&mut event_rx).await;
-            let joined = chunks.join("\n");
-            assert!(joined.contains("running"));
-            assert!(joined.contains("terminal-ok"));
-            assert!(joined.contains("finished successfully"));
+            let terminal_events = collect_terminal_events(&mut event_rx).await;
+            assert!(
+                terminal_events
+                    .started_command
+                    .as_deref()
+                    .is_some_and(|command| command.contains("printf terminal-ok"))
+            );
+            assert!(terminal_events.output.contains("terminal-ok"));
+            assert_eq!(terminal_events.exit_code, Some(0));
 
             agent_conn
                 .release_terminal(ReleaseTerminalRequest::new(
@@ -286,22 +291,32 @@ async fn next_text_chunk(event_rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> 
     }
 }
 
-async fn collect_text_chunks(event_rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> Vec<String> {
-    let mut chunks = Vec::new();
+#[derive(Default)]
+struct TerminalEventSnapshot {
+    started_command: Option<String>,
+    output: String,
+    exit_code: Option<u32>,
+}
+
+async fn collect_terminal_events(
+    event_rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
+) -> TerminalEventSnapshot {
+    let mut snapshot = TerminalEventSnapshot::default();
     while let Ok(Some(event)) =
         tokio::time::timeout(std::time::Duration::from_millis(150), event_rx.recv()).await
     {
-        if let AgentEvent::Notification(SessionNotification {
-            update:
-                SessionUpdate::AgentMessageChunk(acp::ContentChunk {
-                    content: ContentBlock::Text(text),
-                    ..
-                }),
-            ..
-        }) = event
-        {
-            chunks.push(text.text);
+        match event {
+            AgentEvent::Terminal(TerminalEvent::Started { command, .. }) => {
+                snapshot.started_command = Some(command);
+            }
+            AgentEvent::Terminal(TerminalEvent::Output { chunk, .. }) => {
+                snapshot.output.push_str(&chunk);
+            }
+            AgentEvent::Terminal(TerminalEvent::Exited { exit_status, .. }) => {
+                snapshot.exit_code = exit_status.exit_code;
+            }
+            _ => {}
         }
     }
-    chunks
+    snapshot
 }

@@ -7,7 +7,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::client::{AcpController, AgentEvent, PermissionRequestEvent};
+use crate::client::{AcpController, AgentEvent, PermissionRequestEvent, TerminalEvent};
 use crate::config::AppConfig;
 use crate::domain::{Message, MessageContent, Role, Thread, Workspace};
 use crate::persistence::AppPersistence;
@@ -15,7 +15,7 @@ use agent_client_protocol::{
     AvailableCommand, ContentBlock, ContentChunk, PermissionOption, PermissionOptionId, Plan,
     RequestPermissionOutcome, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
     SessionConfigValueId, SessionId, SessionModeId, SessionModeState, SessionNotification,
-    SessionUpdate, StopReason, ToolCall, ToolCallUpdate,
+    SessionUpdate, StopReason, TerminalExitStatus, ToolCall, ToolCallUpdate,
 };
 use ignore::WalkBuilder;
 use similar::TextDiff;
@@ -24,6 +24,13 @@ struct ThreadAgentConnection {
     controller: Rc<AcpController>,
     session_id: SessionId,
     _process: Option<std::process::Child>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ThreadTerminal {
+    command: Option<String>,
+    output: String,
+    exit_status: Option<TerminalExitStatus>,
 }
 
 /// All per-thread agent state in one place. A single `HashMap<Uuid, ThreadState>`
@@ -40,6 +47,7 @@ struct ThreadState {
     available_commands: Vec<AvailableCommand>,
     tool_calls: HashMap<String, ToolCall>,
     tool_call_messages: HashMap<String, Uuid>,
+    terminals: HashMap<String, ThreadTerminal>,
     plan: Option<Plan>,
     mode: Option<SessionModeState>,
     prompt_started_at: Option<Instant>,
@@ -59,6 +67,7 @@ impl ThreadState {
             available_commands: Vec::new(),
             tool_calls: HashMap::new(),
             tool_call_messages: HashMap::new(),
+            terminals: HashMap::new(),
             plan: None,
             mode: None,
             prompt_started_at: None,
@@ -395,6 +404,29 @@ impl AppState {
     pub fn active_thread_modes(&self) -> Option<SessionModeState> {
         let thread_id = self.active_thread_id?;
         self.ts(thread_id).and_then(|ts| ts.mode.clone())
+    }
+
+    pub fn terminal_transcript_for_thread(
+        &self,
+        thread_id: Uuid,
+        terminal_id: &str,
+    ) -> Option<String> {
+        let terminal = self.ts(thread_id)?.terminals.get(terminal_id)?;
+        let mut transcript = String::new();
+        if let Some(command) = &terminal.command {
+            transcript.push_str("$ ");
+            transcript.push_str(command);
+            transcript.push('\n');
+        }
+        transcript.push_str(&terminal.output);
+        if let Some(exit_status) = &terminal.exit_status {
+            if !transcript.is_empty() && !transcript.ends_with('\n') {
+                transcript.push('\n');
+            }
+            transcript.push_str(&terminal_exit_status_label(exit_status));
+            transcript.push('\n');
+        }
+        Some(transcript)
     }
 
     pub fn thread_has_unread_stop(&self, thread_id: Uuid) -> bool {
@@ -1011,6 +1043,9 @@ impl AppState {
                 }
                 self.ts_mut(thread_id).pending_permission = Some(request);
             }
+            AgentEvent::Terminal(event) => {
+                self.apply_terminal_event(thread_id, event);
+            }
             AgentEvent::Disconnected => {
                 self.append_log_line("from_agent.disconnected", thread_id, "disconnected");
                 self.finalize_agent_message(thread_id);
@@ -1147,7 +1182,7 @@ impl AppState {
         }
     }
 
-    fn apply_tool_call_update(&mut self, thread_id: Uuid, update: ToolCallUpdate) {
+    fn apply_tool_call_update(&mut self, thread_id: Uuid, mut update: ToolCallUpdate) {
         let tool_call_id = update.tool_call_id.to_string();
         let (updated_tool_call, existing_message_id) = {
             let ts = self.ts_mut(thread_id);
@@ -1155,6 +1190,19 @@ impl AppState {
                 .tool_calls
                 .entry(tool_call_id.clone())
                 .or_insert_with(|| ToolCall::new(update.tool_call_id.clone(), "Tool call"));
+            if let Some(content) = update.fields.content.as_mut() {
+                let has_terminal = content.iter().any(|item| {
+                    matches!(item, agent_client_protocol::ToolCallContent::Terminal(_))
+                });
+                if !has_terminal {
+                    content.extend(entry.content.iter().filter_map(|item| match item {
+                        agent_client_protocol::ToolCallContent::Terminal(terminal) => Some(
+                            agent_client_protocol::ToolCallContent::Terminal(terminal.clone()),
+                        ),
+                        _ => None,
+                    }));
+                }
+            }
             entry.update(update.fields);
             let updated_tool_call = entry.clone();
             let existing_message_id = ts.tool_call_messages.get(&tool_call_id).copied();
@@ -1180,6 +1228,32 @@ impl AppState {
             self.ts_mut(thread_id)
                 .tool_call_messages
                 .insert(tool_call_id, message_id);
+        }
+    }
+
+    fn apply_terminal_event(&mut self, thread_id: Uuid, event: TerminalEvent) {
+        let terminals = &mut self.ts_mut(thread_id).terminals;
+        match event {
+            TerminalEvent::Started {
+                terminal_id,
+                command,
+            } => {
+                let entry = terminals.entry(terminal_id.to_string()).or_default();
+                entry.command = Some(command);
+                entry.output.clear();
+                entry.exit_status = None;
+            }
+            TerminalEvent::Output { terminal_id, chunk } => {
+                let entry = terminals.entry(terminal_id.to_string()).or_default();
+                entry.output.push_str(&chunk);
+            }
+            TerminalEvent::Exited {
+                terminal_id,
+                exit_status,
+            } => {
+                let entry = terminals.entry(terminal_id.to_string()).or_default();
+                entry.exit_status = Some(exit_status);
+            }
         }
     }
 
@@ -1334,6 +1408,15 @@ fn stop_reason_label(stop_reason: StopReason) -> &'static str {
     }
 }
 
+fn terminal_exit_status_label(exit_status: &TerminalExitStatus) -> String {
+    match (exit_status.exit_code, exit_status.signal.as_deref()) {
+        (Some(0), _) => "finished successfully".to_string(),
+        (Some(code), _) => format!("failed with exit code {code}"),
+        (None, Some(signal)) => format!("terminated by signal {signal}"),
+        _ => "finished".to_string(),
+    }
+}
+
 fn format_duration_short(duration: std::time::Duration) -> String {
     let millis = duration.as_millis();
     if millis < 1_000 {
@@ -1363,8 +1446,8 @@ mod tests {
     use super::*;
     use agent_client_protocol::{
         AvailableCommand, AvailableCommandsUpdate, ConfigOptionUpdate, Diff, PermissionOptionKind,
-        SessionConfigOption, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
-        ToolCallUpdateFields,
+        SessionConfigOption, TerminalExitStatus, TerminalId, ToolCall, ToolCallContent,
+        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     };
 
     #[test]
@@ -1630,6 +1713,108 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("Tool: Read file"));
+    }
+
+    #[test]
+    fn terminal_events_build_transcript_for_terminal_tool_calls() {
+        let mut state = AppState::new();
+        let workspace_id = Uuid::new_v4();
+        let thread = Thread::new(workspace_id, "Thread");
+        let thread_id = thread.id;
+        let mut workspace = Workspace::new("Workspace");
+        workspace.id = workspace_id;
+        workspace.add_thread(thread);
+        state.workspaces.push(workspace);
+        state.active_thread_id = Some(thread_id);
+
+        state.apply_agent_event(
+            thread_id,
+            AgentEvent::Terminal(TerminalEvent::Started {
+                terminal_id: TerminalId::new("terminal-1"),
+                command: "sh -c \"printf terminal-ok\"".to_string(),
+            }),
+        );
+        state.apply_agent_event(
+            thread_id,
+            AgentEvent::Terminal(TerminalEvent::Output {
+                terminal_id: TerminalId::new("terminal-1"),
+                chunk: "terminal-ok".to_string(),
+            }),
+        );
+        state.apply_agent_event(
+            thread_id,
+            AgentEvent::Terminal(TerminalEvent::Exited {
+                terminal_id: TerminalId::new("terminal-1"),
+                exit_status: TerminalExitStatus::new().exit_code(0),
+            }),
+        );
+
+        let transcript = state
+            .terminal_transcript_for_thread(thread_id, "terminal-1")
+            .expect("terminal transcript should exist");
+        assert!(transcript.contains("$ sh -c \"printf terminal-ok\""));
+        assert!(transcript.contains("terminal-ok"));
+        assert!(transcript.contains("finished successfully"));
+    }
+
+    #[test]
+    fn tool_call_updates_preserve_existing_terminal_blocks() {
+        let mut state = AppState::new();
+        let workspace_id = Uuid::new_v4();
+        let thread = Thread::new(workspace_id, "Thread");
+        let thread_id = thread.id;
+        let mut workspace = Workspace::new("Workspace");
+        workspace.id = workspace_id;
+        workspace.add_thread(thread);
+        state.workspaces.push(workspace);
+        state.active_thread_id = Some(thread_id);
+
+        let tool_call = ToolCall::new("tool-1", "Run terminal")
+            .status(ToolCallStatus::InProgress)
+            .content(vec![ToolCallContent::Terminal(
+                agent_client_protocol::Terminal::new(TerminalId::new("terminal-1")),
+            )]);
+        state.apply_agent_event(
+            thread_id,
+            AgentEvent::Notification(SessionNotification::new(
+                SessionId::new("session-1"),
+                SessionUpdate::ToolCall(tool_call),
+            )),
+        );
+
+        let update = ToolCallUpdate::new(
+            "tool-1",
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Completed)
+                .content(vec![ToolCallContent::from("terminal complete")]),
+        );
+        state.apply_agent_event(
+            thread_id,
+            AgentEvent::Notification(SessionNotification::new(
+                SessionId::new("session-1"),
+                SessionUpdate::ToolCallUpdate(update),
+            )),
+        );
+
+        let thread = state
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.get_thread(thread_id))
+            .expect("thread should exist");
+        let has_terminal = thread
+            .messages
+            .iter()
+            .find_map(|message| match &message.content {
+                MessageContent::ToolCall(tool_call) => Some(
+                    tool_call
+                        .content
+                        .iter()
+                        .any(|item| matches!(item, ToolCallContent::Terminal(_))),
+                ),
+                _ => None,
+            })
+            .unwrap_or(false);
+        assert!(has_terminal, "terminal content should remain attached");
     }
 
     #[test]

@@ -30,10 +30,27 @@ pub struct PermissionRequestEvent {
     pub response_tx: oneshot::Sender<RequestPermissionOutcome>,
 }
 
+#[derive(Debug, Clone)]
+pub enum TerminalEvent {
+    Started {
+        terminal_id: acp::TerminalId,
+        command: String,
+    },
+    Output {
+        terminal_id: acp::TerminalId,
+        chunk: String,
+    },
+    Exited {
+        terminal_id: acp::TerminalId,
+        exit_status: TerminalExitStatus,
+    },
+}
+
 #[derive(Debug)]
 pub enum AgentEvent {
     Notification(SessionNotification),
     PermissionRequest(PermissionRequestEvent),
+    Terminal(TerminalEvent),
     Disconnected,
 }
 
@@ -54,7 +71,6 @@ struct TerminalBuffers {
 
 #[derive(Debug)]
 struct TerminalState {
-    session_id: SessionId,
     terminal_id: acp::TerminalId,
     child: Mutex<Option<tokio::process::Child>>,
     buffers: Mutex<TerminalBuffers>,
@@ -62,13 +78,11 @@ struct TerminalState {
 
 impl TerminalState {
     fn new(
-        session_id: SessionId,
         terminal_id: acp::TerminalId,
         child: tokio::process::Child,
         output_limit: Option<u64>,
     ) -> Self {
         Self {
-            session_id,
             terminal_id,
             child: Mutex::new(Some(child)),
             buffers: Mutex::new(TerminalBuffers {
@@ -170,7 +184,6 @@ impl acp::Client for GpuiAcpClient {
         let stderr = child.stderr.take();
         let terminal_id = acp::TerminalId::new(format!("terminal-{}", uuid::Uuid::new_v4()));
         let state = Arc::new(TerminalState::new(
-            args.session_id.clone(),
             terminal_id.clone(),
             child,
             args.output_byte_limit,
@@ -192,13 +205,12 @@ impl acp::Client for GpuiAcpClient {
             rendered_command.push(' ');
             rendered_command.push_str(&args.args.join(" "));
         }
-        self.send_agent_message(
-            args.session_id,
-            format!(
-                "$ {rendered_command}\n[terminal {}] running",
-                state.terminal_id
-            ),
-        );
+        let _ = self
+            .event_tx
+            .send(AgentEvent::Terminal(TerminalEvent::Started {
+                terminal_id: state.terminal_id.clone(),
+                command: rendered_command,
+            }));
 
         Ok(CreateTerminalResponse::new(terminal_id))
     }
@@ -389,14 +401,10 @@ fn spawn_terminal_reader<R>(
                     buffers.truncated = true;
                 }
             }
-            let rendered = format!("[terminal {}] {text}", state.terminal_id);
-            let update = SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                ContentBlock::from(rendered),
-            ));
-            let _ = event_tx.send(AgentEvent::Notification(SessionNotification::new(
-                state.session_id.clone(),
-                update,
-            )));
+            let _ = event_tx.send(AgentEvent::Terminal(TerminalEvent::Output {
+                terminal_id: state.terminal_id.clone(),
+                chunk: text,
+            }));
         }
     });
 }
@@ -419,19 +427,10 @@ async fn report_terminal_exit(
     if !should_report {
         return;
     }
-    let label = match (exit_status.exit_code, exit_status.signal.clone()) {
-        (Some(0), _) => "finished successfully".to_string(),
-        (Some(code), _) => format!("failed with exit code {code}"),
-        (None, Some(signal)) => format!("terminated by signal {signal}"),
-        _ => "finished".to_string(),
-    };
-    let message = format!("[terminal {}] {label}", state.terminal_id);
-    let update =
-        SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(ContentBlock::from(message)));
-    let _ = event_tx.send(AgentEvent::Notification(SessionNotification::new(
-        state.session_id.clone(),
-        update,
-    )));
+    let _ = event_tx.send(AgentEvent::Terminal(TerminalEvent::Exited {
+        terminal_id: state.terminal_id.clone(),
+        exit_status,
+    }));
 }
 
 async fn refresh_terminal_status(

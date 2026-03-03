@@ -4,11 +4,18 @@ version = "0.1.0"
 edition = "2024"
 description = "GPUI-based multi-agent session controller using the Agent-Client Protocol"
 
+[package.metadata.bundle]
+name = "acui"
+identifier = "com.acui.app"
+icon = ["assets/acui.icns"]
+
+
 [dependencies]
 # UI Framework
 gpui = { version = "0.2.2", features = ["runtime_shaders", "test-support"] }
 gpui-component = "0.5.1"
 gpui-component-assets = "0.5.1"
+gpui-terminal = "=0.1.0"
 
 # Async & Concurrency
 tokio = { version = "1.49", features = [
