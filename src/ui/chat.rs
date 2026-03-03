@@ -1,4 +1,4 @@
-use crate::domain::{Message, Role};
+use crate::domain::Role;
 use crate::state::AppState;
 use agent_client_protocol::{AvailableCommand, SessionModeState};
 use gpui::prelude::*;
@@ -8,7 +8,9 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::scroll::Scrollbar;
 use gpui_component::skeleton::Skeleton;
 use gpui_component::text::TextView;
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::rc::Rc;
 use uuid::Uuid;
 
 mod support;
@@ -33,17 +35,13 @@ struct SuggestionState {
     selected: usize,
 }
 
-#[derive(Clone)]
-enum ChatRow {
-    Message(Message),
-    Working,
-}
-
 const COLLAPSE_LINE_LIMIT: usize = 10;
 
 pub struct ChatView {
     app_state: Entity<AppState>,
-    scroll_handle: ScrollHandle,
+    list_state: ListState,
+    listed_thread_id: Option<Uuid>,
+    listed_count: usize,
     suggestion_scroll_handle: ScrollHandle,
     input_state: Entity<InputState>,
     locked_to_bottom: bool,
@@ -54,8 +52,7 @@ pub struct ChatView {
     history_cursor: Option<usize>,
     history_draft: String,
     expanded_messages: HashSet<Uuid>,
-    diff_scroll_handles: HashMap<Uuid, ScrollHandle>,
-    rows: Vec<ChatRow>,
+    diff_scroll_handles: Rc<RefCell<std::collections::HashMap<Uuid, ScrollHandle>>>,
 }
 
 impl ChatView {
@@ -135,7 +132,9 @@ impl ChatView {
 
         Self {
             app_state,
-            scroll_handle: ScrollHandle::new(),
+            list_state: ListState::new(0, ListAlignment::Top, px(512.0)),
+            listed_thread_id: None,
+            listed_count: 0,
             suggestion_scroll_handle: ScrollHandle::new(),
             input_state,
             locked_to_bottom: true,
@@ -146,8 +145,7 @@ impl ChatView {
             history_cursor: None,
             history_draft: String::new(),
             expanded_messages: HashSet::new(),
-            diff_scroll_handles: HashMap::new(),
-            rows: Vec::new(),
+            diff_scroll_handles: Rc::new(RefCell::new(std::collections::HashMap::new())),
         }
     }
 
@@ -225,14 +223,17 @@ impl ChatView {
     }
 
     fn update_scroll_lock(&mut self) {
-        let max_y = self.scroll_handle.max_offset().height;
-        let y = self.scroll_handle.offset().y;
-        self.locked_to_bottom = (max_y - y).abs() <= px(2.0);
+        // scroll_px_offset_for_scrollbar returns negative Y (content-moved-up convention),
+        // so "at bottom" is when max_y + y ≈ 0.
+        let max_y = self.list_state.max_offset_for_scrollbar().height;
+        let y = self.list_state.scroll_px_offset_for_scrollbar().y;
+        self.locked_to_bottom = (max_y + y).abs() <= px(2.0);
     }
 
     fn scroll_to_bottom(&self) {
-        let max = self.scroll_handle.max_offset();
-        self.scroll_handle.set_offset(point(px(0.0), max.height));
+        let max = self.list_state.max_offset_for_scrollbar();
+        self.list_state
+            .set_offset_from_scrollbar(point(px(0.0), max.height));
     }
 
     fn suggestion_anchor_from_input(&self, input: &str) -> Option<(SuggestionKind, usize, String)> {
@@ -345,34 +346,24 @@ impl ChatView {
         self.set_input_value(input, window, cx);
     }
 
-    fn build_rows(&self, messages: Vec<Message>, is_working: bool) -> Vec<ChatRow> {
-        let mut rows = messages
-            .into_iter()
-            .map(ChatRow::Message)
-            .collect::<Vec<_>>();
-        if is_working {
-            rows.push(ChatRow::Working);
-        }
-        rows
-    }
-
     fn render_readonly_code(
-        &mut self,
         message_id: Uuid,
         _language: &str,
         content: String,
+        diff_scroll_handles: &Rc<RefCell<std::collections::HashMap<Uuid, ScrollHandle>>>,
         window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         let scroll_handle = window
             .use_keyed_state(
                 SharedString::from(format!("chat-diff-scroll-{message_id}")),
-                _cx,
+                cx,
                 |_, _| ScrollHandle::new(),
             )
-            .read(_cx)
+            .read(cx)
             .clone();
-        self.diff_scroll_handles
+        diff_scroll_handles
+            .borrow_mut()
             .insert(message_id, scroll_handle.clone());
         let mut lines = Vec::new();
         let mut max_chars = 1usize;
@@ -439,18 +430,25 @@ impl ChatView {
     }
 
     fn render_message_content(
-        &mut self,
-        message: &Message,
+        message_id: Uuid,
         content: String,
+        diff_scroll_handles: &Rc<RefCell<std::collections::HashMap<Uuid, ScrollHandle>>>,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         if content.contains("--- before\n+++ after") {
-            return self.render_readonly_code(message.id, "diff", content, window, cx);
+            return Self::render_readonly_code(
+                message_id,
+                "diff",
+                content,
+                diff_scroll_handles,
+                window,
+                cx,
+            );
         }
 
         TextView::markdown(
-            SharedString::from(format!("chat-md-{}", message.id)),
+            SharedString::from(format!("chat-md-{}", message_id)),
             SharedString::from(content),
             window,
             cx,
@@ -459,135 +457,134 @@ impl ChatView {
         .into_any_element()
     }
 
-    fn render_row(
-        &mut self,
-        row_index: usize,
+    /// Renders a single message row. Called from the list() render callback so it
+    /// takes `Entity<AppState>` and `Entity<ChatView>` rather than `&mut self`.
+    fn render_message_row(
+        index: usize,
+        app_state: &Entity<AppState>,
+        this: &Entity<ChatView>,
+        expanded_messages: &HashSet<Uuid>,
+        diff_scroll_handles: &Rc<RefCell<std::collections::HashMap<Uuid, ScrollHandle>>>,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
-        let Some(row) = self.rows.get(row_index).cloned() else {
+        let state = app_state.read(cx);
+        let Some(thread) = state.active_thread() else {
+            return div().into_any_element();
+        };
+        let Some(message) = thread.messages.get(index) else {
             return div().into_any_element();
         };
 
-        match row {
-            ChatRow::Working => div()
-                .id(("chat-working", row_index))
-                .debug_selector(|| "chat-working-row".to_string())
-                .when_some(row_debug_selector(row_index), |this, selector| {
-                    this.debug_selector(move || selector.to_string())
-                })
-                .px_3()
-                .py_2()
-                .child(
-                    div()
-                        .p_3()
-                        .rounded_md()
-                        .bg(rgb(0x2d2d30))
-                        .child(Skeleton::new()),
-                )
-                .into_any_element(),
-            ChatRow::Message(message) => {
-                let bg = match message.role {
-                    Role::User => rgb(0x0e639c),
-                    Role::Agent => rgb(0x3c3c3c),
-                    Role::System => rgb(0x6b2f2f),
-                };
-                let line_count = message.content.lines().count();
-                let is_diff_message = message.content.contains("--- before\n+++ after");
-                let is_collapsible = line_count > COLLAPSE_LINE_LIMIT && !is_diff_message;
-                let is_expanded = self.expanded_messages.contains(&message.id);
-                let display_content = if is_collapsible && !is_expanded {
-                    message
-                        .content
-                        .lines()
-                        .take(COLLAPSE_LINE_LIMIT)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else {
-                    message.content.clone()
-                };
-                let copy_content = message.content.clone();
+        let bg = match message.role {
+            Role::User => rgb(0x0e639c),
+            Role::Agent => rgb(0x3c3c3c),
+            Role::System => rgb(0x6b2f2f),
+        };
+        let line_count = message.content.lines().count();
+        let is_diff_message = message.content.contains("--- before\n+++ after");
+        let is_collapsible = line_count > COLLAPSE_LINE_LIMIT && !is_diff_message;
+        let is_expanded = expanded_messages.contains(&message.id);
+        let display_content = if is_collapsible && !is_expanded {
+            message
+                .content
+                .lines()
+                .take(COLLAPSE_LINE_LIMIT)
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            message.content.clone()
+        };
+        let copy_content = message.content.clone();
+        let message_id = message.id;
+        drop(state);
 
+        let content_el = Self::render_message_content(
+            message_id,
+            display_content,
+            diff_scroll_handles,
+            window,
+            cx,
+        );
+
+        let this_expand = this.clone();
+        div()
+            .id(("chat-message", index))
+            .when_some(row_debug_selector(index), |this, selector| {
+                this.debug_selector(move || selector.to_string())
+            })
+            .w_full()
+            .min_w(px(0.0))
+            .p_2()
+            .cursor_text()
+            .on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copy_content.clone()));
+            })
+            .child(
                 div()
-                    .id(("chat-message", row_index))
-                    .when_some(row_debug_selector(row_index), |this, selector| {
-                        this.debug_selector(move || selector.to_string())
-                    })
                     .w_full()
                     .min_w(px(0.0))
+                    .max_w_full()
                     .p_2()
-                    .cursor_text()
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copy_content.clone()));
-                    }))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w(px(0.0))
-                            .max_w_full()
-                            .p_2()
-                            .rounded_md()
-                            .bg(bg)
-                            .text_color(white())
-                            .whitespace_normal()
-                            .child(self.render_message_content(
-                                &message,
-                                display_content,
-                                window,
-                                cx,
-                            ))
-                            .when(is_collapsible, |this| {
-                                let message_id = message.id;
-                                this.child(
-                                    div()
-                                        .id(("message-expand-toggle", row_index))
-                                        .mt_2()
-                                        .text_xs()
-                                        .text_color(rgb(0xbdbdbd))
-                                        .cursor_pointer()
-                                        .child(if is_expanded {
-                                            "Show less"
+                    .rounded_md()
+                    .bg(bg)
+                    .text_color(white())
+                    .whitespace_normal()
+                    .child(content_el)
+                    .when(is_collapsible, |this| {
+                        this.child(
+                            div()
+                                .id(("message-expand-toggle", index))
+                                .mt_2()
+                                .text_xs()
+                                .text_color(rgb(0xbdbdbd))
+                                .cursor_pointer()
+                                .child(if is_expanded {
+                                    "Show less"
+                                } else {
+                                    "Show more"
+                                })
+                                .on_click(move |_, _, cx| {
+                                    let _ = this_expand.update(cx, |view, cx| {
+                                        if view.expanded_messages.contains(&message_id) {
+                                            view.expanded_messages.remove(&message_id);
                                         } else {
-                                            "Show more"
-                                        })
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if this.expanded_messages.contains(&message_id) {
-                                                this.expanded_messages.remove(&message_id);
-                                            } else {
-                                                this.expanded_messages.insert(message_id);
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                            }),
-                    )
-                    .into_any_element()
-            }
-        }
+                                            view.expanded_messages.insert(message_id);
+                                        }
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                    }),
+            )
+            .into_any_element()
     }
 
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn debug_message_scroll_offset(&self) -> Point<Pixels> {
-        self.scroll_handle.offset()
+        // Negate Y to match the positive-increases-downward convention of ScrollHandle::offset().
+        let p = self.list_state.scroll_px_offset_for_scrollbar();
+        point(p.x, -p.y)
     }
 
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn debug_message_max_offset(&self) -> Size<Pixels> {
-        self.scroll_handle.max_offset()
+        self.list_state.max_offset_for_scrollbar()
     }
 
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn debug_message_set_scroll_offset(&self, offset: Point<Pixels>) {
-        self.scroll_handle.set_offset(offset);
+        self.list_state.set_offset_from_scrollbar(offset);
     }
 
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn debug_diff_scroll_offset(&self, message_id: Uuid) -> Option<Point<Pixels>> {
         self.diff_scroll_handles
+            .borrow()
             .get(&message_id)
             .map(ScrollHandle::offset)
     }
@@ -596,6 +593,7 @@ impl ChatView {
     #[allow(dead_code)]
     pub fn debug_diff_max_offset(&self, message_id: Uuid) -> Option<Size<Pixels>> {
         self.diff_scroll_handles
+            .borrow()
             .get(&message_id)
             .map(ScrollHandle::max_offset)
     }
@@ -603,7 +601,7 @@ impl ChatView {
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn debug_diff_set_scroll_offset(&self, message_id: Uuid, offset: Point<Pixels>) -> bool {
-        if let Some(handle) = self.diff_scroll_handles.get(&message_id) {
+        if let Some(handle) = self.diff_scroll_handles.borrow().get(&message_id) {
             handle.set_offset(offset);
             true
         } else {
@@ -616,11 +614,18 @@ impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_scroll_lock();
 
-        let (active_thread_id, messages, permission_options, config_options, modes, is_working) = {
+        let (
+            active_thread_id,
+            message_count,
+            permission_options,
+            config_options,
+            modes,
+            is_working,
+        ) = {
             let state = self.app_state.read(cx);
             (
                 state.active_thread_id,
-                state.active_thread_messages(),
+                state.active_thread_message_count(),
                 state.active_thread_permission_options(),
                 state.active_thread_config_options(),
                 state.active_thread_modes(),
@@ -628,10 +633,47 @@ impl Render for ChatView {
             )
         };
 
-        self.rows = self.build_rows(messages, is_working);
+        let total_count = message_count + is_working as usize;
+
+        // Update the ListState only when the thread or item count changes so we
+        // don't invalidate cached item heights unnecessarily on every render.
+        match (
+            active_thread_id != self.listed_thread_id,
+            total_count != self.listed_count,
+        ) {
+            (true, _) => {
+                self.list_state.reset(total_count);
+            }
+            (false, true) if total_count > self.listed_count => {
+                // New items appended (new message or working sentinel added).
+                self.list_state.splice(
+                    self.listed_count..self.listed_count,
+                    total_count - self.listed_count,
+                );
+            }
+            (false, true) => {
+                // Items removed (e.g. working sentinel cleared).
+                self.list_state.reset(total_count);
+            }
+            _ => {
+                // Same thread, same count: streaming chunk landed in the last
+                // message. Invalidate just that item's cached height.
+                if message_count > 0 {
+                    self.list_state.splice(message_count - 1..message_count, 1);
+                }
+            }
+        }
+        self.listed_thread_id = active_thread_id;
+        self.listed_count = total_count;
+
+        // Build list render closure — captures cheap handles, not the full messages.
+        let app_state = self.app_state.clone();
+        let this = cx.entity();
+        let expanded_messages = self.expanded_messages.clone();
+        let diff_scroll_handles = self.diff_scroll_handles.clone();
 
         let chat_content: AnyElement = if active_thread_id.is_some() {
-            if self.rows.is_empty() {
+            if total_count == 0 {
                 div()
                     .flex_1()
                     .flex()
@@ -641,10 +683,6 @@ impl Render for ChatView {
                     .child("Send a message to start")
                     .into_any_element()
             } else {
-                let rows = self.rows.len();
-                let rows = (0..rows)
-                    .map(|index| self.render_row(index, _window, cx))
-                    .collect::<Vec<_>>();
                 div()
                     .relative()
                     .flex_1()
@@ -654,16 +692,45 @@ impl Render for ChatView {
                     .debug_selector(|| "chat-message-list-container".to_string())
                     .child(
                         div()
-                            .id("chat-message-list")
                             .size_full()
                             .min_w(px(0.0))
                             .min_h(px(0.0))
-                            .overflow_y_scroll()
-                            .overflow_x_hidden()
-                            .track_scroll(&self.scroll_handle)
-                            .vertical_scrollbar(&self.scroll_handle)
                             .debug_selector(|| "chat-message-list-scrollable".to_string())
-                            .child(div().w_full().children(rows)),
+                            .child(
+                                list(
+                                    self.list_state.clone(),
+                                    move |index, window, cx| -> AnyElement {
+                                        if index >= message_count {
+                                            // Working skeleton row.
+                                            return div()
+                                                .id(("chat-working", index))
+                                                .debug_selector(|| "chat-working-row".to_string())
+                                                .px_3()
+                                                .py_2()
+                                                .child(
+                                                    div()
+                                                        .p_3()
+                                                        .rounded_md()
+                                                        .bg(rgb(0x2d2d30))
+                                                        .child(Skeleton::new()),
+                                                )
+                                                .into_any_element();
+                                        }
+                                        ChatView::render_message_row(
+                                            index,
+                                            &app_state,
+                                            &this,
+                                            &expanded_messages,
+                                            &diff_scroll_handles,
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                )
+                                .size_full()
+                                .min_w(px(0.0))
+                                .min_h(px(0.0)),
+                            ),
                     )
                     .into_any_element()
             }
