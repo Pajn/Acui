@@ -108,6 +108,8 @@ struct TerminalWidgetState {
 }
 
 const COLLAPSE_LINE_LIMIT: usize = 10;
+const COLLAPSE_CHAR_LIMIT: usize = 2_000;
+const MARKDOWN_FASTPATH_LENGTH: usize = 2_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct MessageTailSignature {
@@ -290,14 +292,15 @@ impl ChatView {
 
         let list_state = {
             let this = cx.entity();
-            let state = ListState::new(0, ListAlignment::Top, px(512.0));
+            let state = ListState::new(0, ListAlignment::Bottom, px(512.0));
             let weak = this.downgrade();
-            state.set_scroll_handler(move |_event, _window, app| {
+            state.set_scroll_handler(move |event, _window, app| {
                 // list_state.0 is borrow_mut'd when this handler fires, so we
                 // must NOT call borrow() on it (e.g. via max_offset_for_scrollbar).
                 // Set a flag; render() will process it safely.
                 let _ = weak.update(app, |this, _cx| {
                     this.user_scrolled = true;
+                    this.locked_to_bottom = !event.is_scrolled;
                 });
             });
             state
@@ -400,12 +403,7 @@ impl ChatView {
     }
 
     fn update_scroll_lock(&mut self, cx: &mut Context<Self>) {
-        // scroll_px_offset_for_scrollbar returns negative Y (content-moved-up convention),
-        // so "at bottom" is when max_y + y ≈ 0.
-        let offset = self.list_state.scroll_px_offset_for_scrollbar();
-        let max_y = self.list_state.max_offset_for_scrollbar().height;
-        self.locked_to_bottom = (max_y + offset.y).abs() <= px(2.0);
-
+        let offset = self.normalized_scroll_offset();
         if let Some(thread_id) = self.app_state.read(cx).active_thread_id {
             let locked = self.locked_to_bottom;
             self.app_state.update(cx, |state, _| {
@@ -414,10 +412,23 @@ impl ChatView {
         }
     }
 
+    fn normalized_scroll_offset(&self) -> Point<Pixels> {
+        let raw_offset = self.list_state.scroll_px_offset_for_scrollbar();
+        let max_y = self.list_state.max_offset_for_scrollbar().height;
+        let y = if self.locked_to_bottom {
+            max_y
+        } else {
+            raw_offset.y.abs().min(max_y)
+        };
+        point(px(0.0), y)
+    }
+
     fn scroll_to_bottom(&self) {
         let max = self.list_state.max_offset_for_scrollbar();
-        self.list_state
-            .set_offset_from_scrollbar(point(px(0.0), max.height));
+        if max.height > px(0.0) {
+            self.list_state
+                .set_offset_from_scrollbar(point(px(0.0), max.height));
+        }
     }
 
     fn suggestion_anchor_from_input(&self, input: &str) -> Option<(SuggestionKind, usize, String)> {
@@ -572,6 +583,21 @@ impl ChatView {
             .into_any_element()
     }
 
+    fn render_markdown_or_plain_text(
+        key: SharedString,
+        text: String,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        if should_render_markdown(&text) {
+            TextView::markdown(key, SharedString::from(text), window, cx)
+                .selectable(true)
+                .into_any_element()
+        } else {
+            div().w_full().min_w(px(0.0)).child(text).into_any_element()
+        }
+    }
+
     fn render_message_content(
         app_state: &Entity<AppState>,
         thread_id: Uuid,
@@ -592,14 +618,12 @@ impl ChatView {
                     );
                 }
 
-                TextView::markdown(
+                Self::render_markdown_or_plain_text(
                     SharedString::from(format!("chat-md-{}", message_id)),
-                    SharedString::from(text.clone()),
+                    text.clone(),
                     window,
                     cx,
                 )
-                .selectable(true)
-                .into_any_element()
             }
             MessageContent::ToolCall(tool_call) => {
                 let mut lines = vec![
@@ -688,13 +712,12 @@ impl ChatView {
                         )
                     }))
                     .children(other_content.into_iter().enumerate().map(|(i, text)| {
-                        TextView::markdown(
+                        Self::render_markdown_or_plain_text(
                             SharedString::from(format!("chat-tool-extra-{}-{}", message_id, i)),
-                            SharedString::from(text),
+                            text,
                             window,
                             cx,
                         )
-                        .selectable(true)
                     }))
                     .into_any_element()
             }
@@ -814,7 +837,8 @@ impl ChatView {
             let mut is_collapsible = false;
 
             if let MessageContent::Text(text) = &raw_content {
-                let collapsed_preview = collapsed_text_preview(text, COLLAPSE_LINE_LIMIT);
+                let collapsed_preview =
+                    collapsed_text_preview(text, COLLAPSE_LINE_LIMIT, COLLAPSE_CHAR_LIMIT);
                 is_collapsible = collapsed_preview.is_some();
                 if !is_expanded && let Some(preview) = collapsed_preview {
                     display_content = MessageContent::Text(preview);
@@ -910,9 +934,7 @@ impl ChatView {
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn debug_message_scroll_offset(&self) -> Point<Pixels> {
-        // Negate Y to match the positive-increases-downward convention of ScrollHandle::offset().
-        let p = self.list_state.scroll_px_offset_for_scrollbar();
-        point(p.x, -p.y)
+        self.normalized_scroll_offset()
     }
 
     #[doc(hidden)]
@@ -928,7 +950,17 @@ impl ChatView {
         offset: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.list_state.set_offset_from_scrollbar(offset);
+        if offset.y <= px(2.0) {
+            self.list_state.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.0),
+            });
+            self.locked_to_bottom = false;
+        } else {
+            self.list_state.set_offset_from_scrollbar(offset);
+            let max_y = self.list_state.max_offset_for_scrollbar().height;
+            self.locked_to_bottom = max_y > px(0.0) && (max_y - offset.y).abs() <= px(2.0);
+        }
         self.update_scroll_lock(cx);
         cx.notify();
     }
@@ -1013,7 +1045,16 @@ impl Render for ChatView {
         }
         // Maintain the bottom-lock invariant on every render.
         if self.locked_to_bottom {
-            self.scroll_to_bottom();
+            let max_y = self.list_state.max_offset_for_scrollbar().height;
+            let current_y = self
+                .list_state
+                .scroll_px_offset_for_scrollbar()
+                .y
+                .abs()
+                .min(max_y);
+            if (max_y - current_y).abs() > px(2.0) {
+                self.scroll_to_bottom();
+            }
         }
 
         let (
@@ -1607,21 +1648,44 @@ fn message_tail_signature(message: &crate::domain::Message) -> MessageTailSignat
     }
 }
 
-fn collapsed_text_preview(text: &str, max_lines: usize) -> Option<String> {
-    let mut parts = text.splitn(max_lines + 1, '\n');
-    let mut preview = String::new();
-    for line_index in 0..max_lines {
-        let part = parts.next()?;
-        if line_index > 0 {
-            preview.push('\n');
+fn collapsed_text_preview(text: &str, max_lines: usize, max_chars: usize) -> Option<String> {
+    let mut parts = text.split('\n');
+    let mut preview_lines = Vec::with_capacity(max_lines);
+    for _ in 0..max_lines {
+        let Some(part) = parts.next() else {
+            break;
+        };
+        preview_lines.push(part);
+    }
+    if preview_lines.len() == max_lines && parts.next().is_some() {
+        return Some(preview_lines.join("\n"));
+    }
+    if text.len() > max_chars {
+        let mut end = max_chars.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
         }
-        preview.push_str(part);
+        let mut preview = text[..end].to_string();
+        preview.push('…');
+        return Some(preview);
     }
-    if parts.next().is_some() {
-        Some(preview)
-    } else {
-        None
+    None
+}
+
+fn should_render_markdown(text: &str) -> bool {
+    if text.len() <= MARKDOWN_FASTPATH_LENGTH {
+        return true;
     }
+    text.contains("```")
+        || text.contains('`')
+        || text.contains("\n#")
+        || text.contains("\n- ")
+        || text.contains("\n* ")
+        || text.contains("\n1. ")
+        || text.contains("](")
+        || text.contains("**")
+        || text.contains("__")
+        || text.contains("\n> ")
 }
 
 fn format_cost_label(cost: Option<&Cost>) -> Option<String> {
@@ -1732,10 +1796,36 @@ pub fn row_debug_selector(index: usize) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[::core::prelude::v1::test]
     fn row_debug_selectors_cover_expected_range() {
         assert_eq!(row_debug_selector(0), Some("chat-row-0"));
         assert_eq!(row_debug_selector(63), Some("chat-row-63"));
         assert_eq!(row_debug_selector(64), None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn collapsed_text_preview_collapses_extra_lines() {
+        let text = "line1\nline2\nline3";
+        assert_eq!(
+            collapsed_text_preview(text, 2, COLLAPSE_CHAR_LIMIT),
+            Some("line1\nline2".to_string())
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn collapsed_text_preview_collapses_long_single_line() {
+        let text = "a".repeat(COLLAPSE_CHAR_LIMIT + 1);
+        let preview = collapsed_text_preview(&text, COLLAPSE_LINE_LIMIT, COLLAPSE_CHAR_LIMIT)
+            .expect("expected collapsed preview");
+        assert!(preview.ends_with('…'));
+    }
+
+    #[::core::prelude::v1::test]
+    fn long_plain_text_skips_markdown_rendering() {
+        let text = "x".repeat(MARKDOWN_FASTPATH_LENGTH + 32);
+        assert!(!should_render_markdown(&text));
+        let markdown_like = format!("{}\n- item", "x".repeat(MARKDOWN_FASTPATH_LENGTH + 32));
+        assert!(should_render_markdown(&markdown_like));
     }
 }
