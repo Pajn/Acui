@@ -6,7 +6,7 @@ description = "GPUI-based multi-agent session controller using the Agent-Client 
 
 [dependencies]
 # UI Framework
-gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+gpui = { version = "0.2.2", features = ["runtime_shaders", "test-support"] }
 gpui-component = "0.5.1"
 gpui-component-assets = "0.5.1"
 

@@ -24,6 +24,12 @@ impl WorkspaceLayout {
             plan_sidebar,
         }
     }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn debug_chat_view(&self) -> Entity<ChatView> {
+        self.chat.clone()
+    }
 }
 
 impl Render for WorkspaceLayout {

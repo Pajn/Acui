@@ -491,6 +491,7 @@ impl AppState {
                             Err(err) => {
                                 let message = format!("Prompt failed: {err}");
                                 let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                    state.prompt_started_at.remove(&thread_id);
                                     state.push_system_message(cx, thread_id, message);
                                 });
                             }
@@ -781,11 +782,7 @@ impl AppState {
         let Some(thread_id) = self.active_thread_id else {
             return false;
         };
-        if self.prompt_started_at.contains_key(&thread_id) {
-            return true;
-        }
-        self.find_thread(thread_id)
-            .is_some_and(|thread| thread.messages.iter().any(|msg| msg.is_streaming))
+        self.prompt_started_at.contains_key(&thread_id)
     }
 
     fn find_thread_mut(&mut self, thread_id: Uuid) -> Option<&mut Thread> {
@@ -1222,6 +1219,24 @@ mod tests {
             format_duration_short(std::time::Duration::from_millis(1_600)),
             "1.6s"
         );
+    }
+
+    #[test]
+    fn active_thread_is_working_only_tracks_active_prompts() {
+        let mut state = AppState::new();
+        let workspace_id = Uuid::new_v4();
+        let mut thread = Thread::new(workspace_id, "Thread");
+        let thread_id = thread.id;
+        thread.add_message(Message::new(thread_id, Role::Agent, "streaming"));
+        let mut workspace = Workspace::new("Workspace");
+        workspace.id = workspace_id;
+        workspace.add_thread(thread);
+        state.workspaces.push(workspace);
+        state.active_thread_id = Some(thread_id);
+
+        assert!(!state.active_thread_is_working());
+        state.prompt_started_at.insert(thread_id, Instant::now());
+        assert!(state.active_thread_is_working());
     }
 
     #[tokio::test(flavor = "current_thread")]
