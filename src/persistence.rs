@@ -1,4 +1,4 @@
-use crate::domain::{Thread, Workspace};
+use crate::domain::{Message, Role, Thread, Workspace};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -18,6 +18,37 @@ struct WorkspaceRecord {
     thread_ids: Vec<Uuid>,
 }
 
+/// Compact per-message record stored inside `ThreadRecord`.
+#[derive(Debug, Serialize, Deserialize)]
+struct MessageRecord {
+    id: Uuid,
+    role: Role,
+    content: String,
+    timestamp: DateTime<Utc>,
+}
+
+impl MessageRecord {
+    fn from_message(m: &Message) -> Self {
+        Self {
+            id: m.id,
+            role: m.role,
+            content: m.content.clone(),
+            timestamp: m.timestamp,
+        }
+    }
+
+    fn into_message(self, thread_id: Uuid) -> Message {
+        Message {
+            id: self.id,
+            thread_id,
+            role: self.role,
+            content: self.content,
+            timestamp: self.timestamp,
+            is_streaming: false,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ThreadRecord {
     id: Uuid,
@@ -26,6 +57,8 @@ struct ThreadRecord {
     #[serde(default)]
     agent_name: Option<String>,
     session_id: Option<String>,
+    #[serde(default)]
+    messages: Vec<MessageRecord>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -52,13 +85,18 @@ impl AppPersistence {
 
         for thread in thread_records {
             if let Some(workspace) = workspaces.iter_mut().find(|w| w.id == thread.workspace_id) {
+                let thread_id = thread.id;
                 workspace.threads.push(Thread {
-                    id: thread.id,
+                    id: thread_id,
                     workspace_id: thread.workspace_id,
                     name: thread.name,
                     agent_name: thread.agent_name,
                     session_id: thread.session_id,
-                    messages: Vec::new(),
+                    messages: thread
+                        .messages
+                        .into_iter()
+                        .map(|m| m.into_message(thread_id))
+                        .collect(),
                     created_at: thread.created_at,
                     updated_at: thread.updated_at,
                 });
@@ -100,6 +138,12 @@ impl AppPersistence {
                     name: thread.name.clone(),
                     agent_name: thread.agent_name.clone(),
                     session_id: thread.session_id.clone(),
+                    messages: thread
+                        .messages
+                        .iter()
+                        .filter(|m| !m.is_streaming)
+                        .map(MessageRecord::from_message)
+                        .collect(),
                     created_at: thread.created_at,
                     updated_at: thread.updated_at,
                 };
@@ -182,7 +226,7 @@ fn cleanup_stale_records(dir: &Path, keep_files: &HashSet<String>) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::AppPersistence;
-    use crate::domain::{Thread, Workspace};
+    use crate::domain::{Message, Role, Thread, Workspace};
     use std::path::PathBuf;
     use uuid::Uuid;
 
@@ -207,6 +251,58 @@ mod tests {
         assert_eq!(
             loaded[0].threads[0].session_id.as_deref(),
             Some("session-123")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn messages_survive_persist_round_trip() {
+        let root = std::env::temp_dir().join(format!("acui-persist-test-{}", Uuid::new_v4()));
+        let persistence = AppPersistence::new(root.clone());
+
+        let mut workspace = Workspace::from_path(PathBuf::from("/tmp/msg-workspace"));
+        let thread_id = Uuid::new_v4();
+        let mut thread = Thread::new(workspace.id, "Thread With Messages");
+        thread.id = thread_id;
+        thread.messages.push(Message {
+            id: Uuid::new_v4(),
+            thread_id,
+            role: Role::User,
+            content: "Hello agent".to_string(),
+            timestamp: chrono::Utc::now(),
+            is_streaming: false,
+        });
+        thread.messages.push(Message {
+            id: Uuid::new_v4(),
+            thread_id,
+            role: Role::Agent,
+            content: "Hello user".to_string(),
+            timestamp: chrono::Utc::now(),
+            is_streaming: false,
+        });
+        // Streaming messages should not be persisted.
+        thread.messages.push(Message {
+            id: Uuid::new_v4(),
+            thread_id,
+            role: Role::Agent,
+            content: "still typing…".to_string(),
+            timestamp: chrono::Utc::now(),
+            is_streaming: true,
+        });
+        workspace.add_thread(thread);
+
+        persistence.save(&[workspace]).expect("save should succeed");
+        let loaded = persistence.load().expect("load should succeed");
+
+        let msgs = &loaded[0].threads[0].messages;
+        assert_eq!(msgs.len(), 2, "streaming message must not be persisted");
+        assert_eq!(msgs[0].role, Role::User);
+        assert_eq!(msgs[0].content, "Hello agent");
+        assert_eq!(msgs[1].role, Role::Agent);
+        assert!(
+            !msgs[1].is_streaming,
+            "loaded messages must not be streaming"
         );
 
         let _ = std::fs::remove_dir_all(root);
