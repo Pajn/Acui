@@ -2,7 +2,10 @@ use acui::domain::{Message, Role};
 use acui::state::AppState;
 use acui::ui::chat::ChatView;
 use acui::ui::layout::WorkspaceLayout;
-use gpui::{AppContext, Entity, TestAppContext, VisualTestContext};
+use gpui::{
+    AppContext, Entity, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
+    VisualTestContext,
+};
 use gpui_component::Root;
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -388,6 +391,97 @@ async fn scroll_stays_put_when_lock_released(cx: &mut TestAppContext) {
             f32::from(offset.y) < 20.0,
             "unlocked scroll should not jump to bottom: offset={}",
             offset.y
+        );
+    });
+}
+
+// -- Regression tests for scroll borrow-safety crash ----------------------------
+
+/// Simulates a real scroll-wheel event over the chat list and verifies that
+/// the scroll_handler does NOT panic with "RefCell already mutably borrowed".
+/// Previously the handler called max_offset_for_scrollbar() (borrow()) while
+/// the list's StateInner was already borrow_mut'd by the scroll dispatch path.
+#[gpui::test]
+async fn scroll_wheel_over_list_does_not_panic(cx: &mut TestAppContext) {
+    with_chat_window(cx, |chat, _diff_message_id, window_cx| {
+        flush_layout(window_cx);
+
+        // Find a point inside the rendered list so the scroll event reaches it.
+        let list_point = window_cx
+            .debug_bounds("chat-row-0")
+            .map(|b| b.origin + gpui::point(gpui::px(10.), gpui::px(10.)))
+            .expect("chat-row-0 should be visible");
+
+        // Simulate the user scrolling up — this previously panicked with
+        // "RefCell already mutably borrowed" because the scroll_handler called
+        // list_state.max_offset_for_scrollbar() (borrow) while list_state was
+        // already borrow_mut'd by GPUI's scroll event dispatch path.
+        window_cx.simulate_event(ScrollWheelEvent {
+            position: list_point,
+            delta: ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(50.))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+
+        // After the scroll event is processed and render() runs,
+        // the scroll lock should be released.
+        let locked = window_cx.read(|app| chat.read(app).debug_is_locked_to_bottom());
+        assert!(!locked, "scroll wheel should release the bottom lock");
+    });
+}
+
+/// Switching to a different thread must re-engage the scroll lock so the
+/// new thread is always viewed from its most recent message.
+#[gpui::test]
+async fn thread_switch_re_engages_scroll_lock(cx: &mut TestAppContext) {
+    with_chat_window(cx, |chat, _diff_message_id, window_cx| {
+        flush_layout(window_cx);
+
+        // Capture app_state.
+        let (app_state, thread_a) = window_cx.read(|app| {
+            let view = chat.read(app);
+            let state = view.debug_app_state();
+            let id = state.read(app).active_thread_id.expect("active thread");
+            (state, id)
+        });
+
+        // Release the scroll lock for thread A.
+        window_cx.update(|_, app| {
+            chat.update(app, |view, cx| {
+                view.debug_message_set_scroll_offset(gpui::point(gpui::px(0.), gpui::px(0.)), cx)
+            })
+        });
+        flush_layout(window_cx);
+        let locked = window_cx.read(|app| chat.read(app).debug_is_locked_to_bottom());
+        assert!(!locked, "lock should be released for thread A");
+
+        // Create a second thread in the same workspace and switch to it.
+        let thread_b = window_cx.update(|_, app| {
+            app_state.update(app, |state, cx| {
+                let ws_id = state.workspaces.first().expect("workspace should exist").id;
+                state
+                    .add_thread(cx, ws_id, "Thread B")
+                    .expect("thread B should be created")
+            })
+        });
+        window_cx.update(|_, app| {
+            app_state.update(app, |state, cx| state.set_active_thread(cx, thread_b))
+        });
+        flush_layout(window_cx);
+
+        let locked = window_cx.read(|app| chat.read(app).debug_is_locked_to_bottom());
+        assert!(locked, "switching to thread B should re-engage scroll lock");
+
+        // Switching back to thread A should also re-engage the lock.
+        window_cx.update(|_, app| {
+            app_state.update(app, |state, cx| state.set_active_thread(cx, thread_a))
+        });
+        flush_layout(window_cx);
+
+        let locked = window_cx.read(|app| chat.read(app).debug_is_locked_to_bottom());
+        assert!(
+            locked,
+            "switching back to thread A should re-engage scroll lock"
         );
     });
 }

@@ -46,6 +46,9 @@ pub struct ChatView {
     input_state: Entity<InputState>,
     locked_to_bottom: bool,
     render_pending: bool,
+    // Set by the list scroll_handler (fired while list_state is borrow_mut'd)
+    // so we cannot call update_scroll_lock() directly there; render() processes it.
+    user_scrolled: bool,
     suggestion_anchor: Option<(SuggestionKind, usize)>,
     suggestion_selected: usize,
     dismissed_suggestion: Option<(SuggestionKind, usize)>,
@@ -158,9 +161,11 @@ impl ChatView {
             let state = ListState::new(0, ListAlignment::Top, px(512.0));
             let weak = this.downgrade();
             state.set_scroll_handler(move |_event, _window, app| {
-                let _ = weak.update(app, |this, cx| {
-                    this.update_scroll_lock();
-                    cx.notify();
+                // list_state.0 is borrow_mut'd when this handler fires, so we
+                // must NOT call borrow() on it (e.g. via max_offset_for_scrollbar).
+                // Set a flag; render() will call update_scroll_lock() safely.
+                let _ = weak.update(app, |this, _cx| {
+                    this.user_scrolled = true;
                 });
             });
             state
@@ -175,6 +180,7 @@ impl ChatView {
             input_state,
             locked_to_bottom: true,
             render_pending: false,
+            user_scrolled: false,
             suggestion_anchor: None,
             suggestion_selected: 0,
             dismissed_suggestion: None,
@@ -667,9 +673,14 @@ impl ChatView {
 
 impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Maintain the bottom-lock invariant: keep scroll at the end of content
-        // while locked. update_scroll_lock() is driven by the list scroll_handler
-        // (user scrolls) and debug_message_set_scroll_offset (tests).
+        // The scroll_handler callback fires while list_state is borrow_mut'd,
+        // so it only sets user_scrolled=true. We call update_scroll_lock() here
+        // where it is safe (no active borrow on list_state).
+        if self.user_scrolled {
+            self.user_scrolled = false;
+            self.update_scroll_lock();
+        }
+        // Maintain the bottom-lock invariant on every render.
         if self.locked_to_bottom {
             self.scroll_to_bottom();
         }
@@ -703,6 +714,9 @@ impl Render for ChatView {
         ) {
             (true, _) => {
                 self.list_state.reset(total_count);
+                // Always lock to bottom when switching threads so the new thread
+                // starts scrolled to its most recent message.
+                self.locked_to_bottom = true;
             }
             (false, true) if total_count > self.listed_count => {
                 // New items appended (new message or working sentinel added).
