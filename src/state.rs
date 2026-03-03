@@ -26,20 +26,45 @@ struct ThreadAgentConnection {
     _process: Option<std::process::Child>,
 }
 
+/// All per-thread agent state in one place. A single `HashMap<Uuid, ThreadState>`
+/// replaces the previous set of parallel HashMaps and ensures nothing is
+/// accidentally left behind when a thread is deleted.
+struct ThreadState {
+    agent_task: Option<Task<()>>,
+    mock_event_sender: Option<mpsc::UnboundedSender<AgentEvent>>,
+    connection: Option<ThreadAgentConnection>,
+    pending_permission: Option<PermissionRequestEvent>,
+    config_options: Vec<SessionConfigOption>,
+    available_commands: Vec<AvailableCommand>,
+    tool_calls: HashMap<String, ToolCall>,
+    tool_call_messages: HashMap<String, Uuid>,
+    plan: Option<Plan>,
+    mode: Option<SessionModeState>,
+    prompt_started_at: Option<Instant>,
+}
+
+impl ThreadState {
+    fn new() -> Self {
+        Self {
+            agent_task: None,
+            mock_event_sender: None,
+            connection: None,
+            pending_permission: None,
+            config_options: Vec::new(),
+            available_commands: Vec::new(),
+            tool_calls: HashMap::new(),
+            tool_call_messages: HashMap::new(),
+            plan: None,
+            mode: None,
+            prompt_started_at: None,
+        }
+    }
+}
+
 pub struct AppState {
     pub workspaces: Vec<Workspace>,
     pub active_thread_id: Option<Uuid>,
-    agent_tasks: HashMap<Uuid, Task<()>>,
-    mock_event_senders: HashMap<Uuid, mpsc::UnboundedSender<AgentEvent>>,
-    agent_connections: HashMap<Uuid, ThreadAgentConnection>,
-    pending_permissions: HashMap<Uuid, PermissionRequestEvent>,
-    thread_config_options: HashMap<Uuid, Vec<SessionConfigOption>>,
-    thread_available_commands: HashMap<Uuid, Vec<AvailableCommand>>,
-    thread_tool_calls: HashMap<Uuid, HashMap<String, ToolCall>>,
-    thread_tool_call_messages: HashMap<Uuid, HashMap<String, Uuid>>,
-    thread_plans: HashMap<Uuid, Plan>,
-    thread_modes: HashMap<Uuid, SessionModeState>,
-    prompt_started_at: HashMap<Uuid, Instant>,
+    thread_state: HashMap<Uuid, ThreadState>,
     unread_stopped_threads: HashSet<Uuid>,
     log_file: Option<PathBuf>,
     persistence: Option<AppPersistence>,
@@ -68,17 +93,7 @@ impl AppState {
         Self {
             workspaces: Vec::new(),
             active_thread_id: None,
-            agent_tasks: HashMap::new(),
-            mock_event_senders: HashMap::new(),
-            agent_connections: HashMap::new(),
-            pending_permissions: HashMap::new(),
-            thread_config_options: HashMap::new(),
-            thread_available_commands: HashMap::new(),
-            thread_tool_calls: HashMap::new(),
-            thread_tool_call_messages: HashMap::new(),
-            thread_plans: HashMap::new(),
-            thread_modes: HashMap::new(),
-            prompt_started_at: HashMap::new(),
+            thread_state: HashMap::new(),
             unread_stopped_threads: HashSet::new(),
             log_file,
             persistence,
@@ -98,6 +113,16 @@ impl AppState {
             .map(|thread| thread.id);
         cx.notify();
         Ok(())
+    }
+
+    fn ts(&self, thread_id: Uuid) -> Option<&ThreadState> {
+        self.thread_state.get(&thread_id)
+    }
+
+    fn ts_mut(&mut self, thread_id: Uuid) -> &mut ThreadState {
+        self.thread_state
+            .entry(thread_id)
+            .or_insert_with(ThreadState::new)
     }
 
     pub fn add_workspace(&mut self, cx: &mut Context<Self>, name: &str) -> Uuid {
@@ -196,7 +221,7 @@ impl AppState {
 
         let (tx, rx) = mpsc::unbounded_channel();
         self.listen_to_agent_events(cx, thread_id, rx);
-        self.mock_event_senders.insert(thread_id, tx);
+        self.ts_mut(thread_id).mock_event_sender = Some(tx);
 
         if let Some(config_path) = self.agent_config_path.clone() {
             self.connect_thread_to_agent_config(cx, thread_id, config_path);
@@ -210,7 +235,10 @@ impl AppState {
     pub fn set_active_thread(&mut self, cx: &mut Context<Self>, thread_id: Uuid) {
         self.active_thread_id = Some(thread_id);
         self.unread_stopped_threads.remove(&thread_id);
-        if !self.agent_connections.contains_key(&thread_id)
+        if !self
+            .thread_state
+            .get(&thread_id)
+            .is_some_and(|ts| ts.connection.is_some())
             && let Some(config_path) = self.agent_config_path.clone()
         {
             self.connect_thread_to_agent_config(cx, thread_id, config_path);
@@ -250,17 +278,7 @@ impl AppState {
             return false;
         }
 
-        self.agent_tasks.remove(&thread_id);
-        self.mock_event_senders.remove(&thread_id);
-        self.agent_connections.remove(&thread_id);
-        self.pending_permissions.remove(&thread_id);
-        self.thread_config_options.remove(&thread_id);
-        self.thread_available_commands.remove(&thread_id);
-        self.thread_tool_calls.remove(&thread_id);
-        self.thread_tool_call_messages.remove(&thread_id);
-        self.thread_plans.remove(&thread_id);
-        self.thread_modes.remove(&thread_id);
-        self.prompt_started_at.remove(&thread_id);
+        self.thread_state.remove(&thread_id);
         self.unread_stopped_threads.remove(&thread_id);
 
         if self.active_thread_id == Some(thread_id) {
@@ -304,29 +322,29 @@ impl AppState {
 
     pub fn active_thread_permission_options(&self) -> Option<Vec<PermissionOption>> {
         let thread_id = self.active_thread_id?;
-        self.pending_permissions
-            .get(&thread_id)
-            .map(|request| request.options.clone())
+        self.ts(thread_id)
+            .and_then(|ts| ts.pending_permission.as_ref())
+            .map(|r| r.options.clone())
     }
 
     pub fn active_thread_config_options(&self) -> Option<Vec<SessionConfigOption>> {
         let thread_id = self.active_thread_id?;
-        self.thread_config_options.get(&thread_id).cloned()
+        self.ts(thread_id).map(|ts| ts.config_options.clone())
     }
 
     pub fn active_thread_available_commands(&self) -> Option<Vec<AvailableCommand>> {
         let thread_id = self.active_thread_id?;
-        self.thread_available_commands.get(&thread_id).cloned()
+        self.ts(thread_id).map(|ts| ts.available_commands.clone())
     }
 
     pub fn active_thread_plan(&self) -> Option<Plan> {
         let thread_id = self.active_thread_id?;
-        self.thread_plans.get(&thread_id).cloned()
+        self.ts(thread_id).and_then(|ts| ts.plan.clone())
     }
 
     pub fn active_thread_modes(&self) -> Option<SessionModeState> {
         let thread_id = self.active_thread_id?;
-        self.thread_modes.get(&thread_id).cloned()
+        self.ts(thread_id).and_then(|ts| ts.mode.clone())
     }
 
     pub fn thread_has_unread_stop(&self, thread_id: Uuid) -> bool {
@@ -359,11 +377,11 @@ impl AppState {
         config_id: String,
         value: String,
     ) {
-        let Some(connection) = self.agent_connections.get(&thread_id) else {
+        let Some(conn) = self.ts(thread_id).and_then(|ts| ts.connection.as_ref()) else {
             return;
         };
-        let controller = Rc::clone(&connection.controller);
-        let session_id = connection.session_id.clone();
+        let controller = Rc::clone(&conn.controller);
+        let session_id = conn.session_id.clone();
         cx.spawn(
             move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
                 let mut cx = cx.clone();
@@ -397,9 +415,7 @@ impl AppState {
                                     })
                                     .to_string(),
                                 );
-                                state
-                                    .thread_config_options
-                                    .insert(thread_id, config_options);
+                                state.ts_mut(thread_id).config_options = config_options;
                                 cx.notify();
                             });
                         }
@@ -422,11 +438,11 @@ impl AppState {
     }
 
     pub fn set_session_mode(&mut self, cx: &mut Context<Self>, thread_id: Uuid, mode_id: String) {
-        let Some(connection) = self.agent_connections.get(&thread_id) else {
+        let Some(conn) = self.ts(thread_id).and_then(|ts| ts.connection.as_ref()) else {
             return;
         };
-        let controller = Rc::clone(&connection.controller);
-        let session_id = connection.session_id.clone();
+        let controller = Rc::clone(&conn.controller);
+        let session_id = conn.session_id.clone();
         cx.spawn(
             move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
                 let mut cx = cx.clone();
@@ -473,11 +489,18 @@ impl AppState {
             thread.add_message(Message::new(thread_id, Role::User, content));
         }
 
-        if let Some(connection) = self.agent_connections.get(&thread_id) {
-            let controller = Rc::clone(&connection.controller);
-            let session_id = connection.session_id.clone();
+        let conn_info = self
+            .ts(thread_id)
+            .and_then(|ts| ts.connection.as_ref())
+            .map(|c| (Rc::clone(&c.controller), c.session_id.clone()));
+        let mock_tx = self
+            .ts(thread_id)
+            .and_then(|ts| ts.mock_event_sender.as_ref())
+            .cloned();
+
+        if let Some((controller, session_id)) = conn_info {
             let content = content.to_owned();
-            self.prompt_started_at.insert(thread_id, Instant::now());
+            self.ts_mut(thread_id).prompt_started_at = Some(Instant::now());
             cx.spawn(
                 move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
                     let mut cx = cx.clone();
@@ -491,7 +514,7 @@ impl AppState {
                             Err(err) => {
                                 let message = format!("Prompt failed: {err}");
                                 let _ = this.update(&mut cx, |state: &mut AppState, cx| {
-                                    state.prompt_started_at.remove(&thread_id);
+                                    state.ts_mut(thread_id).prompt_started_at = None;
                                     state.push_system_message(cx, thread_id, message);
                                 });
                             }
@@ -500,7 +523,7 @@ impl AppState {
                 },
             )
             .detach();
-        } else if let Some(event_tx) = self.mock_event_senders.get(&thread_id).cloned() {
+        } else if let Some(event_tx) = mock_tx {
             let content = content.to_owned();
             let chunks = ["Mock reply: ", &content];
             for chunk in chunks {
@@ -680,17 +703,15 @@ impl AppState {
         if let Some(thread) = self.find_thread_mut(thread_id) {
             thread.session_id = Some(session_id.to_string());
         }
-        self.agent_connections.insert(
-            thread_id,
-            ThreadAgentConnection {
-                controller: Rc::new(controller),
-                session_id,
-                _process: process,
-            },
-        );
-        self.thread_config_options.insert(thread_id, config_options);
+        let ts = self.ts_mut(thread_id);
+        ts.connection = Some(ThreadAgentConnection {
+            controller: Rc::new(controller),
+            session_id,
+            _process: process,
+        });
+        ts.config_options = config_options;
         if let Some(modes) = modes {
-            self.thread_modes.insert(thread_id, modes);
+            ts.mode = Some(modes);
         }
         self.persist_state();
         cx.notify();
@@ -721,7 +742,7 @@ impl AppState {
             },
         );
 
-        self.agent_tasks.insert(thread_id, task);
+        self.ts_mut(thread_id).agent_task = Some(task);
     }
 
     pub fn handle_agent_event(
@@ -748,12 +769,12 @@ impl AppState {
                     })
                     .to_string(),
                 );
-                if let Some(existing) = self.pending_permissions.remove(&thread_id) {
+                if let Some(existing) = self.ts_mut(thread_id).pending_permission.take() {
                     let _ = existing
                         .response_tx
                         .send(RequestPermissionOutcome::Cancelled);
                 }
-                self.pending_permissions.insert(thread_id, request);
+                self.ts_mut(thread_id).pending_permission = Some(request);
             }
             AgentEvent::Disconnected => {
                 self.append_log_line("from_agent.disconnected", thread_id, "disconnected");
@@ -780,7 +801,9 @@ impl AppState {
         let Some(thread_id) = self.active_thread_id else {
             return false;
         };
-        self.prompt_started_at.contains_key(&thread_id)
+        self.ts(thread_id)
+            .map(|ts| ts.prompt_started_at.is_some())
+            .unwrap_or(false)
     }
 
     fn find_thread_mut(&mut self, thread_id: Uuid) -> Option<&mut Thread> {
@@ -823,12 +846,10 @@ impl AppState {
                 self.append_agent_chunk(thread_id, &text.text);
             }
             SessionUpdate::ConfigOptionUpdate(update) => {
-                self.thread_config_options
-                    .insert(thread_id, update.config_options);
+                self.ts_mut(thread_id).config_options = update.config_options;
             }
             SessionUpdate::AvailableCommandsUpdate(update) => {
-                self.thread_available_commands
-                    .insert(thread_id, update.available_commands);
+                self.ts_mut(thread_id).available_commands = update.available_commands;
             }
             SessionUpdate::ToolCall(tool_call) => {
                 self.record_tool_call(thread_id, tool_call);
@@ -837,16 +858,14 @@ impl AppState {
                 self.apply_tool_call_update(thread_id, update);
             }
             SessionUpdate::Plan(plan) => {
-                self.thread_plans.insert(thread_id, plan);
+                self.ts_mut(thread_id).plan = Some(plan);
             }
             SessionUpdate::CurrentModeUpdate(update) => {
-                if let Some(modes) = self.thread_modes.get_mut(&thread_id) {
-                    modes.current_mode_id = update.current_mode_id;
+                let ts = self.ts_mut(thread_id);
+                if let Some(mode) = ts.mode.as_mut() {
+                    mode.current_mode_id = update.current_mode_id;
                 } else {
-                    self.thread_modes.insert(
-                        thread_id,
-                        SessionModeState::new(update.current_mode_id, Vec::new()),
-                    );
+                    ts.mode = Some(SessionModeState::new(update.current_mode_id, Vec::new()));
                 }
             }
             _ => {}
@@ -855,11 +874,10 @@ impl AppState {
 
     fn record_tool_call(&mut self, thread_id: Uuid, tool_call: ToolCall) {
         let tool_call_id = tool_call.tool_call_id.to_string();
-        self.thread_tool_calls
-            .entry(thread_id)
-            .or_default()
-            .insert(tool_call_id.clone(), tool_call.clone());
         let rendered = render_tool_call_message(&tool_call);
+        self.ts_mut(thread_id)
+            .tool_calls
+            .insert(tool_call_id.clone(), tool_call);
         let mut message_id = None;
         if let Some(thread) = self.find_thread_mut(thread_id) {
             let message = Message::new(thread_id, Role::Agent, rendered);
@@ -870,28 +888,25 @@ impl AppState {
             }
         }
         if let Some(message_id) = message_id {
-            self.thread_tool_call_messages
-                .entry(thread_id)
-                .or_default()
+            self.ts_mut(thread_id)
+                .tool_call_messages
                 .insert(tool_call_id, message_id);
         }
     }
 
     fn apply_tool_call_update(&mut self, thread_id: Uuid, update: ToolCallUpdate) {
-        let entry = self
-            .thread_tool_calls
-            .entry(thread_id)
-            .or_default()
-            .entry(update.tool_call_id.to_string())
-            .or_insert_with(|| ToolCall::new(update.tool_call_id.clone(), "Tool call"));
-        entry.update(update.fields);
-        let tool_call_id = entry.tool_call_id.to_string();
-        let rendered = render_tool_call_message(entry);
-        let existing_message_id = self
-            .thread_tool_call_messages
-            .get(&thread_id)
-            .and_then(|messages| messages.get(&tool_call_id))
-            .copied();
+        let tool_call_id = update.tool_call_id.to_string();
+        let (rendered, existing_message_id) = {
+            let ts = self.ts_mut(thread_id);
+            let entry = ts
+                .tool_calls
+                .entry(tool_call_id.clone())
+                .or_insert_with(|| ToolCall::new(update.tool_call_id.clone(), "Tool call"));
+            entry.update(update.fields);
+            let rendered = render_tool_call_message(entry);
+            let existing_message_id = ts.tool_call_messages.get(&tool_call_id).copied();
+            (rendered, existing_message_id)
+        };
         let mut inserted_message_id = None;
         if let Some(thread) = self.find_thread_mut(thread_id) {
             if let Some(message_id) = existing_message_id
@@ -909,9 +924,8 @@ impl AppState {
             }
         }
         if let Some(message_id) = inserted_message_id {
-            self.thread_tool_call_messages
-                .entry(thread_id)
-                .or_default()
+            self.ts_mut(thread_id)
+                .tool_call_messages
                 .insert(tool_call_id, message_id);
         }
     }
@@ -924,8 +938,9 @@ impl AppState {
     ) {
         self.finalize_agent_message(thread_id);
         let elapsed = self
+            .ts_mut(thread_id)
             .prompt_started_at
-            .remove(&thread_id)
+            .take()
             .map(|started| started.elapsed());
         let elapsed_label = elapsed
             .map(format_duration_short)
@@ -985,7 +1000,7 @@ impl AppState {
     }
 
     fn resolve_permission_choice(&mut self, thread_id: Uuid, option_id: Option<String>) -> bool {
-        let Some(request) = self.pending_permissions.remove(&thread_id) else {
+        let Some(request) = self.ts_mut(thread_id).pending_permission.take() else {
             return false;
         };
         let outcome = option_id
@@ -1233,7 +1248,7 @@ mod tests {
         state.active_thread_id = Some(thread_id);
 
         assert!(!state.active_thread_is_working());
-        state.prompt_started_at.insert(thread_id, Instant::now());
+        state.ts_mut(thread_id).prompt_started_at = Some(Instant::now());
         assert!(state.active_thread_is_working());
     }
 
