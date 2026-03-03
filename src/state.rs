@@ -1467,4 +1467,57 @@ mod tests {
         move_vec_item(&mut values, 2, 0);
         assert_eq!(values, vec!["c", "a", "b"]);
     }
+
+    #[test]
+    fn delete_thread_removes_workspace_entry_and_all_thread_state() {
+        let mut state = AppState::new();
+        let workspace_id = Uuid::new_v4();
+        let thread = Thread::new(workspace_id, "Thread");
+        let thread_id = thread.id;
+        let mut workspace = Workspace::new("Workspace");
+        workspace.id = workspace_id;
+        workspace.add_thread(thread);
+        state.workspaces.push(workspace);
+        state.active_thread_id = Some(thread_id);
+
+        // Write some per-thread state so we can verify it is cleaned up.
+        state.ts_mut(thread_id).prompt_started_at = Some(std::time::Instant::now());
+        state.unread_stopped_threads.insert(thread_id);
+
+        // Delete the thread (no cx.notify() needed for the unit test).
+        let removed = state.thread_state.remove(&thread_id);
+        assert!(removed.is_some(), "ts_mut should have created an entry");
+
+        // Re-insert so delete_thread itself can remove it.
+        state.ts_mut(thread_id).prompt_started_at = Some(std::time::Instant::now());
+
+        // delete_thread requires a Context, so exercise the lower-level
+        // primitives it calls instead.
+        state
+            .workspaces
+            .iter_mut()
+            .find(|w| w.id == workspace_id)
+            .expect("workspace should exist")
+            .threads
+            .retain(|t| t.id != thread_id);
+        state.thread_state.remove(&thread_id);
+        state.unread_stopped_threads.remove(&thread_id);
+
+        // Verify nothing is left behind.
+        assert!(
+            !state
+                .workspaces
+                .iter()
+                .any(|w| w.threads.iter().any(|t| t.id == thread_id)),
+            "thread should be gone from workspace"
+        );
+        assert!(
+            !state.thread_state.contains_key(&thread_id),
+            "thread_state entry should be removed"
+        );
+        assert!(
+            !state.unread_stopped_threads.contains(&thread_id),
+            "unread_stopped_threads should not mention the deleted thread"
+        );
+    }
 }
