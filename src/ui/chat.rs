@@ -1079,8 +1079,8 @@ impl Render for ChatView {
                     .into_iter()
                     .enumerate()
                     .map(|(index, mode)| {
+                        let is_current = mode.id == current_mode_id;
                         let mode_id = mode.id.to_string();
-                        let is_current = mode_id == current_mode_id.to_string();
                         div()
                             .id(("session-mode", index))
                             .bg(if is_current {

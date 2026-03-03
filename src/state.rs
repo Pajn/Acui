@@ -525,11 +525,21 @@ impl AppState {
     }
 
     pub fn set_session_mode(&mut self, cx: &mut Context<Self>, thread_id: Uuid, mode_id: String) {
-        let Some(conn) = self.ts(thread_id).and_then(|ts| ts.connection.as_ref()) else {
+        let conn_info = self
+            .ts(thread_id)
+            .and_then(|ts| ts.connection.as_ref())
+            .map(|conn| (Rc::clone(&conn.controller), conn.session_id.clone()));
+
+        let Some((controller, session_id)) = conn_info else {
             return;
         };
-        let controller = Rc::clone(&conn.controller);
-        let session_id = conn.session_id.clone();
+
+        // Optimistically update the current mode so the UI reflects the change immediately.
+        if let Some(mode) = self.ts_mut(thread_id).mode.as_mut() {
+            mode.current_mode_id = SessionModeId::new(mode_id.clone());
+        }
+        cx.notify();
+
         cx.spawn(
             move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
                 let mut cx = cx.clone();
@@ -551,12 +561,13 @@ impl AppState {
                             state.push_system_message(cx, thread_id, message);
                         });
                     } else {
-                        let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                        let _ = this.update(&mut cx, |state: &mut AppState, cx| {
                             state.append_log_line(
                                 "from_agent.set_session_mode_ok",
                                 thread_id,
                                 &mode_id,
                             );
+                            cx.notify();
                         });
                     }
                 }
