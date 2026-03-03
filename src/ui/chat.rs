@@ -11,7 +11,9 @@ use gpui_component::skeleton::Skeleton;
 use gpui_component::text::TextView;
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::io::Read;
+use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -110,6 +112,130 @@ struct TerminalWidgetState {
 const COLLAPSE_LINE_LIMIT: usize = 10;
 const COLLAPSE_CHAR_LIMIT: usize = 2_000;
 const MARKDOWN_FASTPATH_LENGTH: usize = 2_000;
+const VIRTUALIZE_LINE_THRESHOLD: usize = 256;
+const VIRTUALIZE_CHAR_THRESHOLD: usize = 16_384;
+const VIRTUALIZED_CHUNK_LINES: usize = 12;
+const VIRTUALIZED_BLOCK_HEIGHT: f32 = 200.0;
+const VIRTUALIZED_CODE_LINE_HEIGHT: f32 = 16.0;
+const EDITOR_HIGHLIGHT_MAX_LINES: usize = 1_200;
+const EDITOR_HIGHLIGHT_MAX_CHARS: usize = 256_000;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct TextFingerprint {
+    len: usize,
+    head: u64,
+    mid: u64,
+    tail: u64,
+}
+
+#[derive(Clone)]
+struct VirtualizedCodeChunk {
+    code_text: String,
+    line_numbers: String,
+    signs: String,
+    line_count: usize,
+    has_added: bool,
+    has_removed: bool,
+}
+
+struct VirtualizedCodeCache {
+    fingerprint: TextFingerprint,
+    chunks: Arc<[VirtualizedCodeChunk]>,
+}
+
+impl Default for VirtualizedCodeCache {
+    fn default() -> Self {
+        Self {
+            fingerprint: TextFingerprint::default(),
+            chunks: Arc::from(Vec::<VirtualizedCodeChunk>::new()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffRowKind {
+    Header,
+    Context,
+    Added,
+    Removed,
+}
+
+#[derive(Clone)]
+struct VirtualizedDiffRow {
+    kind: DiffRowKind,
+    sign: char,
+    line_number_label: SharedString,
+    text: SharedString,
+}
+
+#[derive(Clone)]
+struct VirtualizedDiffBlock {
+    kind: DiffRowKind,
+    signs: SharedString,
+    line_numbers: SharedString,
+    text: SharedString,
+}
+
+#[derive(Clone)]
+struct VirtualizedDiffChunk {
+    blocks: Arc<[VirtualizedDiffBlock]>,
+}
+
+struct VirtualizedDiffCache {
+    fingerprint: TextFingerprint,
+    diff_text: String,
+    chunks: Arc<[VirtualizedDiffChunk]>,
+}
+
+impl Default for VirtualizedDiffCache {
+    fn default() -> Self {
+        Self {
+            fingerprint: TextFingerprint::default(),
+            diff_text: String::new(),
+            chunks: Arc::from(Vec::<VirtualizedDiffChunk>::new()),
+        }
+    }
+}
+
+struct VirtualizedMarkdownCache {
+    fingerprint: TextFingerprint,
+    chunks: Arc<[SharedString]>,
+}
+
+impl Default for VirtualizedMarkdownCache {
+    fn default() -> Self {
+        Self {
+            fingerprint: TextFingerprint::default(),
+            chunks: Arc::from(Vec::<SharedString>::new()),
+        }
+    }
+}
+
+struct VirtualizedListState {
+    list_state: ListState,
+    item_count: usize,
+}
+
+impl VirtualizedListState {
+    fn new() -> Self {
+        Self {
+            list_state: ListState::new(0, ListAlignment::Top, px(VIRTUALIZED_BLOCK_HEIGHT)),
+            item_count: 0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct MessageContentCache {
+    signature: Option<MessageTailSignature>,
+    content: Option<Arc<MessageContent>>,
+}
+
+#[derive(Clone, Copy)]
+struct VirtualizedCodeRenderOptions {
+    parse_numbered_lines: bool,
+    prefer_editor: bool,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct MessageTailSignature {
@@ -539,17 +665,42 @@ impl ChatView {
         self.set_input_value(input, window, cx);
     }
 
+    fn virtualized_list_state(
+        key: SharedString,
+        item_count: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> ListState {
+        let list_state =
+            window.use_keyed_state(key, cx, |_window, _cx| VirtualizedListState::new());
+        list_state.update(cx, |state, _| {
+            if state.item_count != item_count {
+                state.list_state.reset(item_count);
+                state.item_count = item_count;
+            }
+        });
+        list_state.read(cx).list_state.clone()
+    }
+
     fn render_readonly_code(
         message_id: Uuid,
+        key_suffix: &str,
         language: &str,
         content: String,
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
         let language = SharedString::from(language.to_string());
+        let content_fingerprint = text_fingerprint(&content);
         let input_state = window
             .use_keyed_state(
-                SharedString::from(format!("chat-diff-input-{}", message_id)),
+                SharedString::from(format!(
+                    "chat-code-input-{}-{key_suffix}-{}-{}-{}",
+                    message_id,
+                    content_fingerprint.len,
+                    content_fingerprint.head,
+                    content_fingerprint.tail
+                )),
                 cx,
                 |window, cx| {
                     cx.new(|cx| {
@@ -557,18 +708,14 @@ impl ChatView {
                             .multi_line(true)
                             .code_editor(language)
                             .line_number(true)
+                            .searchable(false)
+                            .soft_wrap(false)
                             .default_value(content.clone())
                     })
                 },
             )
             .read(cx)
             .clone();
-
-        input_state.update(cx, |state, cx| {
-            if state.value().as_ref() != content {
-                state.set_value(content, window, cx);
-            }
-        });
 
         div()
             .w_full()
@@ -579,6 +726,499 @@ impl ChatView {
                     .disabled(true)
                     .appearance(false)
                     .h_full(),
+            )
+            .into_any_element()
+    }
+
+    fn render_virtualized_code_chunk_editor(
+        message_id: Uuid,
+        block_key: &str,
+        language: &str,
+        chunk_index: usize,
+        chunk: &VirtualizedCodeChunk,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let language = SharedString::from(language.to_string());
+        let chunk_rows = chunk.line_count.max(1);
+        let initial_value = chunk.code_text.clone();
+        let chunk_fingerprint = text_fingerprint(&chunk.code_text);
+        let input_state = window
+            .use_keyed_state(
+                SharedString::from(format!(
+                    "chat-code-chunk-input-{message_id}-{block_key}-{chunk_index}-{}-{}-{}",
+                    chunk_fingerprint.len, chunk_fingerprint.head, chunk_fingerprint.tail
+                )),
+                cx,
+                |window, cx| {
+                    cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .code_editor(language)
+                            .line_number(false)
+                            .rows(chunk_rows)
+                            .searchable(false)
+                            .soft_wrap(false)
+                            .default_value(initial_value.clone())
+                    })
+                },
+            )
+            .read(cx)
+            .clone();
+        let content_height = px((chunk_rows as f32 * VIRTUALIZED_CODE_LINE_HEIGHT).max(16.0));
+
+        let row_bg = if chunk.has_added && !chunk.has_removed {
+            rgb(0x173221)
+        } else if chunk.has_removed && !chunk.has_added {
+            rgb(0x3a1f24)
+        } else {
+            rgb(0x1e1e1e)
+        };
+        let has_signs = chunk.has_added || chunk.has_removed;
+        let sign_color = if chunk.has_added && !chunk.has_removed {
+            rgb(0x82dca7)
+        } else if chunk.has_removed && !chunk.has_added {
+            rgb(0xf2a2a2)
+        } else {
+            rgb(0x909090)
+        };
+
+        div()
+            .w_full()
+            .min_w(px(0.0))
+            .flex()
+            .items_start()
+            .border_b_1()
+            .border_color(rgb(0x2d2d30))
+            .bg(row_bg)
+            .when(has_signs, |this| {
+                this.child(
+                    div()
+                        .w(px(18.0))
+                        .px_1()
+                        .py_1()
+                        .text_xs()
+                        .text_color(sign_color)
+                        .whitespace_nowrap()
+                        .child(chunk.signs.clone()),
+                )
+            })
+            .child(
+                div()
+                    .w(px(64.0))
+                    .px_1()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(0x8a8a8a))
+                    .whitespace_nowrap()
+                    .child(chunk.line_numbers.clone()),
+            )
+            .child(
+                div().flex_1().min_w(px(0.0)).h(content_height).child(
+                    Input::new(&input_state)
+                        .disabled(true)
+                        .appearance(false)
+                        .h_full(),
+                ),
+            )
+            .into_any_element()
+    }
+
+    fn render_virtualized_code_chunk_plain(chunk: &VirtualizedCodeChunk) -> AnyElement {
+        let row_bg = if chunk.has_added && !chunk.has_removed {
+            rgb(0x173221)
+        } else if chunk.has_removed && !chunk.has_added {
+            rgb(0x3a1f24)
+        } else {
+            rgb(0x1e1e1e)
+        };
+        let has_signs = chunk.has_added || chunk.has_removed;
+        let sign_color = if chunk.has_added && !chunk.has_removed {
+            rgb(0x82dca7)
+        } else if chunk.has_removed && !chunk.has_added {
+            rgb(0xf2a2a2)
+        } else {
+            rgb(0x909090)
+        };
+
+        div()
+            .w_full()
+            .min_w(px(0.0))
+            .flex()
+            .items_start()
+            .border_b_1()
+            .border_color(rgb(0x2d2d30))
+            .bg(row_bg)
+            .when(has_signs, |this| {
+                this.child(
+                    div()
+                        .w(px(18.0))
+                        .px_1()
+                        .py_1()
+                        .text_xs()
+                        .text_color(sign_color)
+                        .whitespace_nowrap()
+                        .child(chunk.signs.clone()),
+                )
+            })
+            .child(
+                div()
+                    .w(px(64.0))
+                    .px_1()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(0x8a8a8a))
+                    .whitespace_nowrap()
+                    .child(chunk.line_numbers.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .px_1()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(0xd6d6d6))
+                    .whitespace_nowrap()
+                    .child(chunk.code_text.clone()),
+            )
+            .into_any_element()
+    }
+
+    fn render_virtualized_code_block(
+        message_id: Uuid,
+        block_key: &str,
+        language: &str,
+        text: &str,
+        options: VirtualizedCodeRenderOptions,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let fingerprint = text_fingerprint(text);
+        let cache = window.use_keyed_state(
+            SharedString::from(format!("chat-code-cache-{message_id}-{block_key}")),
+            cx,
+            |_window, _cx| VirtualizedCodeCache::default(),
+        );
+        cache.update(cx, |state, _| {
+            if state.fingerprint != fingerprint {
+                state.fingerprint = fingerprint;
+                state.chunks =
+                    build_virtualized_code_chunks(text, options.parse_numbered_lines).into();
+            }
+        });
+        let chunks = cache.read(cx).chunks.clone();
+        if chunks.is_empty() {
+            return div().into_any_element();
+        }
+        let total_lines = chunks.iter().map(|chunk| chunk.line_count).sum::<usize>();
+        let use_editor = options.prefer_editor
+            && total_lines <= EDITOR_HIGHLIGHT_MAX_LINES
+            && text.len() <= EDITOR_HIGHLIGHT_MAX_CHARS;
+
+        if use_editor && chunks.len() == 1 && text.len() <= VIRTUALIZE_CHAR_THRESHOLD {
+            return Self::render_readonly_code(
+                message_id,
+                block_key,
+                language,
+                chunks[0].code_text.clone(),
+                window,
+                cx,
+            );
+        }
+
+        let list_state = Self::virtualized_list_state(
+            SharedString::from(format!("chat-code-list-{message_id}-{block_key}")),
+            chunks.len(),
+            window,
+            cx,
+        );
+        let chunks_for_render = chunks.clone();
+        let language = language.to_string();
+        let block_key = block_key.to_string();
+
+        div()
+            .w_full()
+            .h(px(VIRTUALIZED_BLOCK_HEIGHT))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x3c3c3c))
+            .bg(rgb(0x1e1e1e))
+            .overflow_hidden()
+            .child(
+                list(list_state, move |chunk_index, window, cx| -> AnyElement {
+                    let Some(chunk) = chunks_for_render.get(chunk_index) else {
+                        return div().into_any_element();
+                    };
+                    if use_editor {
+                        ChatView::render_virtualized_code_chunk_editor(
+                            message_id,
+                            &block_key,
+                            &language,
+                            chunk_index,
+                            chunk,
+                            window,
+                            cx,
+                        )
+                    } else {
+                        let _ = window;
+                        let _ = cx;
+                        ChatView::render_virtualized_code_chunk_plain(chunk)
+                    }
+                })
+                .size_full()
+                .min_w(px(0.0))
+                .min_h(px(0.0)),
+            )
+            .into_any_element()
+    }
+
+    fn render_virtualized_diff_chunk(blocks: &[VirtualizedDiffBlock]) -> AnyElement {
+        div()
+            .w_full()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .children(blocks.iter().map(move |block| {
+                let (bg, sign_color, text_color) = match block.kind {
+                    DiffRowKind::Header => (rgb(0x252526), rgb(0x8f8f8f), rgb(0xb8b8b8)),
+                    DiffRowKind::Context => (rgb(0x1e1e1e), rgb(0x8f8f8f), rgb(0xd6d6d6)),
+                    DiffRowKind::Added => (rgb(0x173221), rgb(0x82dca7), rgb(0xdaf4e3)),
+                    DiffRowKind::Removed => (rgb(0x3a1f24), rgb(0xf2a2a2), rgb(0xf7dddd)),
+                };
+                div()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .flex()
+                    .items_start()
+                    .px_1()
+                    .bg(bg)
+                    .child(
+                        div()
+                            .w(px(18.0))
+                            .text_xs()
+                            .text_color(sign_color)
+                            .whitespace_nowrap()
+                            .child(block.signs.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(64.0))
+                            .text_xs()
+                            .text_color(rgb(0x8a8a8a))
+                            .whitespace_nowrap()
+                            .child(block.line_numbers.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_xs()
+                            .text_color(text_color)
+                            .whitespace_nowrap()
+                            .child(block.text.clone()),
+                    )
+                    .into_any_element()
+            }))
+            .into_any_element()
+    }
+
+    fn render_virtualized_diff(
+        message_id: Uuid,
+        block_key: &str,
+        old_text: Option<&str>,
+        new_text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let old_fingerprint = text_fingerprint(old_text.unwrap_or_default());
+        let new_fingerprint = text_fingerprint(new_text);
+        let fingerprint = TextFingerprint {
+            len: old_fingerprint.len + new_fingerprint.len + 1,
+            head: old_fingerprint.head ^ new_fingerprint.head.rotate_left(1),
+            mid: old_fingerprint.mid ^ new_fingerprint.mid.rotate_left(3),
+            tail: old_fingerprint.tail ^ new_fingerprint.tail.rotate_left(7),
+        };
+        let cache = window.use_keyed_state(
+            SharedString::from(format!("chat-diff-cache-{message_id}-{block_key}")),
+            cx,
+            |_window, _cx| VirtualizedDiffCache::default(),
+        );
+        cache.update(cx, |state, _| {
+            if state.fingerprint != fingerprint {
+                state.fingerprint = fingerprint;
+                state.diff_text = crate::state::render_diff_text(old_text, new_text);
+                state.chunks = build_virtualized_diff_chunks(&state.diff_text).into();
+            }
+        });
+        let chunks = cache.read(cx).chunks.clone();
+        if chunks.is_empty() {
+            return div().into_any_element();
+        }
+        let should_use_single_editor = {
+            let state = cache.read(cx);
+            !line_count_exceeds(&state.diff_text, 200) && state.diff_text.len() <= 128_000
+        };
+        if should_use_single_editor {
+            let diff_text = cache.read(cx).diff_text.clone();
+            return Self::render_readonly_code(
+                message_id, block_key, "diff", diff_text, window, cx,
+            );
+        }
+
+        let list_state = Self::virtualized_list_state(
+            SharedString::from(format!("chat-diff-list-{message_id}-{block_key}")),
+            chunks.len(),
+            window,
+            cx,
+        );
+        let chunks_for_render = chunks.clone();
+
+        div()
+            .w_full()
+            .h(px(VIRTUALIZED_BLOCK_HEIGHT))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x3c3c3c))
+            .bg(rgb(0x1e1e1e))
+            .overflow_hidden()
+            .child(
+                list(list_state, move |chunk_index, _window, _cx| -> AnyElement {
+                    let Some(chunk) = chunks_for_render.get(chunk_index) else {
+                        return div().into_any_element();
+                    };
+                    ChatView::render_virtualized_diff_chunk(chunk.blocks.as_ref())
+                })
+                .size_full()
+                .min_w(px(0.0))
+                .min_h(px(0.0)),
+            )
+            .into_any_element()
+    }
+
+    fn render_virtualized_markdown(
+        message_id: Uuid,
+        block_key: &str,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let fingerprint = text_fingerprint(text);
+        let cache = window.use_keyed_state(
+            SharedString::from(format!("chat-md-cache-{message_id}-{block_key}")),
+            cx,
+            |_window, _cx| VirtualizedMarkdownCache::default(),
+        );
+        cache.update(cx, |state, _| {
+            if state.fingerprint != fingerprint {
+                state.fingerprint = fingerprint;
+                state.chunks = build_text_chunks(text).into();
+            }
+        });
+        let chunks = cache.read(cx).chunks.clone();
+        if chunks.is_empty() {
+            return div().into_any_element();
+        }
+        let list_state = Self::virtualized_list_state(
+            SharedString::from(format!("chat-md-list-{message_id}-{block_key}")),
+            chunks.len(),
+            window,
+            cx,
+        );
+        let chunks_for_render = chunks.clone();
+        let block_key = block_key.to_string();
+
+        div()
+            .w_full()
+            .h(px(VIRTUALIZED_BLOCK_HEIGHT))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x3c3c3c))
+            .bg(rgb(0x1e1e1e))
+            .overflow_hidden()
+            .child(
+                list(list_state, move |chunk_index, window, cx| -> AnyElement {
+                    let Some(chunk) = chunks_for_render.get(chunk_index) else {
+                        return div().into_any_element();
+                    };
+                    div()
+                        .px_2()
+                        .py_1()
+                        .child(
+                            TextView::markdown(
+                                SharedString::from(format!(
+                                    "chat-virtual-md-{message_id}-{block_key}-{chunk_index}"
+                                )),
+                                chunk.clone(),
+                                window,
+                                cx,
+                            )
+                            .selectable(true),
+                        )
+                        .into_any_element()
+                })
+                .size_full()
+                .min_w(px(0.0))
+                .min_h(px(0.0)),
+            )
+            .into_any_element()
+    }
+
+    fn render_virtualized_plain_text(
+        message_id: Uuid,
+        block_key: &str,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let fingerprint = text_fingerprint(text);
+        let cache = window.use_keyed_state(
+            SharedString::from(format!("chat-plain-cache-{message_id}-{block_key}")),
+            cx,
+            |_window, _cx| VirtualizedMarkdownCache::default(),
+        );
+        cache.update(cx, |state, _| {
+            if state.fingerprint != fingerprint {
+                state.fingerprint = fingerprint;
+                state.chunks = build_text_chunks(text).into();
+            }
+        });
+        let chunks = cache.read(cx).chunks.clone();
+        if chunks.is_empty() {
+            return div().into_any_element();
+        }
+        let list_state = Self::virtualized_list_state(
+            SharedString::from(format!("chat-plain-list-{message_id}-{block_key}")),
+            chunks.len(),
+            window,
+            cx,
+        );
+        let chunks_for_render = chunks.clone();
+
+        div()
+            .w_full()
+            .h(px(VIRTUALIZED_BLOCK_HEIGHT))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x3c3c3c))
+            .bg(rgb(0x1e1e1e))
+            .overflow_hidden()
+            .child(
+                list(list_state, move |chunk_index, _window, _cx| -> AnyElement {
+                    let Some(chunk) = chunks_for_render.get(chunk_index) else {
+                        return div().into_any_element();
+                    };
+                    div()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .px_2()
+                        .py_1()
+                        .whitespace_nowrap()
+                        .child(chunk.clone())
+                        .into_any_element()
+                })
+                .size_full()
+                .min_w(px(0.0))
+                .min_h(px(0.0)),
             )
             .into_any_element()
     }
@@ -611,8 +1251,28 @@ impl ChatView {
                 if text.contains("--- before\n+++ after") {
                     return Self::render_readonly_code(
                         message_id,
+                        "message-diff",
                         "diff",
                         text.clone(),
+                        window,
+                        cx,
+                    );
+                }
+
+                if should_virtualize_text(text) {
+                    if should_render_markdown(text) {
+                        return Self::render_virtualized_markdown(
+                            message_id,
+                            "message-markdown",
+                            text,
+                            window,
+                            cx,
+                        );
+                    }
+                    return Self::render_virtualized_plain_text(
+                        message_id,
+                        "message-plain",
+                        text,
                         window,
                         cx,
                     );
@@ -626,6 +1286,9 @@ impl ChatView {
                 )
             }
             MessageContent::ToolCall(tool_call) => {
+                let is_read_tool = matches!(tool_call.kind, agent_client_protocol::ToolKind::Read);
+                let is_execute_tool =
+                    matches!(tool_call.kind, agent_client_protocol::ToolKind::Execute);
                 let mut lines = vec![
                     format!("Tool: {}", tool_call.title),
                     format!(
@@ -655,26 +1318,91 @@ impl ChatView {
                     ),
                 ];
 
-                let mut diff_block = None;
-                let mut other_content = Vec::new();
-                let mut terminal_ids = Vec::new();
+                let language_hint = language_from_tool_title(&tool_call.title);
+                let mut content_blocks: Vec<AnyElement> = Vec::new();
 
-                for content in &tool_call.content {
+                for (content_index, content) in tool_call.content.iter().enumerate() {
                     match content {
                         agent_client_protocol::ToolCallContent::Content(c) => {
                             if let agent_client_protocol::ContentBlock::Text(t) = &c.content {
-                                other_content.push(t.text.clone());
+                                let text = t.text.as_str();
+                                let block_key = format!("tool-extra-{content_index}");
+                                let element =
+                                    if is_read_tool || looks_like_numbered_code_lines(text) {
+                                        Self::render_virtualized_code_block(
+                                            message_id,
+                                            &block_key,
+                                            language_hint,
+                                            text,
+                                            VirtualizedCodeRenderOptions {
+                                                parse_numbered_lines: true,
+                                                prefer_editor: true,
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                    } else if is_execute_tool || looks_like_terminal_output(text) {
+                                        Self::render_virtualized_code_block(
+                                            message_id,
+                                            &block_key,
+                                            "sh",
+                                            text,
+                                            VirtualizedCodeRenderOptions {
+                                                parse_numbered_lines: false,
+                                                prefer_editor: false,
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                    } else if should_virtualize_text(text) {
+                                        if should_render_markdown(text) {
+                                            Self::render_virtualized_markdown(
+                                                message_id, &block_key, text, window, cx,
+                                            )
+                                        } else {
+                                            Self::render_virtualized_plain_text(
+                                                message_id, &block_key, text, window, cx,
+                                            )
+                                        }
+                                    } else {
+                                        Self::render_markdown_or_plain_text(
+                                            SharedString::from(format!(
+                                                "chat-tool-extra-{}-{}",
+                                                message_id, content_index
+                                            )),
+                                            text.to_string(),
+                                            window,
+                                            cx,
+                                        )
+                                    };
+                                content_blocks.push(element);
                             }
                         }
                         agent_client_protocol::ToolCallContent::Diff(d) => {
-                            lines.push(format!("Diff: {}", d.path.display()));
-                            diff_block = Some(crate::state::render_diff_text(
+                            let path = d.path.display().to_string();
+                            lines.push(format!("Diff: {path}"));
+                            content_blocks.push(Self::render_virtualized_diff(
+                                message_id,
+                                &format!("diff-{path}"),
                                 d.old_text.as_deref(),
                                 &d.new_text,
+                                window,
+                                cx,
                             ));
                         }
                         agent_client_protocol::ToolCallContent::Terminal(terminal) => {
-                            terminal_ids.push(terminal.terminal_id.to_string());
+                            let terminal_id = terminal.terminal_id.to_string();
+                            let transcript = app_state
+                                .read(cx)
+                                .terminal_transcript_for_thread(thread_id, &terminal_id)
+                                .unwrap_or_default();
+                            content_blocks.push(Self::render_terminal_widget(
+                                message_id,
+                                terminal_id,
+                                transcript,
+                                window,
+                                cx,
+                            ));
                         }
                         _ => {}
                     }
@@ -693,32 +1421,7 @@ impl ChatView {
                         )
                         .selectable(true),
                     )
-                    .when_some(diff_block, |this, diff| {
-                        this.child(Self::render_readonly_code(
-                            message_id, "diff", diff, window, cx,
-                        ))
-                    })
-                    .children(terminal_ids.into_iter().map(|terminal_id| {
-                        let transcript = app_state
-                            .read(cx)
-                            .terminal_transcript_for_thread(thread_id, &terminal_id)
-                            .unwrap_or_default();
-                        Self::render_terminal_widget(
-                            message_id,
-                            terminal_id,
-                            transcript,
-                            window,
-                            cx,
-                        )
-                    }))
-                    .children(other_content.into_iter().enumerate().map(|(i, text)| {
-                        Self::render_markdown_or_plain_text(
-                            SharedString::from(format!("chat-tool-extra-{}-{}", message_id, i)),
-                            text,
-                            window,
-                            cx,
-                        )
-                    }))
+                    .children(content_blocks)
                     .into_any_element()
             }
         }
@@ -744,6 +1447,20 @@ impl ChatView {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
+        if should_virtualize_text(&transcript) {
+            return Self::render_virtualized_code_block(
+                message_id,
+                &format!("terminal-{terminal_id}"),
+                "sh",
+                &transcript,
+                VirtualizedCodeRenderOptions {
+                    parse_numbered_lines: false,
+                    prefer_editor: false,
+                },
+                window,
+                cx,
+            );
+        }
         let terminal_state = window.use_keyed_state(
             SharedString::from(format!("chat-terminal-{}-{}", message_id, terminal_id)),
             cx,
@@ -803,12 +1520,12 @@ impl ChatView {
         let (
             bg,
             text_color,
-            message_content,
             thread_id,
             message_id,
             is_collapsible,
             is_expanded,
-        ): (Rgba, Rgba, MessageContent, Uuid, Uuid, bool, bool) = {
+            collapsed_preview,
+        ): (Rgba, Rgba, Uuid, Uuid, bool, bool, Option<String>) = {
             let state = app_state.read(cx);
             let Some(thread) = state.active_thread() else {
                 return div().into_any_element();
@@ -829,41 +1546,72 @@ impl ChatView {
                 rgb(0xffffff)
             };
 
-            let raw_content = message.content.clone();
-
             // For now, we only collapse Text messages.
             let is_expanded = expanded_messages.contains(&message.id);
-            let mut display_content = raw_content.clone();
             let mut is_collapsible = false;
+            let mut collapsed_preview = None;
 
-            if let MessageContent::Text(text) = &raw_content {
-                let collapsed_preview =
+            if let MessageContent::Text(text) = &message.content
+                && !text.contains("--- before\n+++ after")
+            {
+                let preview_candidate =
                     collapsed_text_preview(text, COLLAPSE_LINE_LIMIT, COLLAPSE_CHAR_LIMIT);
-                is_collapsible = collapsed_preview.is_some();
-                if !is_expanded && let Some(preview) = collapsed_preview {
-                    display_content = MessageContent::Text(preview);
+                is_collapsible = preview_candidate.is_some();
+                if !is_expanded && let Some(preview) = preview_candidate {
+                    collapsed_preview = Some(preview);
                 }
             }
 
             (
                 bg,
                 text_color,
-                display_content,
                 message.thread_id,
                 message.id,
                 is_collapsible,
                 is_expanded,
+                collapsed_preview,
             )
         };
 
-        let content_el = Self::render_message_content(
-            app_state,
-            thread_id,
-            message_id,
-            &message_content,
-            window,
-            cx,
-        );
+        let content_el = if let Some(preview) = collapsed_preview {
+            Self::render_markdown_or_plain_text(
+                SharedString::from(format!("chat-collapsed-preview-{message_id}")),
+                preview,
+                window,
+                cx,
+            )
+        } else {
+            let content_cache = window.use_keyed_state(
+                SharedString::from(format!("chat-message-content-{message_id}")),
+                cx,
+                |_window, _cx| MessageContentCache::default(),
+            );
+            content_cache.update(cx, |cache, cx| {
+                let state = app_state.read(cx);
+                let Some(thread) = state.active_thread() else {
+                    return;
+                };
+                let Some(message) = thread.messages.get(index) else {
+                    return;
+                };
+                let signature = message_tail_signature(message);
+                if cache.signature != Some(signature) {
+                    cache.signature = Some(signature);
+                    cache.content = Some(Arc::new(message.content.clone()));
+                }
+            });
+            let Some(message_content) = content_cache.read(cx).content.clone() else {
+                return div().into_any_element();
+            };
+            Self::render_message_content(
+                app_state,
+                thread_id,
+                message_id,
+                message_content.as_ref(),
+                window,
+                cx,
+            )
+        };
 
         let this_expand = this.clone();
         let app_state_for_copy = app_state.clone();
@@ -1031,6 +1779,12 @@ impl ChatView {
                 state.set_cursor_position(position, window, cx);
             });
         });
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn debug_expand_message(&mut self, message_id: Uuid) {
+        self.expanded_messages.insert(message_id);
     }
 }
 
@@ -1688,6 +2442,404 @@ fn should_render_markdown(text: &str) -> bool {
         || text.contains("\n> ")
 }
 
+#[derive(Clone)]
+struct CodeRenderLine {
+    sign: char,
+    line_number: Option<usize>,
+    text: String,
+    is_added: bool,
+    is_removed: bool,
+}
+
+fn text_fingerprint(text: &str) -> TextFingerprint {
+    let bytes = text.as_bytes();
+    let mut head = 0u64;
+    for byte in bytes.iter().take(32) {
+        head = head
+            .wrapping_mul(16_777_619)
+            .wrapping_add((*byte as u64) + 1);
+    }
+    let mut mid = 0u64;
+    if !bytes.is_empty() {
+        let mid_start = bytes.len().saturating_sub(16) / 2;
+        let mid_end = (mid_start + 32).min(bytes.len());
+        for byte in &bytes[mid_start..mid_end] {
+            mid = mid
+                .wrapping_mul(2_166_136_261)
+                .wrapping_add((*byte as u64) + 1);
+        }
+    }
+    let mut tail = 0u64;
+    for byte in bytes.iter().rev().take(32) {
+        tail = tail
+            .wrapping_mul(1_099_511_628_211)
+            .wrapping_add((*byte as u64) + 1);
+    }
+    TextFingerprint {
+        len: text.len(),
+        head,
+        mid,
+        tail,
+    }
+}
+
+fn should_virtualize_text(text: &str) -> bool {
+    if text.len() >= VIRTUALIZE_CHAR_THRESHOLD {
+        return true;
+    }
+    let mut lines = 1usize;
+    for byte in text.as_bytes() {
+        if *byte == b'\n' {
+            lines += 1;
+            if lines > VIRTUALIZE_LINE_THRESHOLD {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn line_count_exceeds(text: &str, limit: usize) -> bool {
+    let mut lines = 1usize;
+    for byte in text.as_bytes() {
+        if *byte == b'\n' {
+            lines += 1;
+            if lines > limit {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn build_text_chunks(text: &str) -> Vec<SharedString> {
+    let mut chunks = Vec::new();
+    let mut current = Vec::with_capacity(VIRTUALIZED_CHUNK_LINES);
+    let push_line = |line: &str, chunks: &mut Vec<SharedString>, current: &mut Vec<String>| {
+        current.push(line.to_string());
+        if current.len() == VIRTUALIZED_CHUNK_LINES {
+            chunks.push(SharedString::from(current.join("\n")));
+            current.clear();
+        }
+    };
+
+    if text.is_empty() {
+        push_line("", &mut chunks, &mut current);
+    } else {
+        for line in text.split('\n') {
+            push_line(line, &mut chunks, &mut current);
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(SharedString::from(current.join("\n")));
+    }
+    chunks
+}
+
+fn parse_numbered_code_line(line: &str) -> Option<(usize, &str)> {
+    let (left, right) = line.split_once('|')?;
+    let number = left.trim().parse::<usize>().ok()?;
+    Some((number, right.trim_start()))
+}
+
+fn push_virtualized_code_chunk(chunks: &mut Vec<VirtualizedCodeChunk>, lines: &[CodeRenderLine]) {
+    if lines.is_empty() {
+        return;
+    }
+    let mut code_text = String::new();
+    let mut line_numbers = String::new();
+    let mut signs = String::new();
+    let mut has_added = false;
+    let mut has_removed = false;
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            code_text.push('\n');
+            line_numbers.push('\n');
+            signs.push('\n');
+        }
+        code_text.push_str(&line.text);
+        if let Some(number) = line.line_number {
+            let _ = write!(&mut line_numbers, "{number:>6}");
+        }
+        signs.push(line.sign);
+        has_added |= line.is_added;
+        has_removed |= line.is_removed;
+    }
+    chunks.push(VirtualizedCodeChunk {
+        code_text,
+        line_numbers,
+        signs,
+        line_count: lines.len(),
+        has_added,
+        has_removed,
+    });
+}
+
+fn build_virtualized_code_chunks(
+    text: &str,
+    parse_numbered_lines: bool,
+) -> Vec<VirtualizedCodeChunk> {
+    let mut chunks = Vec::new();
+    let mut current = Vec::with_capacity(VIRTUALIZED_CHUNK_LINES);
+    let mut fallback_line = 1usize;
+    let push_line = |raw: &str, lines: &mut Vec<CodeRenderLine>, fallback_line: &mut usize| {
+        let (line_number, text) = if parse_numbered_lines {
+            if let Some((number, text)) = parse_numbered_code_line(raw) {
+                (Some(number), text.to_string())
+            } else {
+                (Some(*fallback_line), raw.to_string())
+            }
+        } else {
+            (Some(*fallback_line), raw.to_string())
+        };
+        lines.push(CodeRenderLine {
+            sign: ' ',
+            line_number,
+            text,
+            is_added: false,
+            is_removed: false,
+        });
+        *fallback_line += 1;
+    };
+
+    if text.is_empty() {
+        push_line("", &mut current, &mut fallback_line);
+    } else {
+        for line in text.split('\n') {
+            push_line(line, &mut current, &mut fallback_line);
+            if current.len() == VIRTUALIZED_CHUNK_LINES {
+                push_virtualized_code_chunk(&mut chunks, &current);
+                current.clear();
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        push_virtualized_code_chunk(&mut chunks, &current);
+    }
+    chunks
+}
+
+fn looks_like_numbered_code_lines(text: &str) -> bool {
+    let numbered = text
+        .lines()
+        .take(8)
+        .filter(|line| parse_numbered_code_line(line).is_some())
+        .count();
+    numbered >= 3
+}
+
+fn looks_like_terminal_output(text: &str) -> bool {
+    text.lines().take(40).any(|line| {
+        line.contains(" ... ")
+            || line.contains("FAILED")
+            || line.contains("error:")
+            || line.starts_with('$')
+            || line.starts_with('>')
+    })
+}
+
+fn parse_diff_hunk_header(line: &str) -> Option<(usize, usize)> {
+    if !line.starts_with("@@") {
+        return None;
+    }
+    let mut parts = line.split_whitespace();
+    let first = parts.next()?;
+    if first != "@@" {
+        return None;
+    }
+    let old_part = parts.next()?;
+    let new_part = parts.next()?;
+    let old_start = old_part
+        .strip_prefix('-')?
+        .split(',')
+        .next()?
+        .parse::<usize>()
+        .ok()?;
+    let new_start = new_part
+        .strip_prefix('+')?
+        .split(',')
+        .next()?
+        .parse::<usize>()
+        .ok()?;
+    Some((old_start, new_start))
+}
+
+fn build_diff_blocks(rows: Vec<VirtualizedDiffRow>) -> Arc<[VirtualizedDiffBlock]> {
+    let mut blocks = Vec::new();
+    let mut current_kind = None;
+    let mut signs = String::new();
+    let mut line_numbers = String::new();
+    let mut text = String::new();
+
+    let flush = |blocks: &mut Vec<VirtualizedDiffBlock>,
+                 current_kind: &mut Option<DiffRowKind>,
+                 signs: &mut String,
+                 line_numbers: &mut String,
+                 text: &mut String| {
+        let Some(kind) = *current_kind else {
+            return;
+        };
+        blocks.push(VirtualizedDiffBlock {
+            kind,
+            signs: SharedString::from(std::mem::take(signs)),
+            line_numbers: SharedString::from(std::mem::take(line_numbers)),
+            text: SharedString::from(std::mem::take(text)),
+        });
+        *current_kind = None;
+    };
+
+    for row in rows {
+        if current_kind != Some(row.kind) {
+            flush(
+                &mut blocks,
+                &mut current_kind,
+                &mut signs,
+                &mut line_numbers,
+                &mut text,
+            );
+            current_kind = Some(row.kind);
+        }
+
+        if !signs.is_empty() {
+            signs.push('\n');
+            line_numbers.push('\n');
+            text.push('\n');
+        }
+        signs.push(row.sign);
+        line_numbers.push_str(row.line_number_label.as_ref());
+        if row.text.is_empty() {
+            text.push(' ');
+        } else {
+            text.push_str(row.text.as_ref());
+        }
+    }
+
+    flush(
+        &mut blocks,
+        &mut current_kind,
+        &mut signs,
+        &mut line_numbers,
+        &mut text,
+    );
+
+    Arc::from(blocks)
+}
+
+fn build_virtualized_diff_chunks(diff_text: &str) -> Vec<VirtualizedDiffChunk> {
+    let mut rows = Vec::new();
+    let mut old_line = 1usize;
+    let mut new_line = 1usize;
+    let push_row = |kind: DiffRowKind,
+                    sign: char,
+                    line_number: Option<usize>,
+                    text: &str|
+     -> VirtualizedDiffRow {
+        let line_number_label = line_number
+            .map(|line| SharedString::from(line.to_string()))
+            .unwrap_or_default();
+        VirtualizedDiffRow {
+            kind,
+            sign,
+            line_number_label,
+            text: SharedString::from(text.to_string()),
+        }
+    };
+
+    let mut process_line = |line: &str| {
+        if let Some((old_start, new_start)) = parse_diff_hunk_header(line) {
+            old_line = old_start;
+            new_line = new_start;
+            rows.push(push_row(DiffRowKind::Header, '@', None, line));
+            return;
+        }
+        if line.starts_with("---") || line.starts_with("+++") {
+            rows.push(push_row(DiffRowKind::Header, ' ', None, line));
+            return;
+        }
+        if let Some(text) = line.strip_prefix('+') {
+            rows.push(push_row(DiffRowKind::Added, '+', Some(new_line), text));
+            new_line += 1;
+            return;
+        }
+        if let Some(text) = line.strip_prefix('-') {
+            rows.push(push_row(DiffRowKind::Removed, '-', Some(old_line), text));
+            old_line += 1;
+            return;
+        }
+        let text = line.strip_prefix(' ').unwrap_or(line);
+        rows.push(push_row(DiffRowKind::Context, ' ', Some(new_line), text));
+        old_line += 1;
+        new_line += 1;
+    };
+
+    if diff_text.is_empty() {
+        process_line("");
+    } else {
+        for line in diff_text.split('\n') {
+            process_line(line);
+        }
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = Vec::with_capacity(VIRTUALIZED_CHUNK_LINES);
+    for row in rows {
+        current.push(row);
+        if current.len() == VIRTUALIZED_CHUNK_LINES {
+            chunks.push(VirtualizedDiffChunk {
+                blocks: build_diff_blocks(std::mem::take(&mut current)),
+            });
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(VirtualizedDiffChunk {
+            blocks: build_diff_blocks(current),
+        });
+    }
+    chunks
+}
+
+fn language_from_tool_title(title: &str) -> &'static str {
+    for token in title.split_whitespace().rev() {
+        let candidate = token.trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ':'
+            )
+        });
+        if candidate.contains('.') {
+            return language_from_path(candidate);
+        }
+    }
+    "text"
+}
+
+fn language_from_path(path: &str) -> &'static str {
+    let ext = path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "rs" => "rust",
+        "js" | "mjs" | "cjs" => "javascript",
+        "ts" | "tsx" => "typescript",
+        "py" => "python",
+        "go" => "go",
+        "java" => "java",
+        "c" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "h" => "cpp",
+        "sh" | "zsh" | "bash" => "bash",
+        "json" => "json",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        "md" | "markdown" => "markdown",
+        "diff" | "patch" => "diff",
+        _ => "text",
+    }
+}
+
 fn format_cost_label(cost: Option<&Cost>) -> Option<String> {
     let cost = cost?;
     Some(format!("{:.2} {}", cost.amount, cost.currency))
@@ -1827,5 +2979,61 @@ mod tests {
         assert!(!should_render_markdown(&text));
         let markdown_like = format!("{}\n- item", "x".repeat(MARKDOWN_FASTPATH_LENGTH + 32));
         assert!(should_render_markdown(&markdown_like));
+    }
+
+    #[::core::prelude::v1::test]
+    fn virtualization_threshold_triggers_for_many_lines() {
+        let mut text = String::new();
+        for _ in 0..(VIRTUALIZE_LINE_THRESHOLD + 4) {
+            text.push_str("line\n");
+        }
+        assert!(should_virtualize_text(&text));
+    }
+
+    #[::core::prelude::v1::test]
+    fn parse_numbered_code_lines_extracts_gutter_number() {
+        let parsed = parse_numbered_code_line("   42 | fn answer() {}").expect("should parse");
+        assert_eq!(parsed.0, 42);
+        assert_eq!(parsed.1, "fn answer() {}");
+        assert!(parse_numbered_code_line("not numbered").is_none());
+    }
+
+    #[::core::prelude::v1::test]
+    fn code_chunk_builder_splits_large_payloads() {
+        let mut payload = String::new();
+        for index in 1..=400 {
+            let _ = writeln!(payload, "{index:>6} | let value_{index} = {index};");
+        }
+        let chunks = build_virtualized_code_chunks(&payload, true);
+        assert!(chunks.len() >= 3);
+        assert_eq!(chunks[0].line_count, VIRTUALIZED_CHUNK_LINES);
+        assert!(chunks[0].line_numbers.contains("     1"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn diff_chunk_builder_marks_added_and_removed_rows() {
+        let diff = "\
+--- before\n\
++++ after\n\
+@@ -1,2 +1,2 @@\n\
+-old line\n\
++new line\n\
+ context line";
+        let chunks = build_virtualized_diff_chunks(diff);
+        assert!(!chunks.is_empty());
+        let blocks = &chunks[0].blocks;
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.kind == DiffRowKind::Removed)
+        );
+        assert!(blocks.iter().any(|block| block.kind == DiffRowKind::Added));
+    }
+
+    #[::core::prelude::v1::test]
+    fn language_hint_prefers_extension_in_tool_title() {
+        assert_eq!(language_from_tool_title("Read src/lib.rs"), "rust");
+        assert_eq!(language_from_tool_title("Read scripts/build.sh"), "bash");
+        assert_eq!(language_from_tool_title("Read NOTES"), "text");
     }
 }
