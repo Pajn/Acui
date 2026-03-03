@@ -4,13 +4,13 @@ use agent_client_protocol::{AvailableCommand, SessionModeState};
 use gpui::prelude::*;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::scroll::ScrollableElement;
 use gpui_component::scroll::Scrollbar;
 use gpui_component::skeleton::Skeleton;
 use gpui_component::text::TextView;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::time::Duration;
 use uuid::Uuid;
 
 mod support;
@@ -45,6 +45,7 @@ pub struct ChatView {
     suggestion_scroll_handle: ScrollHandle,
     input_state: Entity<InputState>,
     locked_to_bottom: bool,
+    render_pending: bool,
     suggestion_anchor: Option<(SuggestionKind, usize)>,
     suggestion_selected: usize,
     dismissed_suggestion: Option<(SuggestionKind, usize)>,
@@ -68,7 +69,29 @@ impl ChatView {
             if this.locked_to_bottom {
                 this.scroll_to_bottom();
             }
-            cx.notify();
+            // Coalesce rapid state updates (e.g. streaming chunks) into at most
+            // one re-render per ~16 ms so we stay near 60 fps.
+            if !this.render_pending {
+                this.render_pending = true;
+                let background = cx.background_executor().clone();
+                cx.spawn(
+                    |this: gpui::WeakEntity<ChatView>, cx: &mut gpui::AsyncApp| {
+                        let mut cx = cx.clone();
+                        async move {
+                            background.timer(Duration::from_millis(16)).await;
+                            this.update(
+                                &mut cx,
+                                |this: &mut ChatView, cx: &mut Context<ChatView>| {
+                                    this.render_pending = false;
+                                    cx.notify();
+                                },
+                            )
+                            .ok();
+                        }
+                    },
+                )
+                .detach();
+            }
         })
         .detach();
 
@@ -138,6 +161,7 @@ impl ChatView {
             suggestion_scroll_handle: ScrollHandle::new(),
             input_state,
             locked_to_bottom: true,
+            render_pending: false,
             suggestion_anchor: None,
             suggestion_selected: 0,
             dismissed_suggestion: None,
