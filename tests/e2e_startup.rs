@@ -27,6 +27,7 @@ fn app_runs_for_ten_seconds_with_agent_config() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_acui"))
         .current_dir(&temp_dir)
         .env("ACUI_HEADLESS", "1")
+        .env("ACUI_E2E_OPEN_WINDOW", "1")
         .env("ACUI_E2E_DURATION_SECS", "10")
         .spawn()
         .expect("failed to launch app");

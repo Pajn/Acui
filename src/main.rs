@@ -9,6 +9,7 @@ mod ui;
 
 use config::AppConfig;
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui_component::Root;
 use state::AppState;
 use std::time::Duration;
 use ui::layout::WorkspaceLayout;
@@ -29,7 +30,8 @@ fn open_main_window(cx: &mut App, app_state: gpui::Entity<AppState>) {
         move |window, cx| {
             window.set_app_id("acui");
             window.set_window_title("acui");
-            cx.new(|cx| WorkspaceLayout::new(app_state.clone(), window, cx))
+            let view = cx.new(|cx| WorkspaceLayout::new(app_state.clone(), window, cx));
+            cx.new(|cx| Root::new(view, window, cx))
         },
     )
     .expect("failed to open window");
@@ -39,6 +41,7 @@ fn main() {
     let e2e_duration_secs = std::env::var("ACUI_E2E_DURATION_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok());
+    let e2e_open_window = std::env::var("ACUI_E2E_OPEN_WINDOW").as_deref() == Ok("1");
     let headless =
         std::env::var("ACUI_HEADLESS").as_deref() == Ok("1") || e2e_duration_secs.is_some();
     let application = if headless {
@@ -78,7 +81,7 @@ fn main() {
         });
         cx.set_global(GlobalAppState(app_state.clone()));
 
-        if !headless {
+        if !headless || e2e_open_window {
             open_main_window(cx, app_state.clone());
         }
 
