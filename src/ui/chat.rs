@@ -59,8 +59,7 @@ impl ChatView {
     pub fn new(app_state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
-                .multi_line(true)
-                .rows(3)
+                .auto_grow(1, 10)
                 .placeholder("Type and press Enter to send, Shift+Enter for new line...")
         });
 
@@ -94,13 +93,16 @@ impl ChatView {
         })
         .detach();
 
-        cx.subscribe(&input_state, |this, _input, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                this.history_cursor = None;
-                this.reconcile_suggestion_visibility(cx);
-                cx.notify();
-            }
-        })
+        cx.subscribe(
+            &input_state,
+            |this, _input_state, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.history_cursor = None;
+                    this.reconcile_suggestion_visibility(cx);
+                    cx.notify();
+                }
+            },
+        )
         .detach();
 
         cx.observe_keystrokes(|this, event, window, cx| {
@@ -933,9 +935,9 @@ impl Render for ChatView {
             .child(
                 div()
                     .flex_1()
-                    .min_h(px(64.0))
-                    .max_h(px(200.0))
-                    .child(Input::new(&self.input_state).h_full()),
+                    .min_h(px(36.0))
+                    .max_h(px(250.0))
+                    .child(Input::new(&self.input_state)),
             )
             .child(
                 div()

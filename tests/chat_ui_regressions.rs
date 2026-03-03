@@ -525,3 +525,55 @@ async fn shift_enter_inserts_newline(cx: &mut TestAppContext) {
         assert_eq!(cursor, 2, "Cursor should be at 2 (after newline)");
     });
 }
+
+#[gpui::test]
+async fn chat_input_grows_with_multiple_lines(cx: &mut TestAppContext) {
+    with_chat_window(cx, |chat, _diff_message_id, window_cx| {
+        let initial_bounds = window_cx
+            .debug_bounds("chat-input-box")
+            .expect("chat input should render");
+        let initial_height = initial_bounds.size.height;
+
+        window_cx.update(|window, cx| {
+            ChatView::debug_focus_input(&chat, window, cx);
+        });
+        window_cx.run_until_parked();
+
+        // Add 5 lines
+        for _ in 0..5 {
+            window_cx.simulate_keystrokes("shift-enter");
+            window_cx.run_until_parked();
+        }
+
+        let grown_bounds = window_cx
+            .debug_bounds("chat-input-box")
+            .expect("chat input should render");
+        let grown_height = grown_bounds.size.height;
+
+        assert!(
+            grown_height > initial_height,
+            "input height should grow: initial={}, grown={}",
+            initial_height,
+            grown_height
+        );
+
+        // Add 15 lines (total 20) to hit max-h
+        for _ in 0..15 {
+            window_cx.simulate_keystrokes("shift-enter");
+            window_cx.run_until_parked();
+        }
+
+        let max_bounds = window_cx
+            .debug_bounds("chat-input-box")
+            .expect("chat input should render");
+        let max_height = max_bounds.size.height;
+
+        // max_h is px(250.0). Plus p-3 (12px top, 12px bottom if p-3 is 12px)
+        // or whatever px(250.0) covers.
+        assert!(
+            max_height <= gpui::px(300.0),
+            "input height should respect max_h limit: current={}",
+            max_height
+        );
+    });
+}
