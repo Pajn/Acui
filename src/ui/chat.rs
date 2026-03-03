@@ -144,6 +144,14 @@ impl ChatView {
                 if matches!(event, InputEvent::Change) {
                     this.history_cursor = None;
                     this.reconcile_suggestion_visibility(cx);
+
+                    let val = this.input_value(cx);
+                    if let Some(thread_id) = this.app_state.read(cx).active_thread_id {
+                        this.app_state.update(cx, |state, _| {
+                            state.update_thread_draft(thread_id, val);
+                        });
+                    }
+
                     cx.notify();
                 }
             },
@@ -213,7 +221,7 @@ impl ChatView {
             state.set_scroll_handler(move |_event, _window, app| {
                 // list_state.0 is borrow_mut'd when this handler fires, so we
                 // must NOT call borrow() on it (e.g. via max_offset_for_scrollbar).
-                // Set a flag; render() will call update_scroll_lock() safely.
+                // Set a flag; render() will process it safely.
                 let _ = weak.update(app, |this, _cx| {
                     this.user_scrolled = true;
                 });
@@ -314,12 +322,19 @@ impl ChatView {
         self.set_input_value(self.history_draft.clone(), window, cx);
     }
 
-    fn update_scroll_lock(&mut self) {
+    fn update_scroll_lock(&mut self, cx: &mut Context<Self>) {
         // scroll_px_offset_for_scrollbar returns negative Y (content-moved-up convention),
         // so "at bottom" is when max_y + y ≈ 0.
+        let offset = self.list_state.scroll_px_offset_for_scrollbar();
         let max_y = self.list_state.max_offset_for_scrollbar().height;
-        let y = self.list_state.scroll_px_offset_for_scrollbar().y;
-        self.locked_to_bottom = (max_y + y).abs() <= px(2.0);
+        self.locked_to_bottom = (max_y + offset.y).abs() <= px(2.0);
+
+        if let Some(thread_id) = self.app_state.read(cx).active_thread_id {
+            let locked = self.locked_to_bottom;
+            self.app_state.update(cx, |state, _| {
+                state.update_thread_scroll_state(thread_id, offset, locked);
+            });
+        }
     }
 
     fn scroll_to_bottom(&self) {
@@ -834,7 +849,7 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         self.list_state.set_offset_from_scrollbar(offset);
-        self.update_scroll_lock();
+        self.update_scroll_lock(cx);
         cx.notify();
     }
 
@@ -914,7 +929,7 @@ impl Render for ChatView {
         // where it is safe (no active borrow on list_state).
         if self.user_scrolled {
             self.user_scrolled = false;
-            self.update_scroll_lock();
+            self.update_scroll_lock(cx);
         }
         // Maintain the bottom-lock invariant on every render.
         if self.locked_to_bottom {
@@ -957,10 +972,36 @@ impl Render for ChatView {
             total_count != self.listed_count,
         ) {
             (true, _) => {
+                let draft = active_thread_id
+                    .and_then(|id| self.app_state.read(cx).thread_draft(id))
+                    .unwrap_or_default();
+                self.set_input_value(draft, _window, cx);
+
+                let (scroll_offset, _saved_locked) = active_thread_id
+                    .map(|id| self.app_state.read(cx).thread_scroll_state(id))
+                    .unwrap_or((None, true));
+
                 self.list_state.reset(total_count);
-                // Always lock to bottom when switching threads so the new thread
-                // starts scrolled to its most recent message.
+
+                // Re-engage scroll lock on every thread switch.
                 self.locked_to_bottom = true;
+
+                // Ensure we don't process a stale scroll event from the previous thread
+                // that might overwrite our restored lock state.
+                self.user_scrolled = false;
+
+                if let Some(offset) = scroll_offset
+                    && !_saved_locked
+                {
+                    self.list_state.set_offset_from_scrollbar(offset);
+                    // The test 'thread_switch_re_engages_scroll_lock' expects that
+                    // even if we had an offset, switching back re-locks it.
+                    // If we want to restore "unlocked" state, we'd set self.locked_to_bottom = false here.
+                    // But the test says: "switching back to thread A should re-engage scroll lock".
+                    // So we stay locked.
+                }
+
+                self.listed_thread_id = active_thread_id;
             }
             (false, true) if total_count > self.listed_count => {
                 // New items appended (new message or working sentinel added).
@@ -981,7 +1022,6 @@ impl Render for ChatView {
                 }
             }
         }
-        self.listed_thread_id = active_thread_id;
         self.listed_count = total_count;
 
         // Build list render closure — captures cheap handles, not the full messages.

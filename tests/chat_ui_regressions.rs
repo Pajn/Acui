@@ -97,7 +97,13 @@ fn flush_layout(window_cx: &mut VisualTestContext) {
 
 #[gpui::test]
 async fn chat_rows_have_no_overlap_or_large_gaps(cx: &mut TestAppContext) {
-    with_chat_window(cx, |_chat, _diff_message_id, window_cx| {
+    with_chat_window(cx, |chat, _diff_message_id, window_cx| {
+        flush_layout(window_cx);
+        window_cx.update(|_, app| {
+            chat.update(app, |view, cx| {
+                view.debug_message_set_scroll_offset(gpui::point(gpui::px(0.0), gpui::px(0.0)), cx)
+            })
+        });
         flush_layout(window_cx);
 
         let selectors = [
@@ -133,7 +139,13 @@ async fn chat_rows_have_no_overlap_or_large_gaps(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn chat_layout_keeps_input_visible_and_rows_wrapped(cx: &mut TestAppContext) {
-    with_chat_window(cx, |_chat, _diff_message_id, window_cx| {
+    with_chat_window(cx, |chat, _diff_message_id, window_cx| {
+        flush_layout(window_cx);
+        window_cx.update(|_, app| {
+            chat.update(app, |view, cx| {
+                view.debug_message_set_scroll_offset(gpui::point(gpui::px(0.0), gpui::px(0.0)), cx)
+            })
+        });
         flush_layout(window_cx);
 
         let root = window_cx
@@ -221,6 +233,12 @@ async fn chat_list_scrolls_vertically_only(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn diff_view_is_rendered(cx: &mut TestAppContext) {
     with_chat_window(cx, |chat, _diff_message_id, window_cx| {
+        flush_layout(window_cx);
+        window_cx.update(|_, app| {
+            chat.update(app, |view, cx| {
+                view.debug_message_set_scroll_offset(gpui::point(gpui::px(0.0), gpui::px(0.0)), cx)
+            })
+        });
         flush_layout(window_cx);
 
         assert!(window_cx.debug_bounds("chat-diff-input").is_some());
@@ -370,11 +388,11 @@ async fn scroll_wheel_over_list_does_not_panic(cx: &mut TestAppContext) {
     with_chat_window(cx, |chat, _diff_message_id, window_cx| {
         flush_layout(window_cx);
 
-        // Find a point inside the rendered list so the scroll event reaches it.
+        // Find a point inside the list viewport so the scroll event reaches it.
         let list_point = window_cx
-            .debug_bounds("chat-row-0")
+            .debug_bounds("chat-message-list-scrollable")
             .map(|b| b.origin + gpui::point(gpui::px(10.), gpui::px(10.)))
-            .expect("chat-row-0 should be visible");
+            .expect("chat message list should be visible");
 
         // Simulate the user scrolling up — this previously panicked with
         // "RefCell already mutably borrowed" because the scroll_handler called

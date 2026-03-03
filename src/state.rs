@@ -1,4 +1,4 @@
-use gpui::{Context, Task};
+use gpui::{Context, Pixels, Point, Task};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
@@ -53,6 +53,10 @@ struct ThreadState {
     prompt_started_at: Option<Instant>,
     /// Agent selected for this thread but not yet connected (pre-first-message).
     selected_agent_name: Option<String>,
+    /// UI State (Not persisted)
+    draft_message: Option<String>,
+    scroll_offset: Option<Point<Pixels>>,
+    locked_to_bottom: bool,
 }
 
 impl ThreadState {
@@ -72,6 +76,9 @@ impl ThreadState {
             mode: None,
             prompt_started_at: None,
             selected_agent_name: None,
+            draft_message: None,
+            scroll_offset: None,
+            locked_to_bottom: true,
         }
     }
 }
@@ -318,6 +325,32 @@ impl AppState {
         self.persist_state();
         cx.notify();
         true
+    }
+
+    pub fn update_thread_draft(&mut self, thread_id: Uuid, draft: String) {
+        let ts = self.ts_mut(thread_id);
+        ts.draft_message = if draft.is_empty() { None } else { Some(draft) };
+    }
+
+    pub fn thread_draft(&self, thread_id: Uuid) -> Option<String> {
+        self.ts(thread_id).and_then(|ts| ts.draft_message.clone())
+    }
+
+    pub fn update_thread_scroll_state(
+        &mut self,
+        thread_id: Uuid,
+        offset: Point<Pixels>,
+        locked: bool,
+    ) {
+        let ts = self.ts_mut(thread_id);
+        ts.scroll_offset = Some(offset);
+        ts.locked_to_bottom = locked;
+    }
+
+    pub fn thread_scroll_state(&self, thread_id: Uuid) -> (Option<Point<Pixels>>, bool) {
+        self.ts(thread_id)
+            .map(|ts| (ts.scroll_offset, ts.locked_to_bottom))
+            .unwrap_or((None, true))
     }
 
     pub fn delete_thread(&mut self, cx: &mut Context<Self>, thread_id: Uuid) -> bool {

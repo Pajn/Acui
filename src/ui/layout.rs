@@ -4,6 +4,7 @@ use crate::ui::plan_sidebar::PlanSidebarView;
 use crate::ui::sidebar::SidebarView;
 use gpui::prelude::*;
 use gpui::*;
+use gpui_component::resizable::{h_resizable, resizable_panel};
 
 pub struct WorkspaceLayout {
     app_state: Entity<AppState>,
@@ -39,13 +40,24 @@ impl Render for WorkspaceLayout {
             .read(cx)
             .active_thread_plan()
             .is_some_and(|plan| !plan.entries.is_empty());
+
+        let main_area = div().flex_1().min_w(px(0.0)).h_full().child(
+            h_resizable("workspace-main-resize")
+                .child(
+                    resizable_panel()
+                        .size(px(260.0))
+                        .size_range(px(180.0)..px(360.0))
+                        .child(self.sidebar.clone()),
+                )
+                .child(resizable_panel().child(self.chat.clone())),
+        );
+
         let root = div()
             .flex()
             .flex_row()
             .size_full()
             .bg(rgb(0x1e1e1e))
-            .child(self.sidebar.clone())
-            .child(self.chat.clone());
+            .child(main_area);
         if show_plan {
             root.child(self.plan_sidebar.clone())
         } else {
