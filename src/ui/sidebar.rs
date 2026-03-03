@@ -256,6 +256,7 @@ impl Render for SidebarView {
                                 let rename_thread_name = thread.name.clone();
                                 let is_renaming = self.renaming_thread_id == Some(thread_id);
                                 let rename_input = self.rename_input.clone();
+                                let can_fork = self.app_state.read(cx).thread_can_fork(thread_id);
                                 let sidebar = cx.entity();
                                 let trailing = if has_unread_stop {
                                     div()
@@ -369,31 +370,58 @@ impl Render for SidebarView {
                                         let sidebar = sidebar.clone();
                                         let rename_thread_name = rename_thread_name.clone();
                                         move |menu, _, _| {
-                                            menu.item(PopupMenuItem::new("Rename").on_click({
-                                                let sidebar = sidebar.clone();
-                                                let rename_thread_name = rename_thread_name.clone();
-                                                move |_, window, cx| {
-                                                    sidebar.update(cx, |this, cx| {
-                                                        this.begin_rename(
-                                                            thread_id,
-                                                            rename_thread_name.clone(),
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    });
-                                                }
-                                            }))
-                                            .item(PopupMenuItem::new("Delete thread").on_click({
-                                                let sidebar = sidebar.clone();
-                                                move |_, _, cx| {
-                                                    sidebar.update(cx, |this, cx| {
-                                                        this.app_state.update(cx, |state, cx| {
-                                                            let _ =
-                                                                state.delete_thread(cx, thread_id);
+                                            let mut menu =
+                                                menu.item(PopupMenuItem::new("Rename").on_click({
+                                                    let sidebar = sidebar.clone();
+                                                    let rename_thread_name =
+                                                        rename_thread_name.clone();
+                                                    move |_, window, cx| {
+                                                        sidebar.update(cx, |this, cx| {
+                                                            this.begin_rename(
+                                                                thread_id,
+                                                                rename_thread_name.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
                                                         });
-                                                    });
-                                                }
-                                            }))
+                                                    }
+                                                }));
+                                            if can_fork {
+                                                menu = menu.item(
+                                                    PopupMenuItem::new("Fork").on_click({
+                                                        let sidebar = sidebar.clone();
+                                                        move |_, _, cx| {
+                                                            sidebar.update(cx, |this, cx| {
+                                                                this.app_state.update(
+                                                                    cx,
+                                                                    |state, cx| {
+                                                                        state.fork_thread(
+                                                                            cx, thread_id,
+                                                                        );
+                                                                    },
+                                                                );
+                                                            });
+                                                        }
+                                                    }),
+                                                );
+                                            }
+                                            menu.item(PopupMenuItem::new("Delete thread").on_click(
+                                                {
+                                                    let sidebar = sidebar.clone();
+                                                    move |_, _, cx| {
+                                                        sidebar.update(cx, |this, cx| {
+                                                            this.app_state.update(
+                                                                cx,
+                                                                |state, cx| {
+                                                                    let _ = state.delete_thread(
+                                                                        cx, thread_id,
+                                                                    );
+                                                                },
+                                                            );
+                                                        });
+                                                    }
+                                                },
+                                            ))
                                             .item(
                                                 PopupMenuItem::new("Mark as unread").on_click({
                                                     let sidebar = sidebar.clone();

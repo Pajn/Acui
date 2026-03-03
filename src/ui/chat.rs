@@ -1,9 +1,12 @@
 use crate::domain::{MessageContent, Role};
 use crate::state::AppState;
-use agent_client_protocol::{AvailableCommand, SessionModeState};
+use agent_client_protocol::{
+    AvailableCommand, Cost, SessionModeState, SessionModelState, UsageUpdate,
+};
 use gpui::prelude::*;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState, RopeExt};
+use gpui_component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_component::skeleton::Skeleton;
 use gpui_component::text::TextView;
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
@@ -26,6 +29,33 @@ enum SuggestionKind {
 struct SuggestionItem {
     display: String,
     replacement: String,
+}
+
+#[derive(Clone)]
+struct PickerOption {
+    value: String,
+    label: String,
+}
+
+impl PickerOption {
+    fn new(value: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            label: label.into(),
+        }
+    }
+}
+
+impl SelectItem for PickerOption {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.label.clone().into()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.value
+    }
 }
 
 struct SuggestionState {
@@ -86,6 +116,8 @@ pub struct ChatView {
     listed_count: usize,
     suggestion_scroll_handle: ScrollHandle,
     input_state: Entity<InputState>,
+    mode_select_state: Entity<SelectState<Vec<PickerOption>>>,
+    model_select_state: Entity<SelectState<Vec<PickerOption>>>,
     locked_to_bottom: bool,
     render_pending: bool,
     // Set by the list scroll_handler (fired while list_state is borrow_mut'd)
@@ -107,6 +139,10 @@ impl ChatView {
                 .auto_grow(1, 10)
                 .placeholder("Type and press Enter to send, Shift+Enter for new line...")
         });
+        let mode_select_state =
+            cx.new(|cx| SelectState::new(Vec::<PickerOption>::new(), None, window, cx));
+        let model_select_state =
+            cx.new(|cx| SelectState::new(Vec::<PickerOption>::new(), None, window, cx));
 
         cx.observe(&app_state, |this, _, cx| {
             if this.locked_to_bottom {
@@ -153,6 +189,36 @@ impl ChatView {
                     }
 
                     cx.notify();
+                }
+            },
+        )
+        .detach();
+
+        cx.subscribe(
+            &mode_select_state,
+            |this, _state, event: &SelectEvent<Vec<PickerOption>>, cx| {
+                let SelectEvent::Confirm(Some(mode_id)) = event else {
+                    return;
+                };
+                if let Some(thread_id) = this.app_state.read(cx).active_thread_id {
+                    this.app_state.update(cx, |state, cx| {
+                        state.set_session_mode(cx, thread_id, mode_id.clone());
+                    });
+                }
+            },
+        )
+        .detach();
+
+        cx.subscribe(
+            &model_select_state,
+            |this, _state, event: &SelectEvent<Vec<PickerOption>>, cx| {
+                let SelectEvent::Confirm(Some(model_id)) = event else {
+                    return;
+                };
+                if let Some(thread_id) = this.app_state.read(cx).active_thread_id {
+                    this.app_state.update(cx, |state, cx| {
+                        state.set_session_model(cx, thread_id, model_id.clone());
+                    });
                 }
             },
         )
@@ -236,6 +302,8 @@ impl ChatView {
             listed_count: 0,
             suggestion_scroll_handle: ScrollHandle::new(),
             input_state,
+            mode_select_state,
+            model_select_state,
             locked_to_bottom: true,
             render_pending: false,
             user_scrolled: false,
@@ -388,9 +456,7 @@ impl ChatView {
                 slash_suggestion_items(&commands, &query)
             }
             SuggestionKind::File => {
-                let Some(thread_id) = self.app_state.read(cx).active_thread_id else {
-                    return None;
-                };
+                let thread_id = self.app_state.read(cx).active_thread_id?;
                 let files = self
                     .app_state
                     .read(cx)
@@ -942,6 +1008,8 @@ impl Render for ChatView {
             permission_options,
             config_options,
             modes,
+            models,
+            usage,
             is_working,
             configured_agents,
             selected_agent,
@@ -955,6 +1023,8 @@ impl Render for ChatView {
                 state.active_thread_permission_options(),
                 state.active_thread_config_options(),
                 state.active_thread_modes(),
+                state.active_thread_models(),
+                state.active_thread_usage(),
                 state.active_thread_is_working(),
                 state.configured_agents().to_vec(),
                 state.active_thread_selected_agent(),
@@ -1101,6 +1171,56 @@ impl Render for ChatView {
                 .into_any_element()
         };
 
+        let usage_footer = usage.map(|usage| {
+            let percent = usage_progress_percent(&usage);
+            let progress_color = if percent >= 90.0 {
+                rgb(0xd96b6b)
+            } else if percent >= 75.0 {
+                rgb(0xd9ad6b)
+            } else {
+                rgb(0x0e639c)
+            };
+            let percent_label = format!("{percent:.0}%");
+            div()
+                .id("chat-usage-indicator")
+                .w_full()
+                .flex()
+                .justify_end()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x8f8f8f))
+                        .child(format!("{} / {}", usage.used, usage.size)),
+                )
+                .when_some(format_cost_label(usage.cost.as_ref()), |this, label| {
+                    this.child(
+                        div()
+                            .id("chat-usage-cost")
+                            .text_xs()
+                            .text_color(rgb(0xb8b8b8))
+                            .child(label),
+                    )
+                })
+                .child(
+                    div()
+                        .id("chat-usage-progress-circle")
+                        .w(px(34.0))
+                        .h(px(34.0))
+                        .rounded_full()
+                        .border_2()
+                        .border_color(progress_color)
+                        .bg(rgb(0x252526))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .text_color(white())
+                        .child(percent_label),
+                )
+        });
+
         let input_box = div()
             .debug_selector(|| "chat-input-box".to_string())
             .w_full()
@@ -1109,30 +1229,38 @@ impl Render for ChatView {
             .border_t_1()
             .border_color(rgb(0x3c3c3c))
             .flex()
+            .flex_col()
             .gap_2()
-            .items_end()
             .child(
                 div()
-                    .flex_1()
-                    .min_h(px(36.0))
-                    .max_h(px(250.0))
-                    .child(Input::new(&self.input_state)),
+                    .w_full()
+                    .flex()
+                    .gap_2()
+                    .items_end()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(36.0))
+                            .max_h(px(250.0))
+                            .child(Input::new(&self.input_state)),
+                    )
+                    .child(
+                        div()
+                            .id("send-button")
+                            .debug_selector(|| "chat-send-button".to_string())
+                            .bg(rgb(0x0e639c))
+                            .text_color(white())
+                            .rounded_md()
+                            .px_3()
+                            .py_2()
+                            .cursor_pointer()
+                            .child("Send")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_input(window, cx);
+                            })),
+                    ),
             )
-            .child(
-                div()
-                    .id("send-button")
-                    .debug_selector(|| "chat-send-button".to_string())
-                    .bg(rgb(0x0e639c))
-                    .text_color(white())
-                    .rounded_md()
-                    .px_3()
-                    .py_2()
-                    .cursor_pointer()
-                    .child("Send")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.submit_input(window, cx);
-                    })),
-            );
+            .children(usage_footer);
 
         let suggestion_panel = if let Some(suggestions) = self.compute_suggestions(cx) {
             self.suggestion_scroll_handle
@@ -1245,40 +1373,61 @@ impl Render for ChatView {
             _ => div(),
         };
 
+        let model_panel = match (active_thread_id, models) {
+            (
+                Some(_thread_id),
+                Some(SessionModelState {
+                    current_model_id,
+                    available_models,
+                    ..
+                }),
+            ) if !available_models.is_empty() => {
+                let options = available_models
+                    .into_iter()
+                    .map(|model| PickerOption::new(model.model_id.to_string(), model.name))
+                    .collect::<Vec<_>>();
+                let current_model_id = current_model_id.to_string();
+                self.model_select_state.update(cx, |state, cx| {
+                    state.set_items(options, _window, cx);
+                    state.set_selected_value(&current_model_id, _window, cx);
+                });
+                div()
+                    .w_full()
+                    .p_2()
+                    .bg(rgb(0x1f2933))
+                    .border_t_1()
+                    .border_color(rgb(0x3c3c3c))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().text_color(rgb(0xdddddd)).child("Session model"))
+                    .child(
+                        div()
+                            .id("chat-model-select")
+                            .child(Select::new(&self.model_select_state).menu_width(px(260.0))),
+                    )
+            }
+            _ => div(),
+        };
+
         let mode_panel = match (active_thread_id, modes) {
             (
-                Some(thread_id),
+                Some(_thread_id),
                 Some(SessionModeState {
                     current_mode_id,
                     available_modes,
                     ..
                 }),
             ) if !available_modes.is_empty() => {
-                let buttons = available_modes
+                let options = available_modes
                     .into_iter()
-                    .enumerate()
-                    .map(|(index, mode)| {
-                        let is_current = mode.id == current_mode_id;
-                        let mode_id = mode.id.to_string();
-                        div()
-                            .id(("session-mode", index))
-                            .bg(if is_current {
-                                rgb(0x0e639c)
-                            } else {
-                                rgb(0x3c3c3c)
-                            })
-                            .text_color(white())
-                            .rounded_md()
-                            .px_2()
-                            .py_1()
-                            .cursor_pointer()
-                            .child(mode.name)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.app_state.update(cx, |state, cx| {
-                                    state.set_session_mode(cx, thread_id, mode_id.clone());
-                                });
-                            }))
-                    });
+                    .map(|mode| PickerOption::new(mode.id.to_string(), mode.name))
+                    .collect::<Vec<_>>();
+                let current_mode_id = current_mode_id.to_string();
+                self.mode_select_state.update(cx, |state, cx| {
+                    state.set_items(options, _window, cx);
+                    state.set_selected_value(&current_mode_id, _window, cx);
+                });
                 div()
                     .w_full()
                     .p_2()
@@ -1289,7 +1438,11 @@ impl Render for ChatView {
                     .flex_col()
                     .gap_2()
                     .child(div().text_color(rgb(0xdddddd)).child("Session mode"))
-                    .child(div().flex().gap_1().flex_wrap().children(buttons))
+                    .child(
+                        div()
+                            .id("chat-mode-select")
+                            .child(Select::new(&self.mode_select_state).menu_width(px(220.0))),
+                    )
             }
             _ => div(),
         };
@@ -1297,72 +1450,76 @@ impl Render for ChatView {
         // Agent panel: shown below the input when there are configured agents.
         // - Thread unlocked: clickable selector buttons (one per configured agent).
         // - Thread locked: static label showing which agent is in use.
-        let agent_panel = if active_thread_id.is_some() && !configured_agents.is_empty() {
-            let panel_content: AnyElement = if is_agent_locked {
-                // Static label
-                let label = locked_agent
-                    .as_deref()
-                    .unwrap_or("unknown agent")
-                    .to_string();
+        let agent_panel = if !configured_agents.is_empty() {
+            if let Some(thread_id) = active_thread_id {
+                let panel_content: AnyElement = if is_agent_locked {
+                    // Static label
+                    let label = locked_agent
+                        .as_deref()
+                        .unwrap_or("unknown agent")
+                        .to_string();
+                    div()
+                        .flex()
+                        .gap_2()
+                        .items_center()
+                        .child(div().text_color(rgb(0x888888)).child("Agent"))
+                        .child(div().text_color(rgb(0xdddddd)).child(label))
+                        .into_any_element()
+                } else {
+                    // Clickable agent selector buttons
+                    let buttons =
+                        configured_agents
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, agent)| {
+                                let agent_name = agent.name.clone();
+                                let is_selected = selected_agent.as_deref() == Some(&agent_name);
+                                div()
+                                    .id(("agent-selector", index))
+                                    .bg(if is_selected {
+                                        rgb(0x0e639c)
+                                    } else {
+                                        rgb(0x3c3c3c)
+                                    })
+                                    .text_color(white())
+                                    .rounded_md()
+                                    .px_2()
+                                    .py_1()
+                                    .cursor_pointer()
+                                    .child(agent.name)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.app_state.update(cx, |state, cx| {
+                                            state.select_agent_for_thread(
+                                                cx,
+                                                thread_id,
+                                                agent_name.clone(),
+                                            );
+                                        });
+                                    }))
+                                    .into_any_element()
+                            });
+                    div()
+                        .flex()
+                        .gap_1()
+                        .flex_wrap()
+                        .children(buttons)
+                        .into_any_element()
+                };
+
                 div()
+                    .w_full()
+                    .p_2()
+                    .bg(rgb(0x1f2933))
+                    .border_t_1()
+                    .border_color(rgb(0x3c3c3c))
                     .flex()
                     .gap_2()
                     .items_center()
-                    .child(div().text_color(rgb(0x888888)).child("Agent"))
-                    .child(div().text_color(rgb(0xdddddd)).child(label))
-                    .into_any_element()
+                    .child(div().text_color(rgb(0x888888)).child("Agent:"))
+                    .child(panel_content)
             } else {
-                // Clickable agent selector buttons
-                let thread_id = active_thread_id.unwrap();
-                let buttons = configured_agents
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, agent)| {
-                        let agent_name = agent.name.clone();
-                        let is_selected = selected_agent.as_deref() == Some(&agent_name);
-                        div()
-                            .id(("agent-selector", index))
-                            .bg(if is_selected {
-                                rgb(0x0e639c)
-                            } else {
-                                rgb(0x3c3c3c)
-                            })
-                            .text_color(white())
-                            .rounded_md()
-                            .px_2()
-                            .py_1()
-                            .cursor_pointer()
-                            .child(agent.name)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.app_state.update(cx, |state, cx| {
-                                    state.select_agent_for_thread(
-                                        cx,
-                                        thread_id,
-                                        agent_name.clone(),
-                                    );
-                                });
-                            }))
-                            .into_any_element()
-                    });
                 div()
-                    .flex()
-                    .gap_1()
-                    .flex_wrap()
-                    .children(buttons)
-                    .into_any_element()
-            };
-
-            div()
-                .w_full()
-                .p_2()
-                .bg(rgb(0x1f2933))
-                .border_t_1()
-                .border_color(rgb(0x3c3c3c))
-                .flex()
-                .gap_2()
-                .items_center()
-                .child(div().text_color(rgb(0x888888)).child("Agent:"))
-                .child(panel_content)
+            }
         } else {
             div()
         };
@@ -1381,9 +1538,22 @@ impl Render for ChatView {
             .child(suggestion_panel)
             .child(input_box)
             .child(agent_panel)
+            .child(model_panel)
             .child(mode_panel)
             .child(config_panel)
     }
+}
+
+fn usage_progress_percent(usage: &UsageUpdate) -> f32 {
+    if usage.size == 0 {
+        return 0.0;
+    }
+    ((usage.used as f32 / usage.size as f32) * 100.0).clamp(0.0, 100.0)
+}
+
+fn format_cost_label(cost: Option<&Cost>) -> Option<String> {
+    let cost = cost?;
+    Some(format!("{:.2} {}", cost.amount, cost.currency))
 }
 
 fn slash_suggestion_items(commands: &[AvailableCommand], query: &str) -> Vec<SuggestionItem> {
