@@ -1,11 +1,13 @@
 use agent_client_protocol::{
-    self as acp, Agent, ClientSideConnection, ContentBlock, CreateTerminalRequest,
-    CreateTerminalResponse, InitializeRequest, KillTerminalCommandRequest,
-    KillTerminalCommandResponse, LoadSessionRequest, NewSessionRequest, PromptRequest,
-    ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, SessionConfigId,
-    SessionConfigOption, SessionConfigValueId, SessionId, SessionModeId, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    self as acp, Agent, AgentCapabilities, ClientSideConnection, ContentBlock,
+    CreateTerminalRequest, CreateTerminalResponse, ForkSessionRequest, InitializeRequest,
+    KillTerminalCommandRequest, KillTerminalCommandResponse, ListSessionsRequest,
+    LoadSessionRequest, ModelId, NewSessionRequest, PromptRequest, ReadTextFileRequest,
+    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResumeSessionRequest, SessionConfigId, SessionConfigOption, SessionConfigValueId, SessionId,
+    SessionInfo, SessionModeId, SessionModeState, SessionModelState, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest,
     StopReason, TerminalExitStatus, TerminalOutputRequest, TerminalOutputResponse,
     WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
     WriteTextFileResponse,
@@ -468,6 +470,14 @@ fn terminal_exit_status_from(status: std::process::ExitStatus) -> TerminalExitSt
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionBootstrap {
+    pub session_id: SessionId,
+    pub config_options: Vec<SessionConfigOption>,
+    pub modes: Option<SessionModeState>,
+    pub models: Option<SessionModelState>,
+}
+
 /// Controller over an ACP client-side connection.
 pub struct AcpController {
     pub connection: ClientSideConnection,
@@ -530,39 +540,82 @@ impl AcpController {
         Ok(Self { connection })
     }
 
-    pub async fn initialize_session(
-        &self,
-        cwd: impl Into<PathBuf>,
-    ) -> anyhow::Result<(
-        SessionId,
-        Vec<SessionConfigOption>,
-        Option<SessionModeState>,
-    )> {
-        let _ = self.connection.initialize(acp_initialize_request()).await?;
+    pub async fn initialize(&self) -> anyhow::Result<AgentCapabilities> {
+        let response = self.connection.initialize(acp_initialize_request()).await?;
+        Ok(response.agent_capabilities)
+    }
 
+    pub async fn new_session(&self, cwd: impl Into<PathBuf>) -> anyhow::Result<SessionBootstrap> {
         let response = self
             .connection
             .new_session(NewSessionRequest::new(cwd.into()))
             .await?;
-
-        Ok((
-            response.session_id,
-            response.config_options.unwrap_or_default(),
-            response.modes,
-        ))
+        Ok(SessionBootstrap {
+            session_id: response.session_id,
+            config_options: response.config_options.unwrap_or_default(),
+            modes: response.modes,
+            models: response.models,
+        })
     }
 
     pub async fn load_session(
         &self,
         session_id: SessionId,
         cwd: impl Into<PathBuf>,
-    ) -> anyhow::Result<(Vec<SessionConfigOption>, Option<SessionModeState>)> {
-        let _ = self.connection.initialize(acp_initialize_request()).await?;
+    ) -> anyhow::Result<SessionBootstrap> {
         let response = self
             .connection
-            .load_session(LoadSessionRequest::new(session_id, cwd.into()))
+            .load_session(LoadSessionRequest::new(session_id.clone(), cwd.into()))
             .await?;
-        Ok((response.config_options.unwrap_or_default(), response.modes))
+        Ok(SessionBootstrap {
+            session_id,
+            config_options: response.config_options.unwrap_or_default(),
+            modes: response.modes,
+            models: response.models,
+        })
+    }
+
+    pub async fn resume_session(
+        &self,
+        session_id: SessionId,
+        cwd: impl Into<PathBuf>,
+    ) -> anyhow::Result<SessionBootstrap> {
+        let response = self
+            .connection
+            .resume_session(ResumeSessionRequest::new(session_id.clone(), cwd.into()))
+            .await?;
+        Ok(SessionBootstrap {
+            session_id,
+            config_options: response.config_options.unwrap_or_default(),
+            modes: response.modes,
+            models: response.models,
+        })
+    }
+
+    pub async fn list_sessions(&self, cwd: Option<PathBuf>) -> anyhow::Result<Vec<SessionInfo>> {
+        let mut request = ListSessionsRequest::new();
+        if let Some(cwd) = cwd {
+            request = request.cwd(cwd);
+        }
+        let response = self.connection.list_sessions(request).await?;
+        Ok(response.sessions)
+    }
+
+    pub async fn fork_session(
+        &self,
+        session_id: SessionId,
+        cwd: impl Into<PathBuf>,
+    ) -> anyhow::Result<SessionBootstrap> {
+        let response = self
+            .connection
+            .fork_session(ForkSessionRequest::new(session_id, cwd.into()))
+            .await?;
+        Ok(SessionBootstrap {
+            session_id: response.session_id,
+            config_options: response.config_options.unwrap_or_default(),
+            modes: response.modes,
+            models: response.models,
+        })
     }
 
     pub async fn set_session_config_option(
@@ -598,6 +651,18 @@ impl AcpController {
         let _ = self
             .connection
             .set_session_mode(SetSessionModeRequest::new(session_id, mode_id))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_session_model(
+        &self,
+        session_id: SessionId,
+        model_id: ModelId,
+    ) -> anyhow::Result<()> {
+        let _ = self
+            .connection
+            .set_session_model(SetSessionModelRequest::new(session_id, model_id))
             .await?;
         Ok(())
     }

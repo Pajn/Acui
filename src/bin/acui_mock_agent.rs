@@ -1,14 +1,18 @@
 use agent_client_protocol::{
-    self as acp, Agent, AgentSideConnection, AuthenticateRequest, AuthenticateResponse,
-    AvailableCommand, AvailableCommandsUpdate, CancelNotification, Client, ContentBlock,
-    ContentChunk, CurrentModeUpdate, Implementation, InitializeRequest, InitializeResponse,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-    PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    PromptRequest, PromptResponse, ReadTextFileRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionConfigOption, SessionConfigSelectOption, SessionMode,
-    SessionModeId, SessionModeState, SessionNotification, SessionUpdate, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, WaitForTerminalExitRequest, WriteTextFileRequest,
+    self as acp, Agent, AgentCapabilities, AgentSideConnection, AuthenticateRequest,
+    AuthenticateResponse, AvailableCommand, AvailableCommandsUpdate, CancelNotification, Client,
+    ContentBlock, ContentChunk, Cost, CurrentModeUpdate, ForkSessionRequest, ForkSessionResponse,
+    Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, ModelId, ModelInfo,
+    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse, ReadTextFileRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
+    ResumeSessionResponse, SessionCapabilities, SessionConfigOption, SessionConfigSelectOption,
+    SessionForkCapabilities, SessionInfo, SessionListCapabilities, SessionMode, SessionModeId,
+    SessionModeState, SessionModelState, SessionNotification, SessionResumeCapabilities,
+    SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest,
+    SetSessionModelResponse, StopReason, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UsageUpdate, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use async_trait::async_trait;
 use std::cell::RefCell;
@@ -21,6 +25,8 @@ struct MockAgent {
     client: Rc<RefCell<Option<Rc<AgentSideConnection>>>>,
     cwd: PathBuf,
     session_modes: Rc<RefCell<HashMap<String, String>>>,
+    session_models: Rc<RefCell<HashMap<String, String>>>,
+    session_cwds: Rc<RefCell<HashMap<String, PathBuf>>>,
 }
 
 impl MockAgent {
@@ -30,6 +36,27 @@ impl MockAgent {
             .as_ref()
             .cloned()
             .ok_or_else(acp::Error::internal_error)
+    }
+
+    fn maybe_seed_session(&self) {
+        if std::env::var("ACUI_MOCK_SEED_SESSION").as_deref() != Ok("1") {
+            return;
+        }
+        let session_id = std::env::var("ACUI_MOCK_SEED_SESSION_ID")
+            .unwrap_or_else(|_| "mock-seeded-session".to_string());
+        let cwd = std::env::var("ACUI_MOCK_SEED_CWD")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| self.cwd.clone());
+        if self.session_cwds.borrow().contains_key(&session_id) {
+            return;
+        }
+        self.session_modes
+            .borrow_mut()
+            .insert(session_id.clone(), "ask".to_string());
+        self.session_models
+            .borrow_mut()
+            .insert(session_id.clone(), "gpt-5".to_string());
+        self.session_cwds.borrow_mut().insert(session_id, cwd);
     }
 
     async fn send_text(
@@ -210,36 +237,145 @@ impl MockAgent {
 #[async_trait(?Send)]
 impl Agent for MockAgent {
     async fn initialize(&self, args: InitializeRequest) -> acp::Result<InitializeResponse> {
+        self.maybe_seed_session();
+        let load_session = std::env::var("ACUI_MOCK_DISABLE_LOAD").as_deref() != Ok("1");
         Ok(InitializeResponse::new(args.protocol_version)
-            .agent_info(Implementation::new("acui-mock-agent", "0.1.0")))
+            .agent_info(Implementation::new("acui-mock-agent", "0.1.0"))
+            .agent_capabilities(
+                AgentCapabilities::new()
+                    .load_session(load_session)
+                    .session_capabilities(
+                        SessionCapabilities::new()
+                            .list(SessionListCapabilities::new())
+                            .fork(SessionForkCapabilities::new())
+                            .resume(SessionResumeCapabilities::new()),
+                    ),
+            ))
     }
 
     async fn authenticate(&self, _args: AuthenticateRequest) -> acp::Result<AuthenticateResponse> {
         Ok(AuthenticateResponse::new())
     }
 
-    async fn new_session(&self, _args: NewSessionRequest) -> acp::Result<NewSessionResponse> {
+    async fn new_session(&self, args: NewSessionRequest) -> acp::Result<NewSessionResponse> {
         let session_id = acp::SessionId::new(format!("mock-session-{}", uuid::Uuid::new_v4()));
         self.session_modes
             .borrow_mut()
             .insert(session_id.to_string(), "ask".to_string());
+        self.session_models
+            .borrow_mut()
+            .insert(session_id.to_string(), "gpt-5".to_string());
+        self.session_cwds
+            .borrow_mut()
+            .insert(session_id.to_string(), args.cwd.clone());
         self.send_available_commands(&session_id).await?;
         Ok(NewSessionResponse::new(session_id.clone())
             .modes(mode_state("ask"))
+            .models(model_state("gpt-5"))
             .config_options(session_config_options("new")))
     }
 
     async fn load_session(&self, args: LoadSessionRequest) -> acp::Result<LoadSessionResponse> {
+        if std::env::var("ACUI_MOCK_DISABLE_LOAD").as_deref() == Ok("1") {
+            return Err(acp::Error::method_not_found());
+        }
         let current_mode = self
             .session_modes
             .borrow()
             .get(&args.session_id.to_string())
             .cloned()
             .unwrap_or_else(|| "ask".to_string());
+        let current_model = self
+            .session_models
+            .borrow()
+            .get(&args.session_id.to_string())
+            .cloned()
+            .unwrap_or_else(|| "gpt-5".to_string());
+        self.session_cwds
+            .borrow_mut()
+            .insert(args.session_id.to_string(), args.cwd.clone());
         self.send_available_commands(&args.session_id).await?;
         Ok(LoadSessionResponse::new()
             .modes(mode_state(current_mode))
+            .models(model_state(current_model))
             .config_options(session_config_options("loaded")))
+    }
+
+    async fn list_sessions(&self, args: ListSessionsRequest) -> acp::Result<ListSessionsResponse> {
+        let cwd_filter = args.cwd;
+        let sessions = self
+            .session_cwds
+            .borrow()
+            .iter()
+            .filter(|(_, cwd)| match cwd_filter.as_ref() {
+                Some(filter) => cwd.as_path() == filter.as_path(),
+                None => true,
+            })
+            .map(|(session_id, cwd)| {
+                SessionInfo::new(acp::SessionId::new(session_id.clone()), cwd.clone()).title(
+                    format!("Session {}", session_id.chars().take(8).collect::<String>()),
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(ListSessionsResponse::new(sessions))
+    }
+
+    async fn fork_session(&self, args: ForkSessionRequest) -> acp::Result<ForkSessionResponse> {
+        let new_session_id =
+            acp::SessionId::new(format!("mock-session-fork-{}", uuid::Uuid::new_v4()));
+        let source_session_id = args.session_id.to_string();
+        let mode = self
+            .session_modes
+            .borrow()
+            .get(&source_session_id)
+            .cloned()
+            .unwrap_or_else(|| "ask".to_string());
+        let model = self
+            .session_models
+            .borrow()
+            .get(&source_session_id)
+            .cloned()
+            .unwrap_or_else(|| "gpt-5".to_string());
+        self.session_modes
+            .borrow_mut()
+            .insert(new_session_id.to_string(), mode.clone());
+        self.session_models
+            .borrow_mut()
+            .insert(new_session_id.to_string(), model.clone());
+        self.session_cwds
+            .borrow_mut()
+            .insert(new_session_id.to_string(), args.cwd.clone());
+        Ok(ForkSessionResponse::new(new_session_id)
+            .modes(mode_state(mode))
+            .models(model_state(model))
+            .config_options(session_config_options("loaded")))
+    }
+
+    async fn resume_session(
+        &self,
+        args: ResumeSessionRequest,
+    ) -> acp::Result<ResumeSessionResponse> {
+        let session_key = args.session_id.to_string();
+        let current_mode = self
+            .session_modes
+            .borrow()
+            .get(&session_key)
+            .cloned()
+            .unwrap_or_else(|| "ask".to_string());
+        let current_model = self
+            .session_models
+            .borrow()
+            .get(&session_key)
+            .cloned()
+            .unwrap_or_else(|| "gpt-5".to_string());
+        self.session_cwds
+            .borrow_mut()
+            .insert(session_key, args.cwd.clone());
+        self.send_available_commands(&args.session_id).await?;
+        Ok(ResumeSessionResponse::new()
+            .modes(mode_state(current_mode))
+            .models(model_state(current_model))
+            .config_options(session_config_options("resumed")))
     }
 
     async fn set_session_mode(
@@ -258,12 +394,41 @@ impl Agent for MockAgent {
         Ok(SetSessionModeResponse::new())
     }
 
+    async fn set_session_model(
+        &self,
+        args: SetSessionModelRequest,
+    ) -> acp::Result<SetSessionModelResponse> {
+        self.session_models
+            .borrow_mut()
+            .insert(args.session_id.to_string(), args.model_id.to_string());
+        Ok(SetSessionModelResponse::new())
+    }
+
     async fn prompt(&self, args: PromptRequest) -> acp::Result<PromptResponse> {
         let prompt = prompt_text(&args.prompt);
         let trimmed = prompt.trim();
         if trimmed == "cwd" {
             self.send_text(&args.session_id, format!("cwd: {}", self.cwd.display()))
                 .await?;
+        } else if let Some(title) = trimmed.strip_prefix("title ").map(str::trim) {
+            self.client()?
+                .session_notification(SessionNotification::new(
+                    args.session_id.clone(),
+                    SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new().title(title)),
+                ))
+                .await?;
+            self.send_text(&args.session_id, format!("title set: {title}"))
+                .await?;
+        } else if trimmed == "usage" {
+            self.client()?
+                .session_notification(SessionNotification::new(
+                    args.session_id.clone(),
+                    SessionUpdate::UsageUpdate(
+                        UsageUpdate::new(42_000, 128_000).cost(Cost::new(1.23, "USD")),
+                    ),
+                ))
+                .await?;
+            self.send_text(&args.session_id, "usage updated").await?;
         } else if trimmed == "permission" {
             self.handle_permission_prompt(&args.session_id).await?;
         } else if trimmed == "terminal" {
@@ -342,6 +507,7 @@ fn session_config_options(current: &str) -> Vec<SessionConfigOption> {
         vec![
             SessionConfigSelectOption::new("new", "New"),
             SessionConfigSelectOption::new("loaded", "Loaded"),
+            SessionConfigSelectOption::new("resumed", "Resumed"),
         ],
     )]
 }
@@ -356,6 +522,16 @@ fn mode_state(current_mode: impl Into<SessionModeId>) -> SessionModeState {
     )
 }
 
+fn model_state(current_model: impl Into<ModelId>) -> SessionModelState {
+    SessionModelState::new(
+        current_model,
+        vec![
+            ModelInfo::new("gpt-5", "GPT-5"),
+            ModelInfo::new("gpt-5-mini", "GPT-5 Mini"),
+        ],
+    )
+}
+
 fn main() {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let client = Rc::new(RefCell::new(None));
@@ -363,6 +539,8 @@ fn main() {
         client: client.clone(),
         cwd,
         session_modes: Rc::new(RefCell::new(HashMap::new())),
+        session_models: Rc::new(RefCell::new(HashMap::new())),
+        session_cwds: Rc::new(RefCell::new(HashMap::new())),
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()

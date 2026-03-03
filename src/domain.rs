@@ -108,6 +108,8 @@ pub struct Thread {
     pub id: Uuid,
     pub workspace_id: Uuid,
     pub name: String,
+    #[serde(default)]
+    pub user_renamed: bool,
     /// The agent this thread is locked to after the first message is sent.
     pub agent_name: Option<String>,
     pub session_id: Option<String>,
@@ -123,6 +125,7 @@ impl Thread {
             id: Uuid::new_v4(),
             workspace_id,
             name: name.into(),
+            user_renamed: false,
             agent_name: None,
             session_id: None,
             messages: Vec::new(),
@@ -164,6 +167,8 @@ pub struct Workspace {
     pub id: Uuid,
     pub name: String,
     pub path: PathBuf,
+    #[serde(default)]
+    pub session_listed_agents: Vec<String>,
     pub threads: Vec<Thread>,
     pub created_at: DateTime<Utc>,
 }
@@ -174,6 +179,7 @@ impl Workspace {
             id: Uuid::new_v4(),
             name: name.into(),
             path: PathBuf::from("."),
+            session_listed_agents: Vec::new(),
             threads: Vec::new(),
             created_at: Utc::now(),
         }
@@ -189,6 +195,7 @@ impl Workspace {
             id: Uuid::new_v4(),
             name,
             path,
+            session_listed_agents: Vec::new(),
             threads: Vec::new(),
             created_at: Utc::now(),
         }

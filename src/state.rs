@@ -12,10 +12,12 @@ use crate::config::AppConfig;
 use crate::domain::{Message, MessageContent, Role, Thread, Workspace};
 use crate::persistence::AppPersistence;
 use agent_client_protocol::{
-    AvailableCommand, ContentBlock, ContentChunk, PermissionOption, PermissionOptionId, Plan,
-    RequestPermissionOutcome, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-    SessionConfigValueId, SessionId, SessionModeId, SessionModeState, SessionNotification,
-    SessionUpdate, StopReason, TerminalExitStatus, ToolCall, ToolCallUpdate,
+    AgentCapabilities, AvailableCommand, ContentBlock, ContentChunk, MaybeUndefined, ModelId,
+    PermissionOption, PermissionOptionId, Plan, RequestPermissionOutcome,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigValueId,
+    SessionId, SessionInfo, SessionModeId, SessionModeState, SessionModelState,
+    SessionNotification, SessionUpdate, StopReason, TerminalExitStatus, ToolCall, ToolCallUpdate,
+    UsageUpdate,
 };
 use ignore::WalkBuilder;
 use similar::TextDiff;
@@ -50,6 +52,9 @@ struct ThreadState {
     terminals: HashMap<String, ThreadTerminal>,
     plan: Option<Plan>,
     mode: Option<SessionModeState>,
+    model: Option<SessionModelState>,
+    usage: Option<UsageUpdate>,
+    capabilities: Option<AgentCapabilities>,
     prompt_started_at: Option<Instant>,
     /// Agent selected for this thread but not yet connected (pre-first-message).
     selected_agent_name: Option<String>,
@@ -74,6 +79,9 @@ impl ThreadState {
             terminals: HashMap::new(),
             plan: None,
             mode: None,
+            model: None,
+            usage: None,
+            capabilities: None,
             prompt_started_at: None,
             selected_agent_name: None,
             draft_message: None,
@@ -88,6 +96,8 @@ pub struct AppState {
     pub active_thread_id: Option<Uuid>,
     thread_state: HashMap<Uuid, ThreadState>,
     unread_stopped_threads: HashSet<Uuid>,
+    agent_capabilities: HashMap<String, AgentCapabilities>,
+    workspace_session_syncing: HashSet<(Uuid, String)>,
     log_file: Option<PathBuf>,
     persistence: Option<AppPersistence>,
     agents: Vec<crate::config::AgentConfig>,
@@ -131,6 +141,8 @@ impl AppState {
             active_thread_id: None,
             thread_state: HashMap::new(),
             unread_stopped_threads: HashSet::new(),
+            agent_capabilities: HashMap::new(),
+            workspace_session_syncing: HashSet::new(),
             log_file,
             persistence,
             agents,
@@ -168,6 +180,7 @@ impl AppState {
             self.connect_thread_to_agent(cx, thread_id, agent);
         }
 
+        self.sync_unsynced_workspace_sessions(cx);
         cx.notify();
         Ok(())
     }
@@ -186,6 +199,7 @@ impl AppState {
         let workspace = Workspace::new(name);
         let id = workspace.id;
         self.workspaces.push(workspace);
+        self.sync_workspace_sessions(cx, id);
         self.persist_state();
         cx.notify();
         id
@@ -195,6 +209,7 @@ impl AppState {
         let workspace = Workspace::from_path(path);
         let id = workspace.id;
         self.workspaces.push(workspace);
+        self.sync_workspace_sessions(cx, id);
         self.persist_state();
         cx.notify();
         id
@@ -321,6 +336,7 @@ impl AppState {
             return false;
         };
         thread.name = trimmed.to_string();
+        thread.user_renamed = true;
         thread.updated_at = chrono::Utc::now();
         self.persist_state();
         cx.notify();
@@ -439,6 +455,32 @@ impl AppState {
         self.ts(thread_id).and_then(|ts| ts.mode.clone())
     }
 
+    pub fn active_thread_models(&self) -> Option<SessionModelState> {
+        let thread_id = self.active_thread_id?;
+        self.ts(thread_id).and_then(|ts| ts.model.clone())
+    }
+
+    pub fn active_thread_usage(&self) -> Option<UsageUpdate> {
+        let thread_id = self.active_thread_id?;
+        self.ts(thread_id).and_then(|ts| ts.usage.clone())
+    }
+
+    pub fn thread_can_fork(&self, thread_id: Uuid) -> bool {
+        let Some(thread) = self.find_thread(thread_id) else {
+            return false;
+        };
+        if thread.session_id.is_none() {
+            return false;
+        }
+        let Some(agent_name) = thread.agent_name.as_ref() else {
+            return false;
+        };
+        self.agent_capabilities
+            .get(agent_name)
+            .and_then(|capabilities| capabilities.session_capabilities.fork.as_ref())
+            .is_some()
+    }
+
     pub fn terminal_transcript_for_thread(
         &self,
         thread_id: Uuid,
@@ -501,6 +543,195 @@ impl AppState {
         self.active_thread_id
             .and_then(|id| self.find_thread(id))
             .and_then(|t| t.agent_name.clone())
+    }
+
+    fn sync_unsynced_workspace_sessions(&mut self, cx: &mut Context<Self>) {
+        let workspace_ids: Vec<Uuid> = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id)
+            .collect();
+        for workspace_id in workspace_ids {
+            self.sync_workspace_sessions(cx, workspace_id);
+        }
+    }
+
+    fn sync_workspace_sessions(&mut self, cx: &mut Context<Self>, workspace_id: Uuid) {
+        let Some(workspace) = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+        else {
+            return;
+        };
+        if self.agents.is_empty() {
+            return;
+        }
+        let workspace_path = workspace.path.clone();
+        let agents_to_sync: Vec<_> = self
+            .agents
+            .iter()
+            .filter(|agent| !workspace.session_listed_agents.contains(&agent.name))
+            .filter(|agent| {
+                !self
+                    .workspace_session_syncing
+                    .contains(&(workspace_id, agent.name.clone()))
+            })
+            .cloned()
+            .collect();
+
+        for agent in agents_to_sync {
+            let agent_name = agent.name.clone();
+            self.workspace_session_syncing
+                .insert((workspace_id, agent_name.clone()));
+            let workspace_path = workspace_path.clone();
+            cx.spawn(
+                move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
+                    let mut cx = cx.clone();
+                    async move {
+                        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+                        let connect_result =
+                            AcpController::connect_from_agent_config(&agent, event_tx).await;
+                        let (controller, mut process) = match connect_result {
+                            Ok(pair) => pair,
+                            Err(_) => {
+                                let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                                    state
+                                        .workspace_session_syncing
+                                        .remove(&(workspace_id, agent_name.clone()));
+                                });
+                                return;
+                            }
+                        };
+
+                        let capabilities = match controller.initialize().await {
+                            Ok(capabilities) => capabilities,
+                            Err(_) => {
+                                let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                                    state
+                                        .workspace_session_syncing
+                                        .remove(&(workspace_id, agent_name.clone()));
+                                });
+                                let _ = process.kill();
+                                let _ = process.wait();
+                                return;
+                            }
+                        };
+
+                        let sessions_result = if capabilities.session_capabilities.list.is_some() {
+                            controller
+                                .list_sessions(Some(workspace_path.clone()))
+                                .await
+                                .map(Some)
+                        } else {
+                            Ok(None)
+                        };
+
+                        let _ = process.kill();
+                        let _ = process.wait();
+
+                        match sessions_result {
+                            Ok(sessions) => {
+                                let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                    state
+                                        .agent_capabilities
+                                        .insert(agent_name.clone(), capabilities.clone());
+                                    if let Some(sessions) = sessions {
+                                        for session in sessions {
+                                            state.upsert_listed_session_thread(
+                                                workspace_id,
+                                                &agent_name,
+                                                session,
+                                            );
+                                        }
+                                    }
+                                    state.mark_workspace_agent_synced(workspace_id, &agent_name);
+                                    state
+                                        .workspace_session_syncing
+                                        .remove(&(workspace_id, agent_name.clone()));
+                                    state.persist_state();
+                                    cx.notify();
+                                });
+                            }
+                            Err(_) => {
+                                let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                                    state
+                                        .workspace_session_syncing
+                                        .remove(&(workspace_id, agent_name.clone()));
+                                });
+                            }
+                        }
+                    }
+                },
+            )
+            .detach();
+        }
+    }
+
+    fn mark_workspace_agent_synced(&mut self, workspace_id: Uuid, agent_name: &str) {
+        let Some(workspace) = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+        else {
+            return;
+        };
+        if workspace
+            .session_listed_agents
+            .iter()
+            .any(|existing| existing == agent_name)
+        {
+            return;
+        }
+        workspace.session_listed_agents.push(agent_name.to_string());
+    }
+
+    fn upsert_listed_session_thread(
+        &mut self,
+        workspace_id: Uuid,
+        agent_name: &str,
+        session: SessionInfo,
+    ) {
+        let Some(workspace) = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+        else {
+            return;
+        };
+
+        let session_id = session.session_id.to_string();
+        if let Some(thread) = workspace.threads.iter_mut().find(|thread| {
+            thread.agent_name.as_deref() == Some(agent_name)
+                && thread.session_id.as_deref() == Some(session_id.as_str())
+        }) {
+            if !thread.user_renamed
+                && let Some(title) = session.title
+            {
+                let trimmed = title.trim();
+                if !trimmed.is_empty() {
+                    thread.name = trimmed.to_string();
+                }
+            }
+            return;
+        }
+
+        let mut thread_name = session.title.unwrap_or_else(|| {
+            let short_session = session_id.chars().take(8).collect::<String>();
+            format!("{agent_name}: {short_session}")
+        });
+        if thread_name.trim().is_empty() {
+            thread_name = format!("{agent_name}: {}", session_id);
+        }
+        let mut thread = Thread::new(workspace_id, thread_name);
+        let thread_id = thread.id;
+        thread.agent_name = Some(agent_name.to_string());
+        thread.session_id = Some(session_id);
+        workspace.add_thread(thread);
+        self.ts_mut(thread_id).selected_agent_name = Some(agent_name.to_string());
+        if self.active_thread_id.is_none() {
+            self.active_thread_id = Some(thread_id);
+        }
     }
 
     pub fn resolve_permission(
@@ -641,6 +872,204 @@ impl AppState {
         .detach();
     }
 
+    pub fn set_session_model(&mut self, cx: &mut Context<Self>, thread_id: Uuid, model_id: String) {
+        if self
+            .ts(thread_id)
+            .and_then(|ts| ts.model.as_ref())
+            .is_none()
+        {
+            return;
+        }
+        let conn_info = self
+            .ts(thread_id)
+            .and_then(|ts| ts.connection.as_ref())
+            .map(|conn| (Rc::clone(&conn.controller), conn.session_id.clone()));
+
+        let Some((controller, session_id)) = conn_info else {
+            return;
+        };
+
+        if let Some(models) = self.ts_mut(thread_id).model.as_mut() {
+            models.current_model_id = ModelId::new(model_id.clone());
+        }
+        cx.notify();
+
+        cx.spawn(
+            move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                        state.append_log_line("to_agent.set_session_model", thread_id, &model_id);
+                    });
+                    let result = controller
+                        .set_session_model(session_id, ModelId::new(model_id.clone()))
+                        .await;
+                    if let Err(err) = result {
+                        let message = format!("Failed to set session model: {err}");
+                        let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                            state.append_log_line(
+                                "from_agent.set_session_model_error",
+                                thread_id,
+                                &message,
+                            );
+                            state.push_system_message(cx, thread_id, message);
+                        });
+                    } else {
+                        let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                            state.append_log_line(
+                                "from_agent.set_session_model_ok",
+                                thread_id,
+                                &model_id,
+                            );
+                            cx.notify();
+                        });
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
+    pub fn fork_thread(&mut self, cx: &mut Context<Self>, thread_id: Uuid) {
+        let Some(thread) = self.find_thread(thread_id).cloned() else {
+            return;
+        };
+        let Some(session_id) = thread.session_id.clone() else {
+            return;
+        };
+        let Some(agent_name) = thread.agent_name.clone() else {
+            return;
+        };
+
+        let capabilities = self.agent_capabilities.get(&agent_name).cloned();
+        if capabilities
+            .as_ref()
+            .and_then(|caps| caps.session_capabilities.fork.as_ref())
+            .is_none()
+        {
+            return;
+        }
+
+        let source_thread_name = thread.name;
+        let workspace_id = thread.workspace_id;
+        let cwd = self
+            .workspace_cwd_for_thread(thread_id)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let connected_controller = self
+            .ts(thread_id)
+            .and_then(|ts| ts.connection.as_ref())
+            .map(|conn| Rc::clone(&conn.controller));
+        let agent = self
+            .agents
+            .iter()
+            .find(|candidate| candidate.name == agent_name)
+            .cloned();
+
+        cx.spawn(
+            move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let source_session_id = SessionId::new(session_id.clone());
+                    let mut active_capabilities = capabilities;
+                    let forked = if let Some(controller) = connected_controller {
+                        controller
+                            .fork_session(source_session_id, cwd.clone())
+                            .await
+                    } else {
+                        let Some(agent) = agent else {
+                            return;
+                        };
+                        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+                        let connect_result =
+                            AcpController::connect_from_agent_config(&agent, event_tx).await;
+                        let (controller, mut process) = match connect_result {
+                            Ok(pair) => pair,
+                            Err(err) => {
+                                let message = format!("Failed to connect ACP controller: {err}");
+                                let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                    state.push_system_message(cx, thread_id, message);
+                                });
+                                return;
+                            }
+                        };
+
+                        let capabilities = match controller.initialize().await {
+                            Ok(capabilities) => capabilities,
+                            Err(err) => {
+                                let _ = process.kill();
+                                let _ = process.wait();
+                                let message = format!("Failed to initialize ACP session: {err}");
+                                let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                    state.push_system_message(cx, thread_id, message);
+                                });
+                                return;
+                            }
+                        };
+                        if capabilities.session_capabilities.fork.is_none() {
+                            let _ = process.kill();
+                            let _ = process.wait();
+                            return;
+                        }
+                        active_capabilities = Some(capabilities);
+                        let response = controller
+                            .fork_session(source_session_id, cwd.clone())
+                            .await;
+                        let _ = process.kill();
+                        let _ = process.wait();
+                        response
+                    };
+
+                    match forked {
+                        Ok(forked) => {
+                            let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                let forked_thread_id = {
+                                    let Some(workspace) = state
+                                        .workspaces
+                                        .iter_mut()
+                                        .find(|workspace| workspace.id == workspace_id)
+                                    else {
+                                        return;
+                                    };
+                                    let mut forked_thread = Thread::new(
+                                        workspace_id,
+                                        format!("{source_thread_name} (fork)"),
+                                    );
+                                    let forked_thread_id = forked_thread.id;
+                                    forked_thread.agent_name = Some(agent_name.clone());
+                                    forked_thread.session_id = Some(forked.session_id.to_string());
+                                    workspace.add_thread(forked_thread);
+                                    forked_thread_id
+                                };
+                                state.active_thread_id = Some(forked_thread_id);
+                                let capability_for_thread = active_capabilities.clone();
+                                if let Some(capabilities) = capability_for_thread.as_ref() {
+                                    state
+                                        .agent_capabilities
+                                        .insert(agent_name.clone(), capabilities.clone());
+                                }
+                                let ts = state.ts_mut(forked_thread_id);
+                                ts.selected_agent_name = Some(agent_name.clone());
+                                ts.config_options = forked.config_options;
+                                ts.mode = forked.modes;
+                                ts.model = forked.models;
+                                ts.capabilities = capability_for_thread;
+                                state.persist_state();
+                                cx.notify();
+                            });
+                        }
+                        Err(err) => {
+                            let message = format!("Failed to fork ACP session: {err}");
+                            let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                state.push_system_message(cx, thread_id, message);
+                            });
+                        }
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
     pub fn send_user_message(&mut self, cx: &mut Context<Self>, thread_id: Uuid, content: &str) {
         if content.trim().is_empty() {
             return;
@@ -762,8 +1191,24 @@ impl AppState {
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
                         });
 
-                    let session_result = controller.initialize_session(cwd).await;
-                    let (session_id, config_options, modes) = match session_result {
+                    let capabilities = match controller.initialize().await {
+                        Ok(capabilities) => capabilities,
+                        Err(err) => {
+                            let message = format!("Failed to initialize ACP session: {err}");
+                            let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                state.append_log_line(
+                                    "from_agent.initialize_session_error",
+                                    thread_id,
+                                    &message,
+                                );
+                                state.ts_mut(thread_id).prompt_started_at = None;
+                                state.push_system_message(cx, thread_id, message);
+                            });
+                            return;
+                        }
+                    };
+
+                    let session = match controller.new_session(cwd).await {
                         Ok(data) => data,
                         Err(err) => {
                             let message = format!("Failed to initialize ACP session: {err}");
@@ -791,15 +1236,17 @@ impl AppState {
                         state.append_log_line(
                             "from_agent.initialize_session_ok",
                             thread_id,
-                            &session_id.to_string(),
+                            &session.session_id.to_string(),
                         );
+                        state
+                            .agent_capabilities
+                            .insert(agent.name.clone(), capabilities.clone());
                         state.attach_connection(
                             cx,
                             thread_id,
                             controller,
-                            session_id,
-                            config_options,
-                            modes,
+                            session,
+                            capabilities,
                             Some(process),
                             event_rx,
                         );
@@ -872,45 +1319,97 @@ impl AppState {
                             let cwd = cwd.unwrap_or_else(|| {
                                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
                             });
-                            let loaded_session_id = if let Some(session_id) = previous_session_id {
+                            let capabilities = match controller.initialize().await {
+                                Ok(capabilities) => capabilities,
+                                Err(err) => {
+                                    let message =
+                                        format!("Failed to initialize ACP session: {err}");
+                                    let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                        state.append_log_line(
+                                            "from_agent.initialize_session_error",
+                                            thread_id,
+                                            &message,
+                                        );
+                                        state.ts_mut(thread_id).connecting = false;
+                                        state.push_system_message(cx, thread_id, message);
+                                    });
+                                    return;
+                                }
+                            };
+
+                            let loaded_session = if let Some(session_id) = previous_session_id {
                                 let session_id = SessionId::new(session_id);
-                                let _ = this.update(&mut cx, |state: &mut AppState, _| {
-                                    state.append_log_line(
-                                        "to_agent.load_session",
-                                        thread_id,
-                                        &serde_json::json!({
-                                            "session_id": session_id.to_string(),
-                                            "cwd": cwd.clone(),
-                                        })
-                                        .to_string(),
-                                    );
-                                });
-                                match controller
-                                    .load_session(session_id.clone(), cwd.clone())
-                                    .await
-                                {
-                                    Ok((config_options, modes)) => {
-                                        Some((session_id, config_options, modes))
+                                if capabilities.load_session {
+                                    let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                                        state.append_log_line(
+                                            "to_agent.load_session",
+                                            thread_id,
+                                            &serde_json::json!({
+                                                "session_id": session_id.to_string(),
+                                                "cwd": cwd.clone(),
+                                            })
+                                            .to_string(),
+                                        );
+                                    });
+                                    match controller.load_session(session_id, cwd.clone()).await {
+                                        Ok(session) => Some(session),
+                                        Err(err) => {
+                                            let message =
+                                                format!("Failed to load ACP session: {err}");
+                                            let _ =
+                                                this.update(&mut cx, |state: &mut AppState, cx| {
+                                                    state.append_log_line(
+                                                        "from_agent.load_session_error",
+                                                        thread_id,
+                                                        &message,
+                                                    );
+                                                    state.push_system_message(
+                                                        cx, thread_id, message,
+                                                    );
+                                                });
+                                            None
+                                        }
                                     }
-                                    Err(err) => {
-                                        let message = format!("Failed to load ACP session: {err}");
-                                        let _ = this.update(&mut cx, |state: &mut AppState, cx| {
-                                            state.append_log_line(
-                                                "from_agent.load_session_error",
-                                                thread_id,
-                                                &message,
-                                            );
-                                            state.push_system_message(cx, thread_id, message);
-                                        });
-                                        None
+                                } else if capabilities.session_capabilities.resume.is_some() {
+                                    let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                                        state.append_log_line(
+                                            "to_agent.resume_session",
+                                            thread_id,
+                                            &serde_json::json!({
+                                                "session_id": session_id.to_string(),
+                                                "cwd": cwd.clone(),
+                                            })
+                                            .to_string(),
+                                        );
+                                    });
+                                    match controller.resume_session(session_id, cwd.clone()).await {
+                                        Ok(session) => Some(session),
+                                        Err(err) => {
+                                            let message =
+                                                format!("Failed to resume ACP session: {err}");
+                                            let _ =
+                                                this.update(&mut cx, |state: &mut AppState, cx| {
+                                                    state.append_log_line(
+                                                        "from_agent.resume_session_error",
+                                                        thread_id,
+                                                        &message,
+                                                    );
+                                                    state.push_system_message(
+                                                        cx, thread_id, message,
+                                                    );
+                                                });
+                                            None
+                                        }
                                     }
+                                } else {
+                                    None
                                 }
                             } else {
                                 None
                             };
 
-                            let session_result = if let Some(session_data) = loaded_session_id {
-                                Ok(session_data)
+                            let session_result = if let Some(session) = loaded_session {
+                                Ok(session)
                             } else {
                                 let _ = this.update(&mut cx, |state: &mut AppState, _| {
                                     state.append_log_line(
@@ -919,19 +1418,19 @@ impl AppState {
                                         &cwd.display().to_string(),
                                     );
                                 });
-                                controller.initialize_session(cwd).await
+                                controller.new_session(cwd).await
                             };
 
                             match session_result {
-                                Ok((session_id, config_options, modes)) => {
+                                Ok(session) => {
                                     let _ = this.update(&mut cx, |state: &mut AppState, cx| {
                                         state.append_log_line(
                                             "from_agent.initialize_or_load_session_ok",
                                             thread_id,
                                             &serde_json::json!({
-                                                "session_id": session_id.to_string(),
-                                                "config_options_len": config_options.len(),
-                                                "has_modes": modes.is_some(),
+                                                "session_id": session.session_id.to_string(),
+                                                "config_options_len": session.config_options.len(),
+                                                "has_modes": session.modes.is_some(),
                                             })
                                             .to_string(),
                                         );
@@ -941,14 +1440,16 @@ impl AppState {
                                         {
                                             thread.agent_name = Some(agent.name.clone());
                                         }
+                                        state
+                                            .agent_capabilities
+                                            .insert(agent.name.clone(), capabilities.clone());
                                         state.ts_mut(thread_id).connecting = false;
                                         state.attach_connection(
                                             cx,
                                             thread_id,
                                             controller,
-                                            session_id,
-                                            config_options,
-                                            modes,
+                                            session,
+                                            capabilities,
                                             Some(process),
                                             event_rx,
                                         );
@@ -993,13 +1494,13 @@ impl AppState {
         cx: &mut Context<Self>,
         thread_id: Uuid,
         controller: AcpController,
-        session_id: SessionId,
-        config_options: Vec<SessionConfigOption>,
-        modes: Option<SessionModeState>,
+        session: crate::client::SessionBootstrap,
+        capabilities: AgentCapabilities,
         process: Option<std::process::Child>,
         rx: mpsc::UnboundedReceiver<AgentEvent>,
     ) {
         self.listen_to_agent_events(cx, thread_id, rx);
+        let session_id = session.session_id.clone();
         if let Some(thread) = self.find_thread_mut(thread_id) {
             thread.session_id = Some(session_id.to_string());
         }
@@ -1009,10 +1510,11 @@ impl AppState {
             session_id,
             _process: process,
         });
-        ts.config_options = config_options;
-        if let Some(modes) = modes {
-            ts.mode = Some(modes);
-        }
+        ts.config_options = session.config_options;
+        ts.mode = session.modes;
+        ts.model = session.models;
+        ts.capabilities = Some(capabilities);
+        ts.usage = None;
         self.persist_state();
         cx.notify();
     }
@@ -1190,8 +1692,42 @@ impl AppState {
                     ts.mode = Some(SessionModeState::new(update.current_mode_id, Vec::new()));
                 }
             }
+            SessionUpdate::SessionInfoUpdate(update) => {
+                self.apply_session_info_update(thread_id, update);
+            }
+            SessionUpdate::UsageUpdate(update) => {
+                self.ts_mut(thread_id).usage = Some(update);
+            }
             _ => {}
         }
+    }
+
+    fn apply_session_info_update(
+        &mut self,
+        thread_id: Uuid,
+        update: agent_client_protocol::SessionInfoUpdate,
+    ) {
+        let Some(thread) = self.find_thread_mut(thread_id) else {
+            return;
+        };
+
+        if thread.user_renamed {
+            return;
+        }
+
+        let MaybeUndefined::Value(title) = update.title else {
+            return;
+        };
+        let trimmed = title.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if thread.name == trimmed {
+            return;
+        }
+        thread.name = trimmed.to_string();
+        thread.updated_at = chrono::Utc::now();
+        self.persist_state();
     }
 
     fn record_tool_call(&mut self, thread_id: Uuid, tool_call: ToolCall) {
@@ -1478,9 +2014,10 @@ fn move_vec_item<T>(items: &mut Vec<T>, from_index: usize, to_index: usize) {
 mod tests {
     use super::*;
     use agent_client_protocol::{
-        AvailableCommand, AvailableCommandsUpdate, ConfigOptionUpdate, Diff, PermissionOptionKind,
-        SessionConfigOption, TerminalExitStatus, TerminalId, ToolCall, ToolCallContent,
-        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        AvailableCommand, AvailableCommandsUpdate, ConfigOptionUpdate, Cost, Diff,
+        PermissionOptionKind, SessionConfigOption, SessionInfoUpdate, TerminalExitStatus,
+        TerminalId, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
+        ToolCallUpdateFields, UsageUpdate,
     };
 
     #[test]
@@ -1651,6 +2188,83 @@ mod tests {
             .expect("commands should be present");
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].name, "build");
+    }
+
+    #[test]
+    fn session_info_update_applies_title_when_user_has_not_renamed() {
+        let mut state = AppState::new();
+        let workspace_id = Uuid::new_v4();
+        let thread = Thread::new(workspace_id, "Thread");
+        let thread_id = thread.id;
+        let mut workspace = Workspace::new("Workspace");
+        workspace.id = workspace_id;
+        workspace.add_thread(thread);
+        state.workspaces.push(workspace);
+
+        state.apply_session_update(
+            thread_id,
+            SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title("Agent Title")),
+        );
+
+        let thread = state
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.get_thread(thread_id))
+            .expect("thread should exist");
+        assert_eq!(thread.name, "Agent Title");
+    }
+
+    #[test]
+    fn session_info_update_does_not_override_user_renamed_title() {
+        let mut state = AppState::new();
+        let workspace_id = Uuid::new_v4();
+        let mut thread = Thread::new(workspace_id, "Thread");
+        let thread_id = thread.id;
+        thread.name = "Custom Title".to_string();
+        thread.user_renamed = true;
+        let mut workspace = Workspace::new("Workspace");
+        workspace.id = workspace_id;
+        workspace.add_thread(thread);
+        state.workspaces.push(workspace);
+
+        state.apply_session_update(
+            thread_id,
+            SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title("Agent Title")),
+        );
+
+        let thread = state
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.get_thread(thread_id))
+            .expect("thread should exist");
+        assert_eq!(thread.name, "Custom Title");
+    }
+
+    #[test]
+    fn usage_update_is_stored_for_active_thread() {
+        let mut state = AppState::new();
+        let workspace_id = Uuid::new_v4();
+        let thread = Thread::new(workspace_id, "Thread");
+        let thread_id = thread.id;
+        let mut workspace = Workspace::new("Workspace");
+        workspace.id = workspace_id;
+        workspace.add_thread(thread);
+        state.workspaces.push(workspace);
+        state.active_thread_id = Some(thread_id);
+
+        state.apply_session_update(
+            thread_id,
+            SessionUpdate::UsageUpdate(UsageUpdate::new(20, 80).cost(Cost::new(1.25, "USD"))),
+        );
+
+        let usage = state
+            .active_thread_usage()
+            .expect("usage should be present on active thread");
+        assert_eq!(usage.used, 20);
+        assert_eq!(usage.size, 80);
+        let cost = usage.cost.expect("cost should be present");
+        assert_eq!(cost.amount, 1.25);
+        assert_eq!(cost.currency, "USD");
     }
 
     #[test]

@@ -15,6 +15,8 @@ struct WorkspaceRecord {
     name: String,
     path: PathBuf,
     created_at: DateTime<Utc>,
+    #[serde(default)]
+    session_listed_agents: Vec<String>,
     thread_ids: Vec<Uuid>,
 }
 
@@ -55,6 +57,8 @@ struct ThreadRecord {
     workspace_id: Uuid,
     name: String,
     #[serde(default)]
+    user_renamed: bool,
+    #[serde(default)]
     agent_name: Option<String>,
     session_id: Option<String>,
     #[serde(default)]
@@ -78,6 +82,7 @@ impl AppPersistence {
                 id: workspace.id,
                 name: workspace.name,
                 path: workspace.path,
+                session_listed_agents: workspace.session_listed_agents,
                 threads: Vec::new(),
                 created_at: workspace.created_at,
             })
@@ -90,6 +95,7 @@ impl AppPersistence {
                     id: thread_id,
                     workspace_id: thread.workspace_id,
                     name: thread.name,
+                    user_renamed: thread.user_renamed,
                     agent_name: thread.agent_name,
                     session_id: thread.session_id,
                     messages: thread
@@ -122,6 +128,7 @@ impl AppPersistence {
                 name: workspace.name.clone(),
                 path: workspace.path.clone(),
                 created_at: workspace.created_at,
+                session_listed_agents: workspace.session_listed_agents.clone(),
                 thread_ids: workspace.threads.iter().map(|thread| thread.id).collect(),
             };
             write_record(
@@ -136,6 +143,7 @@ impl AppPersistence {
                     id: thread.id,
                     workspace_id: thread.workspace_id,
                     name: thread.name.clone(),
+                    user_renamed: thread.user_renamed,
                     agent_name: thread.agent_name.clone(),
                     session_id: thread.session_id.clone(),
                     messages: thread
