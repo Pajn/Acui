@@ -2,11 +2,15 @@ use crate::state::AppState;
 use chrono::{DateTime, Utc};
 use gpui::prelude::*;
 use gpui::*;
+use gpui_component::input::{Input, InputEvent, InputState};
 use std::collections::HashSet;
 
 pub struct SidebarView {
     app_state: Entity<AppState>,
     collapsed_workspaces: HashSet<uuid::Uuid>,
+    thread_context_menu: Option<uuid::Uuid>,
+    renaming_thread_id: Option<uuid::Uuid>,
+    rename_input: Option<Entity<InputState>>,
 }
 
 #[derive(Clone)]
@@ -45,10 +49,69 @@ impl Render for DragPreview {
 impl SidebarView {
     pub fn new(app_state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         cx.observe(&app_state, |_, _, cx| cx.notify()).detach();
+        cx.observe_keystrokes(|this, event, _window, cx| {
+            if this.renaming_thread_id.is_some() && event.keystroke.key == "escape" {
+                this.cancel_rename(cx);
+            }
+        })
+        .detach();
+
         Self {
             app_state,
             collapsed_workspaces: HashSet::new(),
+            thread_context_menu: None,
+            renaming_thread_id: None,
+            rename_input: None,
         }
+    }
+
+    fn begin_rename(
+        &mut self,
+        thread_id: uuid::Uuid,
+        current_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(current_name)
+                .placeholder("Thread name")
+        });
+        cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                this.commit_rename(cx);
+            }
+        })
+        .detach();
+        input.update(cx, |state, cx| {
+            state.focus(window, cx);
+        });
+        self.renaming_thread_id = Some(thread_id);
+        self.rename_input = Some(input);
+        self.thread_context_menu = None;
+        cx.notify();
+    }
+
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.renaming_thread_id else {
+            return;
+        };
+        let Some(input) = &self.rename_input else {
+            return;
+        };
+        let name = input.read(cx).value().to_string();
+        self.app_state.update(cx, |state, cx| {
+            let _ = state.rename_thread(cx, thread_id, name);
+        });
+        self.renaming_thread_id = None;
+        self.rename_input = None;
+        cx.notify();
+    }
+
+    fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        self.renaming_thread_id = None;
+        self.rename_input = None;
+        cx.notify();
     }
 }
 
@@ -71,6 +134,15 @@ impl Render for SidebarView {
             .border_color(rgb(0x3c3c3c))
             .p_3()
             .gap_2()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.thread_context_menu = None;
+                    if this.renaming_thread_id.is_none() {
+                        cx.notify();
+                    }
+                }),
+            )
             .child(
                 div()
                     .id("new-workspace-button")
@@ -191,6 +263,8 @@ impl Render for SidebarView {
                                     && self.app_state.read(cx).thread_has_unread_stop(thread_id);
                                 let thread_dom_id = ws_index * 1000 + thread_index;
                                 let thread_name = thread.name.clone();
+                                let is_renaming = self.renaming_thread_id == Some(thread_id);
+                                let rename_input = self.rename_input.clone();
                                 let trailing = if has_unread_stop {
                                     div()
                                         .w(px(8.0))
@@ -206,7 +280,7 @@ impl Render for SidebarView {
                                         .into_any_element()
                                 };
 
-                                div()
+                                let row = div()
                                     .id(("thread-item", thread_dom_id))
                                     .pl_4()
                                     .pr_2()
@@ -219,6 +293,13 @@ impl Render for SidebarView {
                                     })
                                     .text_color(rgb(0xcccccc))
                                     .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.thread_context_menu = Some(thread_id);
+                                            cx.notify();
+                                        }),
+                                    )
                                     .on_drag(
                                         SidebarDragItem::Thread {
                                             workspace_id: ws_id,
@@ -259,20 +340,106 @@ impl Render for SidebarView {
                                             _ => style,
                                         }
                                     })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.thread_context_menu = None;
+                                        this.app_state.update(cx, |state, cx| {
+                                            state.set_active_thread(cx, thread_id);
+                                        });
+                                    }))
                                     .child(
                                         div()
                                             .flex()
                                             .items_center()
                                             .justify_between()
                                             .gap_2()
-                                            .child(div().flex_1().child(thread.name))
+                                            .child(if is_renaming {
+                                                if let Some(input) = rename_input {
+                                                    div()
+                                                        .flex_1()
+                                                        .child(Input::new(&input))
+                                                        .into_any_element()
+                                                } else {
+                                                    div()
+                                                        .flex_1()
+                                                        .child(thread.name.clone())
+                                                        .into_any_element()
+                                                }
+                                            } else {
+                                                div()
+                                                    .flex_1()
+                                                    .child(thread.name.clone())
+                                                    .into_any_element()
+                                            })
                                             .child(trailing),
-                                    )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.app_state.update(cx, |state, cx| {
-                                            state.set_active_thread(cx, thread_id);
-                                        });
-                                    }))
+                                    );
+
+                                let context_menu = if self.thread_context_menu == Some(thread_id)
+                                    && !is_renaming
+                                {
+                                    div()
+                                        .pl_6()
+                                        .pt_1()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .id(("thread-menu-rename", thread_dom_id))
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(rgb(0x2d2d30))
+                                                .cursor_pointer()
+                                                .child("Rename")
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.begin_rename(
+                                                            thread_id,
+                                                            thread.name.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("thread-menu-delete", thread_dom_id))
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(rgb(0x2d2d30))
+                                                .cursor_pointer()
+                                                .child("Delete thread")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.thread_context_menu = None;
+                                                    this.app_state.update(cx, |state, cx| {
+                                                        let _ = state.delete_thread(cx, thread_id);
+                                                    });
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("thread-menu-unread", thread_dom_id))
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(rgb(0x2d2d30))
+                                                .cursor_pointer()
+                                                .child("Mark as unread")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.thread_context_menu = None;
+                                                    this.app_state.update(cx, |state, cx| {
+                                                        state.mark_thread_unread(cx, thread_id);
+                                                    });
+                                                })),
+                                        )
+                                        .into_any_element()
+                                } else {
+                                    div().into_any_element()
+                                };
+
+                                div().child(row).child(context_menu)
                             },
                         );
 
