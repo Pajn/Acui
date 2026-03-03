@@ -54,6 +54,8 @@ pub struct Thread {
     pub id: Uuid,
     pub workspace_id: Uuid,
     pub name: String,
+    /// The agent this thread is locked to after the first message is sent.
+    pub agent_name: Option<String>,
     pub session_id: Option<String>,
     pub messages: Vec<Message>,
     pub created_at: DateTime<Utc>,
@@ -67,6 +69,7 @@ impl Thread {
             id: Uuid::new_v4(),
             workspace_id,
             name: name.into(),
+            agent_name: None,
             session_id: None,
             messages: Vec::new(),
             created_at: now,

@@ -614,6 +614,17 @@ impl AcpController {
         let controller = Self::connect(incoming, outgoing, event_tx).await?;
         Ok((controller, child))
     }
+
+    pub async fn connect_from_agent_config(
+        agent: &crate::config::AgentConfig,
+        event_tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> anyhow::Result<(Self, Child)> {
+        let process_config = AgentProcessConfig::from(agent);
+        let (child, stdout, stdin) = spawn_agent_process(&process_config)?;
+        let (incoming, outgoing) = bridge_stdio(stdout, stdin);
+        let controller = Self::connect(incoming, outgoing, event_tx).await?;
+        Ok((controller, child))
+    }
 }
 
 fn spawn_agent_process(
@@ -703,6 +714,16 @@ impl AgentProcessConfig {
     pub fn from_path(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)?;
         Ok(toml::from_str(&raw)?)
+    }
+}
+
+impl From<&crate::config::AgentConfig> for AgentProcessConfig {
+    fn from(config: &crate::config::AgentConfig) -> Self {
+        Self {
+            command: config.command.clone(),
+            args: config.args.clone(),
+            cwd: config.cwd.clone(),
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-use acui::config::AppConfig;
+use acui::config::{AgentConfig, AppConfig};
 use acui::state::AppState;
 use agent_client_protocol::SessionConfigKind;
 use gpui::{AppContext, Entity, TestAppContext};
@@ -6,28 +6,26 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-fn write_agent_config(path: &PathBuf, workspace: &PathBuf) {
-    fs::write(
-        path,
-        format!(
-            "command = \"{}\"\nargs = []\ncwd = \"{}\"\n",
-            env!("CARGO_BIN_EXE_acui_mock_agent"),
-            workspace.display()
-        ),
-    )
-    .expect("should write mock agent config");
+fn make_agent_config(workspace: &PathBuf) -> AgentConfig {
+    AgentConfig {
+        name: "mock-agent".to_string(),
+        command: env!("CARGO_BIN_EXE_acui_mock_agent").to_string(),
+        args: vec![],
+        cwd: Some(workspace.clone()),
+    }
 }
 
 fn create_state_entity(
     cx: &mut TestAppContext,
     data_dir: PathBuf,
-    agent_config: PathBuf,
+    agent: AgentConfig,
 ) -> Entity<AppState> {
     cx.update(|cx| {
         cx.new(|_| {
             AppState::new_with_config(AppConfig {
                 data_dir,
-                agent_config: Some(agent_config),
+                agents: vec![agent],
+                enable_mock_agent: false,
                 log_file: None,
             })
         })
@@ -41,10 +39,8 @@ async fn mock_agent_subprocess_handles_cwd_and_permission(cx: &mut TestAppContex
     let data_dir = temp_dir.join("data");
     fs::create_dir_all(&workspace).expect("should create workspace");
     fs::create_dir_all(&data_dir).expect("should create data dir");
-    let agent_config_path = temp_dir.join("acui_agent.toml");
-    write_agent_config(&agent_config_path, &workspace);
 
-    let state = create_state_entity(cx, data_dir.clone(), agent_config_path.clone());
+    let state = create_state_entity(cx, data_dir.clone(), make_agent_config(&workspace));
     let thread_id = state.update(cx, |state, cx| {
         let workspace_id = state.add_workspace_from_path(cx, workspace.clone());
         state
@@ -109,10 +105,9 @@ async fn persisted_thread_reconnect_uses_load_session(cx: &mut TestAppContext) {
     let data_dir = temp_dir.join("data");
     fs::create_dir_all(&workspace).expect("should create workspace");
     fs::create_dir_all(&data_dir).expect("should create data dir");
-    let agent_config_path = temp_dir.join("acui_agent.toml");
-    write_agent_config(&agent_config_path, &workspace);
 
-    let state_a = create_state_entity(cx, data_dir.clone(), agent_config_path.clone());
+    let agent = make_agent_config(&workspace);
+    let state_a = create_state_entity(cx, data_dir.clone(), agent.clone());
     let thread_id = state_a.update(cx, |state, cx| {
         let workspace_id = state.add_workspace_from_path(cx, workspace.clone());
         state
@@ -134,7 +129,8 @@ async fn persisted_thread_reconnect_uses_load_session(cx: &mut TestAppContext) {
         cx.new(|cx| {
             let mut state = AppState::new_with_config(AppConfig {
                 data_dir: data_dir.clone(),
-                agent_config: Some(agent_config_path.clone()),
+                agents: vec![agent],
+                enable_mock_agent: false,
                 log_file: None,
             });
             state
@@ -185,10 +181,8 @@ async fn mock_agent_exposes_modes_and_plan_updates(cx: &mut TestAppContext) {
     let data_dir = temp_dir.join("data");
     fs::create_dir_all(&workspace).expect("should create workspace");
     fs::create_dir_all(&data_dir).expect("should create data dir");
-    let agent_config_path = temp_dir.join("acui_agent.toml");
-    write_agent_config(&agent_config_path, &workspace);
 
-    let state = create_state_entity(cx, data_dir.clone(), agent_config_path.clone());
+    let state = create_state_entity(cx, data_dir.clone(), make_agent_config(&workspace));
     let thread_id = state.update(cx, |state, cx| {
         let workspace_id = state.add_workspace_from_path(cx, workspace.clone());
         state

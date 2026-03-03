@@ -68,26 +68,34 @@ pub struct AppState {
     unread_stopped_threads: HashSet<Uuid>,
     log_file: Option<PathBuf>,
     persistence: Option<AppPersistence>,
-    agent_config_path: Option<PathBuf>,
+    agents: Vec<crate::config::AgentConfig>,
+    enable_mock_agent: bool,
 }
 
 impl AppState {
     pub fn new() -> Self {
-        Self::with_parts(None, None, None)
+        Self::with_parts(None, Vec::new(), true, None)
     }
 
     pub fn new_with_config(config: AppConfig) -> Self {
         let AppConfig {
             data_dir,
-            agent_config,
+            agents,
+            enable_mock_agent,
             log_file,
         } = config;
-        Self::with_parts(Some(AppPersistence::new(data_dir)), agent_config, log_file)
+        Self::with_parts(
+            Some(AppPersistence::new(data_dir)),
+            agents,
+            enable_mock_agent,
+            log_file,
+        )
     }
 
     fn with_parts(
         persistence: Option<AppPersistence>,
-        agent_config_path: Option<PathBuf>,
+        agents: Vec<crate::config::AgentConfig>,
+        enable_mock_agent: bool,
         log_file: Option<PathBuf>,
     ) -> Self {
         Self {
@@ -97,7 +105,8 @@ impl AppState {
             unread_stopped_threads: HashSet::new(),
             log_file,
             persistence,
-            agent_config_path,
+            agents,
+            enable_mock_agent,
         }
     }
 
@@ -219,12 +228,16 @@ impl AppState {
         workspace.add_thread(thread);
         self.active_thread_id = Some(thread_id);
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.listen_to_agent_events(cx, thread_id, rx);
-        self.ts_mut(thread_id).mock_event_sender = Some(tx);
+        if self.enable_mock_agent {
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.listen_to_agent_events(cx, thread_id, rx);
+            self.ts_mut(thread_id).mock_event_sender = Some(tx);
+        }
 
-        if let Some(config_path) = self.agent_config_path.clone() {
-            self.connect_thread_to_agent_config(cx, thread_id, config_path);
+        // Auto-connect new threads to the first configured agent when available.
+        // (Lazy per-message selection is handled in a later flow.)
+        if let Some(agent) = self.agents.first().cloned() {
+            self.connect_thread_to_agent(cx, thread_id, agent);
         }
 
         self.persist_state();
@@ -235,13 +248,19 @@ impl AppState {
     pub fn set_active_thread(&mut self, cx: &mut Context<Self>, thread_id: Uuid) {
         self.active_thread_id = Some(thread_id);
         self.unread_stopped_threads.remove(&thread_id);
+        // Auto-connect if the thread is locked to a specific agent and not yet connected.
+        let locked_agent = self
+            .find_thread(thread_id)
+            .and_then(|t| t.agent_name.clone())
+            .and_then(|name| self.agents.iter().find(|a| a.name == name).cloned());
         if !self
             .thread_state
             .get(&thread_id)
             .is_some_and(|ts| ts.connection.is_some())
-            && let Some(config_path) = self.agent_config_path.clone()
         {
-            self.connect_thread_to_agent_config(cx, thread_id, config_path);
+            if let Some(agent) = locked_agent {
+                self.connect_thread_to_agent(cx, thread_id, agent);
+            }
         }
         cx.notify();
     }
@@ -539,23 +558,19 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn connect_thread_to_agent_config(
+    pub fn connect_thread_to_agent(
         &mut self,
         cx: &mut Context<Self>,
         thread_id: Uuid,
-        config_path: PathBuf,
+        agent: crate::config::AgentConfig,
     ) {
-        self.append_log_line(
-            "to_agent.connect_from_config",
-            thread_id,
-            &config_path.display().to_string(),
-        );
+        self.append_log_line("to_agent.connect", thread_id, &agent.name);
         cx.spawn(
             move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
                 let mut cx = cx.clone();
                 async move {
                     let (event_tx, event_rx) = mpsc::unbounded_channel();
-                    let result = AcpController::connect_from_config(config_path, event_tx).await;
+                    let result = AcpController::connect_from_agent_config(&agent, event_tx).await;
 
                     match result {
                         Ok((controller, process)) => {
@@ -644,6 +659,12 @@ impl AppState {
                                             })
                                             .to_string(),
                                         );
+                                        // Lock the thread to this agent.
+                                        if let Some(thread) = state.find_thread_mut(thread_id) {
+                                            if thread.agent_name.is_none() {
+                                                thread.agent_name = Some(agent.name.clone());
+                                            }
+                                        }
                                         state.attach_connection(
                                             cx,
                                             thread_id,
@@ -1450,7 +1471,7 @@ mod tests {
     fn append_log_line_writes_json_records() {
         let temp_dir = std::env::temp_dir().join(format!("acui-log-test-{}", uuid::Uuid::new_v4()));
         let log_path = temp_dir.join("acui.log");
-        let state = AppState::with_parts(None, None, Some(log_path.clone()));
+        let state = AppState::with_parts(None, Vec::new(), false, Some(log_path.clone()));
 
         state.append_log_line("to_agent", uuid::Uuid::new_v4(), "hello");
         state.append_log_line("from_agent", uuid::Uuid::new_v4(), "{\"ok\":true}");
