@@ -101,13 +101,18 @@ APP_LOG="$PROFILE_ROOT/acui.stdout.log"
 SAMPLE_OUT="$PROFILE_ROOT/sample.txt"
 
 echo "Launching non-headless acui profile app..."
-(
-  cd "$PROFILE_ROOT"
-  ACUI_MOCK_PROFILE_LONG_THREAD=1 \
-  ACUI_MOCK_PROFILE_ITERATIONS="$ACUI_MOCK_PROFILE_ITERATIONS" \
-  "$APP_BIN" >"$APP_LOG" 2>&1
-) &
+cd "$PROFILE_ROOT"
+ACUI_MOCK_PROFILE_LONG_THREAD=1 \
+ACUI_MOCK_PROFILE_ITERATIONS="$ACUI_MOCK_PROFILE_ITERATIONS" \
+"$APP_BIN" >"$APP_LOG" 2>&1 &
 APP_PID=$!
+cd "$REPO_ROOT"
+
+APP_COMM="$(ps -o comm= -p "$APP_PID" | tr -d '[:space:]')"
+if [[ "$(basename "$APP_COMM")" != "acui" ]]; then
+  echo "Expected acui PID, got '$APP_COMM' (pid $APP_PID)."
+  exit 1
+fi
 
 cleanup() {
   if kill -0 "$APP_PID" >/dev/null 2>&1; then
