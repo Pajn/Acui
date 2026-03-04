@@ -2018,56 +2018,6 @@ impl Render for ChatView {
                 .into_any_element()
         };
 
-        let usage_footer = usage.map(|usage| {
-            let percent = usage_progress_percent(&usage);
-            let progress_color = if percent >= 90.0 {
-                rgb(0xd96b6b)
-            } else if percent >= 75.0 {
-                rgb(0xd9ad6b)
-            } else {
-                rgb(0x0e639c)
-            };
-            let percent_label = format!("{percent:.0}%");
-            div()
-                .id("chat-usage-indicator")
-                .w_full()
-                .flex()
-                .justify_end()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x8f8f8f))
-                        .child(format!("{} / {}", usage.used, usage.size)),
-                )
-                .when_some(format_cost_label(usage.cost.as_ref()), |this, label| {
-                    this.child(
-                        div()
-                            .id("chat-usage-cost")
-                            .text_xs()
-                            .text_color(rgb(0xb8b8b8))
-                            .child(label),
-                    )
-                })
-                .child(
-                    div()
-                        .id("chat-usage-progress-circle")
-                        .w(px(34.0))
-                        .h(px(34.0))
-                        .rounded_full()
-                        .border_2()
-                        .border_color(progress_color)
-                        .bg(rgb(0x252526))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_xs()
-                        .text_color(white())
-                        .child(percent_label),
-                )
-        });
-
         let input_box = div()
             .debug_selector(|| "chat-input-box".to_string())
             .w_full()
@@ -2106,8 +2056,7 @@ impl Render for ChatView {
                                 this.submit_input(window, cx);
                             })),
                     ),
-            )
-            .children(usage_footer);
+            );
 
         let suggestion_panel = if let Some(suggestions) = self.compute_suggestions(cx) {
             self.suggestion_scroll_handle
@@ -2202,227 +2151,273 @@ impl Render for ChatView {
             .map(|opts| !opts.is_empty())
             .unwrap_or(false);
 
-        let config_panel = match (active_thread_id, config_options) {
-            (Some(_thread_id), Some(options)) if !options.is_empty() => {
-                let option_rows = options
+        // Build left-side option columns for the unified info row.
+        let mut left_cols: Vec<AnyElement> = Vec::new();
+
+        // Agent column: shown when configured agents exist.
+        // - Thread unlocked: clickable selector buttons (one per configured agent).
+        // - Thread locked: static label showing which agent is in use.
+        if !configured_agents.is_empty()
+            && let Some(thread_id) = active_thread_id
+        {
+            let agent_content: AnyElement = if is_agent_locked {
+                let label = locked_agent
+                    .as_deref()
+                    .unwrap_or("unknown agent")
+                    .to_string();
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xdddddd))
+                    .child(label)
+                    .into_any_element()
+            } else {
+                let buttons = configured_agents
                     .into_iter()
                     .enumerate()
-                    .map(|(option_index, option)| {
-                        let _option_id = option.id.to_string();
-                        let title = div().text_color(rgb(0xdddddd)).child(option.name);
-                        match option.kind {
-                            agent_client_protocol::SessionConfigKind::Select(select) => {
-                                let entries = match select.options {
-                                    agent_client_protocol::SessionConfigSelectOptions::Ungrouped(values) => values
-                                        .into_iter()
-                                        .map(|entry| PickerOption::new(entry.value.to_string(), entry.name))
-                                        .collect::<Vec<_>>(),
-                                    agent_client_protocol::SessionConfigSelectOptions::Grouped(groups) => groups
-                                        .into_iter()
-                                        .flat_map(|group| {
-                                            group.options.into_iter().map(move |entry| {
-                                                PickerOption::new(
-                                                    entry.value.to_string(),
-                                                    format!("{} / {}", group.group, entry.name),
-                                                )
-                                            })
-                                        })
-                                        .collect::<Vec<_>>(),
-                                    _ => Vec::new(),
-                                };
-                                let current_value = select.current_value.to_string();
-                                if option_index < self.config_select_states.len() {
-                                    let select_state = &self.config_select_states[option_index];
-                                    select_state.update(cx, |state, cx| {
-                                        state.set_items(entries, _window, cx);
-                                        state.set_selected_value(&current_value, _window, cx);
-                                        cx.notify();
-                                    });
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(title)
-                                        .child(
-                                            div()
-                                                .id(("session-config-select", option_index))
-                                                .child(Select::new(select_state).menu_width(px(220.0)).max_h(px(300.0))),
-                                        )
-                                } else {
-                                    div().w_full().child(title)
-                                }
-                            }
-                            _ => div().w_full().child(title),
-                        }
+                    .map(|(index, agent)| {
+                        let agent_name = agent.name.clone();
+                        let is_selected = selected_agent.as_deref() == Some(&agent_name);
+                        div()
+                            .id(("agent-selector", index))
+                            .bg(if is_selected {
+                                rgb(0x0e639c)
+                            } else {
+                                rgb(0x3c3c3c)
+                            })
+                            .text_color(white())
+                            .rounded_md()
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .child(agent.name)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.app_state.update(cx, |state, cx| {
+                                    state.select_agent_for_thread(
+                                        cx,
+                                        thread_id,
+                                        agent_name.clone(),
+                                    );
+                                });
+                            }))
+                            .into_any_element()
                     });
                 div()
-                    .w_full()
-                    .p_2()
-                    .bg(rgb(0x1f2933))
-                    .border_t_1()
-                    .border_color(rgb(0x3c3c3c))
                     .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(div().text_color(rgb(0xdddddd)).child("Session options"))
-                    .children(option_rows)
-            }
-            _ => div(),
-        };
-
-        let model_panel = match (active_thread_id, models, has_config_options) {
-            (
-                Some(_thread_id),
-                Some(SessionModelState {
-                    current_model_id,
-                    available_models,
-                    ..
-                }),
-                false,
-            ) if !available_models.is_empty() => {
-                let options = available_models
-                    .into_iter()
-                    .map(|model| PickerOption::new(model.model_id.to_string(), model.name))
-                    .collect::<Vec<_>>();
-                let current_model_id = current_model_id.to_string();
-                self.model_select_state.update(cx, |state, cx| {
-                    state.set_items(options, _window, cx);
-                    state.set_selected_value(&current_model_id, _window, cx);
-                });
+                    .gap_1()
+                    .flex_wrap()
+                    .children(buttons)
+                    .into_any_element()
+            };
+            left_cols.push(
                 div()
-                    .w_full()
-                    .p_2()
-                    .bg(rgb(0x1f2933))
-                    .border_t_1()
-                    .border_color(rgb(0x3c3c3c))
                     .flex()
                     .flex_col()
-                    .gap_2()
-                    .child(div().text_color(rgb(0xdddddd)).child("Session model"))
+                    .gap_1()
+                    .child(div().text_xs().text_color(rgb(0x888888)).child("Agent"))
+                    .child(agent_content)
+                    .into_any_element(),
+            );
+        }
+
+        // Model column
+        if let (
+            Some(_thread_id),
+            Some(SessionModelState {
+                current_model_id,
+                available_models,
+                ..
+            }),
+            false,
+        ) = (active_thread_id, models, has_config_options)
+            && !available_models.is_empty()
+        {
+            let options = available_models
+                .into_iter()
+                .map(|model| PickerOption::new(model.model_id.to_string(), model.name))
+                .collect::<Vec<_>>();
+            let current_model_id = current_model_id.to_string();
+            self.model_select_state.update(cx, |state, cx| {
+                state.set_items(options, _window, cx);
+                state.set_selected_value(&current_model_id, _window, cx);
+            });
+            left_cols.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_xs().text_color(rgb(0x888888)).child("Model"))
                     .child(
                         div()
                             .id("chat-model-select")
                             .child(Select::new(&self.model_select_state).menu_width(px(260.0))),
                     )
-            }
-            _ => div(),
-        };
+                    .into_any_element(),
+            );
+        }
 
-        let mode_panel = match (active_thread_id, modes, has_config_options) {
-            (
-                Some(_thread_id),
-                Some(SessionModeState {
-                    current_mode_id,
-                    available_modes,
-                    ..
-                }),
-                false,
-            ) if !available_modes.is_empty() => {
-                let options = available_modes
-                    .into_iter()
-                    .map(|mode| PickerOption::new(mode.id.to_string(), mode.name))
-                    .collect::<Vec<_>>();
-                let current_mode_id = current_mode_id.to_string();
-                self.mode_select_state.update(cx, |state, cx| {
-                    state.set_items(options, _window, cx);
-                    state.set_selected_value(&current_mode_id, _window, cx);
-                });
+        // Mode column
+        if let (
+            Some(_thread_id),
+            Some(SessionModeState {
+                current_mode_id,
+                available_modes,
+                ..
+            }),
+            false,
+        ) = (active_thread_id, modes, has_config_options)
+            && !available_modes.is_empty()
+        {
+            let options = available_modes
+                .into_iter()
+                .map(|mode| PickerOption::new(mode.id.to_string(), mode.name))
+                .collect::<Vec<_>>();
+            let current_mode_id = current_mode_id.to_string();
+            self.mode_select_state.update(cx, |state, cx| {
+                state.set_items(options, _window, cx);
+                state.set_selected_value(&current_mode_id, _window, cx);
+            });
+            left_cols.push(
                 div()
-                    .w_full()
-                    .p_2()
-                    .bg(rgb(0x1f2933))
-                    .border_t_1()
-                    .border_color(rgb(0x3c3c3c))
                     .flex()
                     .flex_col()
-                    .gap_2()
-                    .child(div().text_color(rgb(0xdddddd)).child("Session mode"))
+                    .gap_1()
+                    .child(div().text_xs().text_color(rgb(0x888888)).child("Mode"))
                     .child(
                         div()
                             .id("chat-mode-select")
                             .child(Select::new(&self.mode_select_state).menu_width(px(220.0))),
                     )
-            }
-            _ => div(),
-        };
+                    .into_any_element(),
+            );
+        }
 
-        // Agent panel: shown below the input when there are configured agents.
-        // - Thread unlocked: clickable selector buttons (one per configured agent).
-        // - Thread locked: static label showing which agent is in use.
-        let agent_panel = if !configured_agents.is_empty() {
-            if let Some(thread_id) = active_thread_id {
-                let panel_content: AnyElement = if is_agent_locked {
-                    // Static label
-                    let label = locked_agent
-                        .as_deref()
-                        .unwrap_or("unknown agent")
-                        .to_string();
-                    div()
-                        .flex()
-                        .gap_2()
-                        .items_center()
-                        .child(div().text_color(rgb(0x888888)).child("Agent"))
-                        .child(div().text_color(rgb(0xdddddd)).child(label))
-                        .into_any_element()
-                } else {
-                    // Clickable agent selector buttons
-                    let buttons =
-                        configured_agents
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, agent)| {
-                                let agent_name = agent.name.clone();
-                                let is_selected = selected_agent.as_deref() == Some(&agent_name);
-                                div()
-                                    .id(("agent-selector", index))
-                                    .bg(if is_selected {
-                                        rgb(0x0e639c)
-                                    } else {
-                                        rgb(0x3c3c3c)
+        // Config option columns
+        if let (Some(_thread_id), Some(options)) = (active_thread_id, config_options) {
+            for (option_index, option) in options.into_iter().enumerate() {
+                let _option_id = option.id.to_string();
+                let label = div().text_xs().text_color(rgb(0x888888)).child(option.name);
+                let control: AnyElement = match option.kind {
+                    agent_client_protocol::SessionConfigKind::Select(select) => {
+                        let entries = match select.options {
+                            agent_client_protocol::SessionConfigSelectOptions::Ungrouped(
+                                values,
+                            ) => values
+                                .into_iter()
+                                .map(|entry| PickerOption::new(entry.value.to_string(), entry.name))
+                                .collect::<Vec<_>>(),
+                            agent_client_protocol::SessionConfigSelectOptions::Grouped(groups) => {
+                                groups
+                                    .into_iter()
+                                    .flat_map(|group| {
+                                        group.options.into_iter().map(move |entry| {
+                                            PickerOption::new(
+                                                entry.value.to_string(),
+                                                format!("{} / {}", group.group, entry.name),
+                                            )
+                                        })
                                     })
-                                    .text_color(white())
-                                    .rounded_md()
-                                    .px_2()
-                                    .py_1()
-                                    .cursor_pointer()
-                                    .child(agent.name)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.app_state.update(cx, |state, cx| {
-                                            state.select_agent_for_thread(
-                                                cx,
-                                                thread_id,
-                                                agent_name.clone(),
-                                            );
-                                        });
-                                    }))
-                                    .into_any_element()
+                                    .collect::<Vec<_>>()
+                            }
+                            _ => Vec::new(),
+                        };
+                        let current_value = select.current_value.to_string();
+                        if option_index < self.config_select_states.len() {
+                            let select_state = &self.config_select_states[option_index];
+                            select_state.update(cx, |state, cx| {
+                                state.set_items(entries, _window, cx);
+                                state.set_selected_value(&current_value, _window, cx);
+                                cx.notify();
                             });
+                            div()
+                                .id(("session-config-select", option_index))
+                                .child(
+                                    Select::new(select_state)
+                                        .menu_width(px(220.0))
+                                        .max_h(px(300.0)),
+                                )
+                                .into_any_element()
+                        } else {
+                            div().into_any_element()
+                        }
+                    }
+                    _ => div().into_any_element(),
+                };
+                left_cols.push(
                     div()
                         .flex()
+                        .flex_col()
                         .gap_1()
-                        .flex_wrap()
-                        .children(buttons)
-                        .into_any_element()
-                };
-
-                div()
-                    .w_full()
-                    .p_2()
-                    .bg(rgb(0x1f2933))
-                    .border_t_1()
-                    .border_color(rgb(0x3c3c3c))
-                    .flex()
-                    .gap_2()
-                    .items_center()
-                    .child(div().text_color(rgb(0x888888)).child("Agent:"))
-                    .child(panel_content)
-            } else {
-                div()
+                        .child(label)
+                        .child(control)
+                        .into_any_element(),
+                );
             }
-        } else {
+        }
+
+        let usage_el = usage.map(|usage| {
+            let percent = usage_progress_percent(&usage);
+            let progress_color = if percent >= 90.0 {
+                rgb(0xd96b6b)
+            } else if percent >= 75.0 {
+                rgb(0xd9ad6b)
+            } else {
+                rgb(0x0e639c)
+            };
+            let percent_label = format!("{percent:.0}%");
             div()
-        };
+                .id("chat-usage-indicator")
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x8f8f8f))
+                        .child(format!("{} / {}", usage.used, usage.size)),
+                )
+                .when_some(format_cost_label(usage.cost.as_ref()), |this, label| {
+                    this.child(
+                        div()
+                            .id("chat-usage-cost")
+                            .text_xs()
+                            .text_color(rgb(0xb8b8b8))
+                            .child(label),
+                    )
+                })
+                .child(
+                    div()
+                        .id("chat-usage-progress-circle")
+                        .w(px(34.0))
+                        .h(px(34.0))
+                        .rounded_full()
+                        .border_2()
+                        .border_color(progress_color)
+                        .bg(rgb(0x252526))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .text_color(white())
+                        .child(percent_label),
+                )
+        });
+
+        // Unified info row: options left-aligned, usage right-aligned, no background.
+        let info_row = div()
+            .w_full()
+            .px_3()
+            .py_1()
+            .flex()
+            .items_end()
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .gap_4()
+                    .items_end()
+                    .children(left_cols),
+            )
+            .when_some(usage_el, |this, el| this.child(el));
 
         div()
             .debug_selector(|| "chat-root".to_string())
@@ -2437,10 +2432,7 @@ impl Render for ChatView {
             .child(permission_panel)
             .child(suggestion_panel)
             .child(input_box)
-            .child(agent_panel)
-            .child(model_panel)
-            .child(mode_panel)
-            .child(config_panel)
+            .child(info_row)
     }
 }
 
