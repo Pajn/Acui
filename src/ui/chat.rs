@@ -151,7 +151,6 @@ impl Default for VirtualizedCodeCache {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DiffRowKind {
-    Header,
     Context,
     Added,
     Removed,
@@ -232,6 +231,7 @@ struct MessageContentCache {
 struct VirtualizedCodeRenderOptions {
     parse_numbered_lines: bool,
     prefer_editor: bool,
+    inner_scroll: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -784,6 +784,7 @@ impl ChatView {
                 |window, cx| {
                     cx.new(|cx| {
                         InputState::new(window, cx)
+                            .multi_line(true)
                             .code_editor(language)
                             .line_number(false)
                             .rows(chunk_rows)
@@ -946,7 +947,11 @@ impl ChatView {
             && total_lines <= EDITOR_HIGHLIGHT_MAX_LINES
             && text.len() <= EDITOR_HIGHLIGHT_MAX_CHARS;
 
-        if use_editor && chunks.len() == 1 && text.len() <= VIRTUALIZE_CHAR_THRESHOLD {
+        if use_editor
+            && chunks.len() == 1
+            && text.len() <= VIRTUALIZE_CHAR_THRESHOLD
+            && options.inner_scroll
+        {
             return Self::render_readonly_code(
                 message_id,
                 block_key,
@@ -957,15 +962,47 @@ impl ChatView {
             );
         }
 
+        let language = language.to_string();
+        let block_key = block_key.to_string();
+        let chunks_for_render = chunks.clone();
+
+        if !options.inner_scroll {
+            return div()
+                .w_full()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(0x3c3c3c))
+                .bg(rgb(0x1e1e1e))
+                .overflow_hidden()
+                .children(
+                    chunks_for_render
+                        .iter()
+                        .enumerate()
+                        .map(|(chunk_index, chunk)| {
+                            if use_editor {
+                                ChatView::render_virtualized_code_chunk_editor(
+                                    message_id,
+                                    &block_key,
+                                    &language,
+                                    chunk_index,
+                                    chunk,
+                                    window,
+                                    cx,
+                                )
+                            } else {
+                                ChatView::render_virtualized_code_chunk_plain(chunk)
+                            }
+                        }),
+                )
+                .into_any_element();
+        }
+
         let list_state = Self::virtualized_list_state(
             SharedString::from(format!("chat-code-list-{message_id}-{block_key}")),
             chunks.len(),
             window,
             cx,
         );
-        let chunks_for_render = chunks.clone();
-        let language = language.to_string();
-        let block_key = block_key.to_string();
 
         div()
             .w_full()
@@ -1011,7 +1048,6 @@ impl ChatView {
             .flex_col()
             .children(blocks.iter().map(move |block| {
                 let (bg, sign_color, text_color) = match block.kind {
-                    DiffRowKind::Header => (rgb(0x252526), rgb(0x8f8f8f), rgb(0xb8b8b8)),
                     DiffRowKind::Context => (rgb(0x1e1e1e), rgb(0x8f8f8f), rgb(0xd6d6d6)),
                     DiffRowKind::Added => (rgb(0x173221), rgb(0x82dca7), rgb(0xdaf4e3)),
                     DiffRowKind::Removed => (rgb(0x3a1f24), rgb(0xf2a2a2), rgb(0xf7dddd)),
@@ -1084,16 +1120,6 @@ impl ChatView {
         let chunks = cache.read(cx).chunks.clone();
         if chunks.is_empty() {
             return div().into_any_element();
-        }
-        let should_use_single_editor = {
-            let state = cache.read(cx);
-            !line_count_exceeds(&state.diff_text, 200) && state.diff_text.len() <= 128_000
-        };
-        if should_use_single_editor {
-            let diff_text = cache.read(cx).diff_text.clone();
-            return Self::render_readonly_code(
-                message_id, block_key, "diff", diff_text, window, cx,
-            );
         }
 
         let list_state = Self::virtualized_list_state(
@@ -1367,7 +1393,8 @@ impl ChatView {
                                             text,
                                             VirtualizedCodeRenderOptions {
                                                 parse_numbered_lines: true,
-                                                prefer_editor: true,
+                                                prefer_editor: !is_read_tool,
+                                                inner_scroll: !is_read_tool,
                                             },
                                             window,
                                             cx,
@@ -1381,6 +1408,7 @@ impl ChatView {
                                             VirtualizedCodeRenderOptions {
                                                 parse_numbered_lines: false,
                                                 prefer_editor: false,
+                                                inner_scroll: true,
                                             },
                                             window,
                                             cx,
@@ -1487,6 +1515,7 @@ impl ChatView {
                 VirtualizedCodeRenderOptions {
                     parse_numbered_lines: false,
                     prefer_editor: false,
+                    inner_scroll: true,
                 },
                 window,
                 cx,
@@ -2575,19 +2604,6 @@ fn should_virtualize_text(text: &str) -> bool {
     false
 }
 
-fn line_count_exceeds(text: &str, limit: usize) -> bool {
-    let mut lines = 1usize;
-    for byte in text.as_bytes() {
-        if *byte == b'\n' {
-            lines += 1;
-            if lines > limit {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 fn build_text_chunks(text: &str) -> Vec<SharedString> {
     let mut chunks = Vec::new();
     let mut current = Vec::with_capacity(VIRTUALIZED_CHUNK_LINES);
@@ -2614,9 +2630,19 @@ fn build_text_chunks(text: &str) -> Vec<SharedString> {
 }
 
 fn parse_numbered_code_line(line: &str) -> Option<(usize, &str)> {
-    let (left, right) = line.split_once('|')?;
+    if let Some((left, right)) = line.split_once('|')
+        && let Ok(number) = left.trim().parse::<usize>()
+    {
+        return Some((number, right.strip_prefix(' ').unwrap_or(right)));
+    }
+    if let Some((left, right)) = line.split_once('.')
+        && let Ok(number) = left.trim().parse::<usize>()
+    {
+        return Some((number, right.strip_prefix(' ').unwrap_or(right)));
+    }
+    let (left, right) = line.split_once(':')?;
     let number = left.trim().parse::<usize>().ok()?;
-    Some((number, right.trim_start()))
+    Some((number, right.strip_prefix(' ').unwrap_or(right)))
 }
 
 fn push_virtualized_code_chunk(chunks: &mut Vec<VirtualizedCodeChunk>, lines: &[CodeRenderLine]) {
@@ -2662,6 +2688,7 @@ fn build_virtualized_code_chunks(
     let push_line = |raw: &str, lines: &mut Vec<CodeRenderLine>, fallback_line: &mut usize| {
         let (line_number, text) = if parse_numbered_lines {
             if let Some((number, text)) = parse_numbered_code_line(raw) {
+                *fallback_line = number.saturating_add(1);
                 (Some(number), text.to_string())
             } else {
                 (Some(*fallback_line), raw.to_string())
@@ -2807,6 +2834,7 @@ fn build_virtualized_diff_chunks(diff_text: &str) -> Vec<VirtualizedDiffChunk> {
     let mut rows = Vec::new();
     let mut old_line = 1usize;
     let mut new_line = 1usize;
+    let mut in_hunk = false;
     let push_row = |kind: DiffRowKind,
                     sign: char,
                     line_number: Option<usize>,
@@ -2827,11 +2855,13 @@ fn build_virtualized_diff_chunks(diff_text: &str) -> Vec<VirtualizedDiffChunk> {
         if let Some((old_start, new_start)) = parse_diff_hunk_header(line) {
             old_line = old_start;
             new_line = new_start;
-            rows.push(push_row(DiffRowKind::Header, '@', None, line));
+            in_hunk = true;
             return;
         }
-        if line.starts_with("---") || line.starts_with("+++") {
-            rows.push(push_row(DiffRowKind::Header, ' ', None, line));
+        if !in_hunk {
+            return;
+        }
+        if line.starts_with('\\') {
             return;
         }
         if let Some(text) = line.strip_prefix('+') {
@@ -2856,6 +2886,9 @@ fn build_virtualized_diff_chunks(diff_text: &str) -> Vec<VirtualizedDiffChunk> {
         for line in diff_text.split('\n') {
             process_line(line);
         }
+    }
+    if rows.is_empty() {
+        rows.push(push_row(DiffRowKind::Context, ' ', None, "(no changes)"));
     }
 
     let mut chunks = Vec::new();
@@ -2892,7 +2925,8 @@ fn language_from_tool_title(title: &str) -> &'static str {
 }
 
 fn language_from_path(path: &str) -> &'static str {
-    let ext = path
+    let normalized_path = path.split_once(':').map(|(base, _)| base).unwrap_or(path);
+    let ext = normalized_path
         .rsplit('.')
         .next()
         .unwrap_or_default()
@@ -3071,6 +3105,14 @@ mod tests {
         let parsed = parse_numbered_code_line("   42 | fn answer() {}").expect("should parse");
         assert_eq!(parsed.0, 42);
         assert_eq!(parsed.1, "fn answer() {}");
+        let parsed_colon =
+            parse_numbered_code_line("  183: let answer = 42;").expect("should parse");
+        assert_eq!(parsed_colon.0, 183);
+        assert_eq!(parsed_colon.1, "let answer = 42;");
+        let parsed_indent =
+            parse_numbered_code_line("  184:     indented();").expect("should parse");
+        assert_eq!(parsed_indent.0, 184);
+        assert_eq!(parsed_indent.1, "    indented();");
         assert!(parse_numbered_code_line("not numbered").is_none());
     }
 
@@ -3084,6 +3126,32 @@ mod tests {
         assert!(chunks.len() >= 3);
         assert_eq!(chunks[0].line_count, VIRTUALIZED_CHUNK_LINES);
         assert!(chunks[0].line_numbers.contains("     1"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn code_chunk_builder_preserves_file_line_numbers_across_chunks() {
+        let mut payload = String::new();
+        for index in 183..=(183 + VIRTUALIZED_CHUNK_LINES + 1) {
+            let _ = writeln!(payload, "{index:>6}: let value_{index} = {index};");
+        }
+        let chunks = build_virtualized_code_chunks(&payload, true);
+        assert!(chunks.len() >= 2);
+        assert!(
+            chunks[0]
+                .code_text
+                .lines()
+                .next()
+                .expect("expected first line")
+                .starts_with("let value_183")
+        );
+        assert_eq!(
+            chunks[1]
+                .line_numbers
+                .lines()
+                .next()
+                .expect("expected first line number in second chunk"),
+            format!("{:>6}", 183 + VIRTUALIZED_CHUNK_LINES)
+        );
     }
 
     #[::core::prelude::v1::test]
@@ -3107,8 +3175,61 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn diff_chunk_builder_skips_unified_diff_headers() {
+        let diff = "\
+--- before\n\
++++ after\n\
+@@ -42,2 +42,2 @@\n\
+-old line\n\
++new line";
+        let chunks = build_virtualized_diff_chunks(diff);
+        assert!(!chunks.is_empty());
+        let rendered = chunks[0]
+            .blocks
+            .iter()
+            .map(|block| block.text.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("@@ -42,2 +42,2 @@"));
+        assert!(!rendered.contains("--- before"));
+        assert!(!rendered.contains("+++ after"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn diff_chunk_builder_uses_file_relative_line_numbers() {
+        let diff = "\
+--- before\n\
++++ after\n\
+@@ -183,1 +183,1 @@\n\
+-removed content\n\
++added content";
+        let chunks = build_virtualized_diff_chunks(diff);
+        assert!(!chunks.is_empty());
+
+        let removed = chunks[0]
+            .blocks
+            .iter()
+            .find(|block| block.kind == DiffRowKind::Removed)
+            .expect("expected removed block");
+        let added = chunks[0]
+            .blocks
+            .iter()
+            .find(|block| block.kind == DiffRowKind::Added)
+            .expect("expected added block");
+
+        assert_eq!(removed.line_numbers.as_ref(), "183");
+        assert_eq!(removed.signs.as_ref(), "-");
+        assert_eq!(removed.text.as_ref(), "removed content");
+
+        assert_eq!(added.line_numbers.as_ref(), "183");
+        assert_eq!(added.signs.as_ref(), "+");
+        assert_eq!(added.text.as_ref(), "added content");
+    }
+
+    #[::core::prelude::v1::test]
     fn language_hint_prefers_extension_in_tool_title() {
         assert_eq!(language_from_tool_title("Read src/lib.rs"), "rust");
+        assert_eq!(language_from_tool_title("Read src/lib.rs:183"), "rust");
         assert_eq!(language_from_tool_title("Read scripts/build.sh"), "bash");
         assert_eq!(language_from_tool_title("Read NOTES"), "text");
     }
