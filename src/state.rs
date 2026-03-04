@@ -28,7 +28,16 @@ const AUTO_CONNECT_MESSAGE_LIMIT: usize = 400;
 struct ThreadAgentConnection {
     controller: Rc<AcpController>,
     session_id: SessionId,
-    _process: Option<std::process::Child>,
+    process: Option<std::process::Child>,
+}
+
+impl Drop for ThreadAgentConnection {
+    fn drop(&mut self) {
+        if let Some(process) = self.process.as_mut() {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -106,9 +115,10 @@ pub struct AppState {
     agents: Vec<crate::config::AgentConfig>,
     enable_mock_agent: bool,
     /// Pre-connected agents at the app level.
-    /// All agents are connected when a new thread is created, and threads
-    /// just reference which pre-connected agent to use.
-    preconnected_agents: HashMap<String, PreconnectedAgent>,
+    /// Keyed by (agent_name, cwd) to ensure correct workspace context.
+    preconnected_agents: HashMap<(String, PathBuf), PreconnectedAgent>,
+    /// In-flight pre-connect attempts keyed the same as `preconnected_agents`.
+    preconnecting_agents: HashSet<(String, PathBuf)>,
 }
 
 /// A fully connected agent with active session.
@@ -126,6 +136,15 @@ struct PreconnectedAgent {
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        for preconnected in self.preconnected_agents.values_mut() {
+            let _ = preconnected.process.kill();
+            let _ = preconnected.process.wait();
+        }
     }
 }
 
@@ -179,19 +198,30 @@ impl AppState {
             agents,
             enable_mock_agent,
             preconnected_agents: HashMap::new(),
+            preconnecting_agents: HashSet::new(),
         }
     }
 
     /// Pre-connect to all agents in the background.
     /// This is called when a new thread is created to make agent switching instant.
-    pub fn preconnect_all_agents(&mut self, cx: &mut Context<Self>) {
+    pub fn preconnect_all_agents(&mut self, cx: &mut Context<Self>, cwd: Option<PathBuf>) {
+        let cwd_raw = cwd
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let cwd = cwd_raw.canonicalize().unwrap_or(cwd_raw);
+
         for agent in &self.agents {
-            if self.preconnected_agents.contains_key(&agent.name) {
+            let key = (agent.name.clone(), cwd.clone());
+            if self.preconnected_agents.contains_key(&key)
+                || self.preconnecting_agents.contains(&key)
+            {
                 continue; // Already connected
             }
+            self.preconnecting_agents.insert(key.clone());
 
             let agent = agent.clone();
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let cwd = cwd.clone();
+            let key = key.clone();
 
             cx.spawn(
                 move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
@@ -201,10 +231,13 @@ impl AppState {
 
                         let result =
                             AcpController::connect_from_agent_config(&agent, event_tx).await;
-                        let (controller, process) = match result {
+                        let (controller, mut process) = match result {
                             Ok(pair) => pair,
                             Err(e) => {
                                 eprintln!("preconnect: failed to connect to {}: {}", agent.name, e);
+                                let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                                    state.preconnecting_agents.remove(&key);
+                                });
                                 return;
                             }
                         };
@@ -214,17 +247,27 @@ impl AppState {
                             Ok(c) => c,
                             Err(e) => {
                                 eprintln!("preconnect: failed to initialize {}: {}", agent.name, e);
+                                let _ = process.kill();
+                                let _ = process.wait();
+                                let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                                    state.preconnecting_agents.remove(&key);
+                                });
                                 return;
                             }
                         };
 
-                        let session = match controller.new_session(cwd).await {
+                        let session = match controller.new_session(cwd.clone()).await {
                             Ok(s) => s,
                             Err(e) => {
                                 eprintln!(
                                     "preconnect: failed to create session for {}: {}",
                                     agent.name, e
                                 );
+                                let _ = process.kill();
+                                let _ = process.wait();
+                                let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                                    state.preconnecting_agents.remove(&key);
+                                });
                                 return;
                             }
                         };
@@ -244,16 +287,38 @@ impl AppState {
                         };
 
                         let _ = this.update(&mut cx, |state: &mut AppState, cx| {
-                            state
+                            state.preconnecting_agents.remove(&key);
+                            if let Some(mut old) = state
                                 .preconnected_agents
-                                .insert(agent.name.clone(), preconnected);
+                                .insert((agent.name.clone(), cwd.clone()), preconnected)
+                            {
+                                let _ = old.process.kill();
+                                let _ = old.process.wait();
+                            }
 
-                            // Propagate to threads that have this agent selected but no connection yet.
-                            for ts in state.thread_state.values_mut() {
-                                if ts.selected_agent_name.as_ref() == Some(&agent.name)
-                                    && ts.connection.is_none()
-                                {
-                                    let p = state.preconnected_agents.get(&agent.name).unwrap();
+                            // Propagate to threads that have this agent selected/locked but no connection yet.
+                            let agent_name = agent.name.clone();
+                            let tids_to_update: Vec<Uuid> = state
+                                .thread_state
+                                .keys()
+                                .filter(|tid| {
+                                    let ts = state.thread_state.get(tid).unwrap();
+                                    ts.selected_agent_name.as_ref() == Some(&agent_name)
+                                        || state
+                                            .find_thread(**tid)
+                                            .and_then(|t| t.agent_name.as_ref())
+                                            == Some(&agent_name)
+                                })
+                                .copied()
+                                .collect();
+
+                            for tid in tids_to_update {
+                                let ts = state.thread_state.get_mut(&tid).unwrap();
+                                if ts.connection.is_none() {
+                                    let p = state
+                                        .preconnected_agents
+                                        .get(&(agent_name.clone(), cwd.clone()))
+                                        .unwrap();
                                     ts.config_options = p.config_options.clone();
                                     ts.mode = p.mode.clone();
                                     ts.model = p.model.clone();
@@ -272,12 +337,18 @@ impl AppState {
     pub fn restore_persisted_state(&mut self, cx: &mut Context<Self>) -> anyhow::Result<()> {
         // Pre-connect to all agents in the background for instant agent switching
         // This runs regardless of whether we have persisted state
-        self.preconnect_all_agents(cx);
+        self.preconnect_all_agents(cx, None);
 
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
         self.workspaces = persistence.load()?;
+
+        // Pre-connect for all loaded workspace roots as well
+        let workspace_paths: Vec<_> = self.workspaces.iter().map(|w| w.path.clone()).collect();
+        for path in workspace_paths {
+            self.preconnect_all_agents(cx, Some(path));
+        }
         self.active_thread_id = self
             .workspaces
             .iter()
@@ -317,7 +388,9 @@ impl AppState {
     pub fn add_workspace(&mut self, cx: &mut Context<Self>, name: &str) -> Uuid {
         let workspace = Workspace::new(name);
         let id = workspace.id;
+        let path = workspace.path.clone();
         self.workspaces.push(workspace);
+        self.preconnect_all_agents(cx, Some(path));
         self.sync_workspace_sessions(cx, id);
         self.persist_state();
         cx.notify();
@@ -327,7 +400,9 @@ impl AppState {
     pub fn add_workspace_from_path(&mut self, cx: &mut Context<Self>, path: PathBuf) -> Uuid {
         let workspace = Workspace::from_path(path);
         let id = workspace.id;
+        let path = workspace.path.clone();
         self.workspaces.push(workspace);
+        self.preconnect_all_agents(cx, Some(path));
         self.sync_workspace_sessions(cx, id);
         self.persist_state();
         cx.notify();
@@ -405,6 +480,7 @@ impl AppState {
         name: &str,
     ) -> Option<Uuid> {
         let workspace = self.workspaces.iter_mut().find(|w| w.id == workspace_id)?;
+        let cwd = workspace.path.clone();
         let thread = Thread::new(workspace_id, name);
         let thread_id = thread.id;
         workspace.add_thread(thread);
@@ -417,24 +493,62 @@ impl AppState {
         }
 
         // Pre-connect to all agents so switching is instant
-        self.preconnect_all_agents(cx);
+        self.preconnect_all_agents(cx, Some(cwd.clone()));
 
         // Pre-select the first configured agent for the thread
         // The connection is already established via preconnect_all_agents
         let first_agent = self.agents.first().cloned();
         if let Some(agent) = first_agent {
-            let preconnected = self.preconnected_agents.get(&agent.name);
-            let config_options = preconnected.map(|p| p.config_options.clone());
-            let mode = preconnected.map(|p| p.mode.clone());
-            let model = preconnected.map(|p| p.model.clone());
-            let capabilities = preconnected.map(|p| p.capabilities.clone());
-
             let ts = self.ts_mut(thread_id);
             ts.selected_agent_name = Some(agent.name.clone());
-            ts.config_options = config_options.unwrap_or_default();
-            ts.mode = mode.flatten();
-            ts.model = model.flatten();
-            ts.capabilities = capabilities.flatten();
+
+            if let Some(preconnected) = self.take_preconnected_agent(&agent.name, Some(cwd.clone()))
+            {
+                let session = crate::client::SessionBootstrap {
+                    session_id: preconnected.session_id.clone(),
+                    config_options: preconnected.config_options.clone(),
+                    modes: preconnected.mode.clone(),
+                    models: preconnected.model.clone(),
+                };
+                let controller = preconnected.controller.clone();
+                let capabilities = preconnected.capabilities.clone().unwrap_or_default();
+                let process = preconnected.process;
+                let rx = preconnected.rx;
+
+                self.attach_connection_rc(
+                    cx,
+                    thread_id,
+                    controller,
+                    session,
+                    capabilities,
+                    Some(process),
+                    rx,
+                );
+                // Re-fill the pre-connect cache for other threads
+                self.preconnect_all_agents(cx, Some(cwd));
+            } else {
+                // Fallback to metadata only if not fully pre-connected yet
+                // The first message will establish the full connection.
+                let pre_data = self
+                    .preconnected_agents
+                    .get(&(agent.name.clone(), cwd.clone()))
+                    .map(|p| {
+                        (
+                            p.config_options.clone(),
+                            p.mode.clone(),
+                            p.model.clone(),
+                            p.capabilities.clone(),
+                        )
+                    });
+
+                if let Some((config_options, mode, model, capabilities)) = pre_data {
+                    let ts = self.ts_mut(thread_id);
+                    ts.config_options = config_options;
+                    ts.mode = mode;
+                    ts.model = model;
+                    ts.capabilities = capabilities;
+                }
+            }
         }
 
         self.persist_state();
@@ -445,13 +559,20 @@ impl AppState {
     pub fn set_active_thread(&mut self, cx: &mut Context<Self>, thread_id: Uuid) {
         self.active_thread_id = Some(thread_id);
         self.unread_stopped_threads.remove(&thread_id);
+
+        let locked_agent_name = self
+            .find_thread(thread_id)
+            .and_then(|t| t.agent_name.clone());
+
+        if let Some(name) = &locked_agent_name {
+            self.ts_mut(thread_id).selected_agent_name = Some(name.clone());
+        }
+
         // Auto-connect if the thread is locked to a specific agent and neither a
         // connection nor an in-flight connect task already exists (the startup
         // background load may have already spawned one).
-        let locked_agent = self
-            .find_thread(thread_id)
-            .and_then(|t| t.agent_name.clone())
-            .and_then(|name| self.agents.iter().find(|a| a.name == name).cloned());
+        let locked_agent =
+            locked_agent_name.and_then(|name| self.agents.iter().find(|a| a.name == name).cloned());
         let already_connecting = self
             .thread_state
             .get(&thread_id)
@@ -651,14 +772,27 @@ impl AppState {
         &self.agents
     }
 
-    /// Check if a named agent is pre-connected.
-    pub fn agent_is_preconnected(&self, agent_name: &str) -> bool {
-        self.preconnected_agents.contains_key(agent_name)
+    /// Check if a named agent is pre-connected for a given CWD.
+    pub fn agent_is_preconnected(&self, agent_name: &str, cwd: Option<PathBuf>) -> bool {
+        let cwd_raw = cwd
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let cwd = cwd_raw.canonicalize().unwrap_or(cwd_raw);
+        let key = (agent_name.to_string(), cwd);
+        self.preconnected_agents.contains_key(&key)
     }
 
-    /// Take a pre-connected agent by name, if available.
-    fn take_preconnected_agent(&mut self, agent_name: &str) -> Option<PreconnectedAgent> {
-        self.preconnected_agents.remove(agent_name)
+    fn take_preconnected_agent(
+        &mut self,
+        agent_name: &str,
+        cwd: Option<PathBuf>,
+    ) -> Option<PreconnectedAgent> {
+        let cwd_raw = cwd
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let cwd = cwd_raw.canonicalize().unwrap_or(cwd_raw);
+        let key = (agent_name.to_string(), cwd);
+        self.preconnected_agents.remove(&key)
     }
 
     /// Select a named agent for the active thread (before first message).
@@ -690,7 +824,8 @@ impl AppState {
         ts.capabilities = None;
 
         // If we have a pre-connected agent, take it and attach it immediately.
-        if let Some(preconnected) = self.take_preconnected_agent(&agent_name) {
+        let cwd = self.workspace_cwd_for_thread(thread_id);
+        if let Some(preconnected) = self.take_preconnected_agent(&agent_name, cwd.clone()) {
             let session = crate::client::SessionBootstrap {
                 session_id: preconnected.session_id.clone(),
                 config_options: preconnected.config_options.clone(),
@@ -708,11 +843,11 @@ impl AppState {
                 preconnected.rx,
             );
             // Re-fill the pre-connect cache for other threads
-            self.preconnect_all_agents(cx);
+            self.preconnect_all_agents(cx, cwd);
         } else {
             // No pre-connection ready, wait for preconnect_all_agents to propagate it
             // or for first message to connect.
-            self.preconnect_all_agents(cx);
+            self.preconnect_all_agents(cx, cwd);
         }
 
         cx.notify();
@@ -1333,7 +1468,19 @@ impl AppState {
                 });
 
             if let Some(agent_name) = agent_name {
-                if let Some(preconnected) = self.take_preconnected_agent(&agent_name) {
+                let ts_ref = self.ts(thread_id);
+                let has_session_id = self
+                    .find_thread(thread_id)
+                    .is_some_and(|t| t.session_id.is_some());
+                let has_connection =
+                    ts_ref.is_some_and(|ts| ts.connection.is_some() || ts.connecting);
+
+                let cwd = self.workspace_cwd_for_thread(thread_id);
+                if !has_session_id
+                    && !has_connection
+                    && let Some(preconnected) =
+                        self.take_preconnected_agent(&agent_name, cwd.clone())
+                {
                     // Consume the pre-connected agent
                     let controller = preconnected.controller.clone();
                     let session_id = preconnected.session_id.clone();
@@ -1358,7 +1505,7 @@ impl AppState {
                         event_rx,
                     );
                     // Re-fill cache
-                    self.preconnect_all_agents(cx);
+                    self.preconnect_all_agents(cx, cwd);
 
                     let content = content.to_owned();
                     self.ts_mut(thread_id).prompt_started_at = Some(Instant::now());
@@ -1403,6 +1550,7 @@ impl AppState {
                     if let Some(agent) = agent {
                         let content = content.to_owned();
                         self.ts_mut(thread_id).prompt_started_at = Some(Instant::now());
+                        self.preconnect_all_agents(cx, cwd);
                         self.connect_and_send(cx, thread_id, agent, content);
                     }
                 }
@@ -1421,6 +1569,39 @@ impl AppState {
         agent: crate::config::AgentConfig,
         content: String,
     ) {
+        // Optimization: If already connected (e.g. via add_thread pre-connection), use it!
+        if let Some(ts) = self.ts(thread_id)
+            && let Some(connection) = &ts.connection
+        {
+            self.append_log_line("to_agent.send_existing", thread_id, &agent.name);
+            let controller = connection.controller.clone();
+            let session_id = connection.session_id.clone();
+
+            cx.spawn(
+                move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
+                    let mut cx = cx.clone();
+                    async move {
+                        match controller.send_prompt(session_id, content).await {
+                            Ok(stop_reason) => {
+                                let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                    state.apply_prompt_stop_reason(cx, thread_id, stop_reason);
+                                });
+                            }
+                            Err(err) => {
+                                let message = format!("Prompt failed: {err}");
+                                let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                    state.ts_mut(thread_id).prompt_started_at = None;
+                                    state.push_system_message(cx, thread_id, message);
+                                });
+                            }
+                        }
+                    }
+                },
+            )
+            .detach();
+            return;
+        }
+
         self.append_log_line("to_agent.connect_and_send", thread_id, &agent.name);
 
         cx.spawn(
@@ -1551,6 +1732,30 @@ impl AppState {
         agent: crate::config::AgentConfig,
     ) {
         self.append_log_line("to_agent.connect", thread_id, &agent.name);
+
+        let cwd = self.workspace_cwd_for_thread(thread_id);
+        if let Some(preconnected) = self.take_preconnected_agent(&agent.name, cwd.clone()) {
+            let session = crate::client::SessionBootstrap {
+                session_id: preconnected.session_id.clone(),
+                config_options: preconnected.config_options.clone(),
+                modes: preconnected.mode.clone(),
+                models: preconnected.model.clone(),
+            };
+            let controller = preconnected.controller.clone();
+            self.attach_connection_rc(
+                cx,
+                thread_id,
+                controller,
+                session,
+                preconnected.capabilities.clone().unwrap_or_default(),
+                Some(preconnected.process),
+                preconnected.rx,
+            );
+            // Re-fill the pre-connect cache for other threads
+            self.preconnect_all_agents(cx, cwd);
+            return;
+        }
+
         self.ts_mut(thread_id).connecting = true;
 
         cx.spawn(
@@ -1791,7 +1996,7 @@ impl AppState {
         ts.connection = Some(ThreadAgentConnection {
             controller,
             session_id,
-            _process: process,
+            process,
         });
         ts.config_options = session.config_options;
         ts.mode = session.modes;
@@ -1877,10 +2082,24 @@ impl AppState {
         self.active_thread_id.and_then(|id| self.find_thread(id))
     }
 
+    pub fn thread_messages(&self, thread_id: Uuid) -> Vec<Message> {
+        self.workspaces
+            .iter()
+            .flat_map(|workspace| workspace.threads.iter())
+            .find(|thread| thread.id == thread_id)
+            .map(|thread| thread.messages.clone())
+            .unwrap_or_default()
+    }
+
     pub fn active_thread_messages(&self) -> Vec<Message> {
         self.active_thread()
             .map(|thread| thread.messages.clone())
             .unwrap_or_default()
+    }
+
+    #[doc(hidden)]
+    pub fn thread_connection_is_some(&self, thread_id: Uuid) -> bool {
+        self.ts(thread_id).is_some_and(|ts| ts.connection.is_some())
     }
 
     pub fn active_thread_message_count(&self) -> usize {

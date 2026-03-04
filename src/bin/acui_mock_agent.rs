@@ -524,7 +524,17 @@ impl Agent for MockAgent {
         let prompt = prompt_text(&args.prompt);
         let trimmed = prompt.trim();
         if trimmed == "cwd" {
-            self.send_text(&args.session_id, format!("cwd: {}", self.cwd.display()))
+            let session_cwd = self
+                .session_cwds
+                .borrow()
+                .get(&args.session_id.to_string())
+                .cloned();
+            eprintln!(
+                "MockAgent::prompt: request_id={} found_cwd={:?} fallback={:?}",
+                args.session_id, session_cwd, self.cwd
+            );
+            let display_cwd = session_cwd.unwrap_or_else(|| self.cwd.clone());
+            self.send_text(&args.session_id, format!("cwd: {}", display_cwd.display()))
                 .await?;
         } else if let Some(title) = trimmed.strip_prefix("title ").map(str::trim) {
             self.client()?
