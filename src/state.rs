@@ -308,10 +308,14 @@ impl AppState {
             self.ts_mut(thread_id).mock_event_sender = Some(tx);
         }
 
-        // Pre-select the first configured agent for the thread; the connection
-        // is established lazily on the first `send_user_message` call.
-        let first_agent_name = self.agents.first().map(|a| a.name.clone());
-        self.ts_mut(thread_id).selected_agent_name = first_agent_name;
+        // Pre-select the first configured agent for the thread and connect immediately
+        // so session options (modes, models) are available before the first message.
+        let first_agent = self.agents.first().cloned();
+        if let Some(agent) = first_agent {
+            self.ts_mut(thread_id).selected_agent_name = Some(agent.name.clone());
+            // Connect immediately to get session options available
+            self.connect_thread_to_agent(cx, thread_id, agent);
+        }
 
         self.persist_state();
         cx.notify();
@@ -528,13 +532,50 @@ impl AppState {
     }
 
     /// Select a named agent for the active thread (before first message).
+    /// Immediately connects to the selected agent so session options are available.
     pub fn select_agent_for_thread(
         &mut self,
         cx: &mut Context<Self>,
         thread_id: Uuid,
         agent_name: String,
     ) {
-        self.ts_mut(thread_id).selected_agent_name = Some(agent_name);
+        let ts = self.ts_mut(thread_id);
+
+        // Check if we're already connected to this agent - don't reconnect if so
+        let already_connected = ts.connection.is_some()
+            && ts
+                .selected_agent_name
+                .as_ref()
+                .is_some_and(|n| n == &agent_name);
+
+        // Check if we're switching to a different agent
+        let switching_agents = ts
+            .selected_agent_name
+            .as_ref()
+            .is_some_and(|n| n != &agent_name);
+
+        ts.selected_agent_name = Some(agent_name.clone());
+
+        // Only disconnect if changing agents or not yet connected
+        // Note: We don't eagerly connect here - that happens lazily when the first
+        // message is sent via connect_and_send in send_user_message.
+        // This avoids race conditions between eager and lazy connection attempts.
+        if !already_connected {
+            // Disconnect from current agent if connected (to abandon empty session)
+            ts.connection = None;
+            ts.agent_task = None;
+            ts.config_options.clear();
+            ts.mode = None;
+            ts.model = None;
+            ts.capabilities = None;
+
+            // When switching to a different agent, clear the session_id so we don't
+            // try to load the previous agent's session. We'll create a fresh one
+            // when the first message is sent.
+            if switching_agents && let Some(thread) = self.find_thread_mut(thread_id) {
+                thread.session_id = None;
+            }
+        }
         cx.notify();
     }
 
@@ -1091,8 +1132,21 @@ impl AppState {
 
         self.append_log_line("to_agent", thread_id, content);
 
+        // Get the selected agent name before mutating the thread
+        let agent_to_lock = self
+            .ts(thread_id)
+            .and_then(|ts| ts.selected_agent_name.clone());
+
         if let Some(thread) = self.find_thread_mut(thread_id) {
             thread.add_message(Message::new(thread_id, Role::User, content));
+            // Lock the thread to the selected agent when the first message is sent.
+            // This allows users to change their agent selection up until they send
+            // their first message.
+            if thread.agent_name.is_none()
+                && let Some(selected_agent) = agent_to_lock
+            {
+                thread.agent_name = Some(selected_agent);
+            }
         }
 
         let conn_info = self
@@ -1448,12 +1502,9 @@ impl AppState {
                                             })
                                             .to_string(),
                                         );
-                                        // Lock the thread to this agent.
-                                        if let Some(thread) = state.find_thread_mut(thread_id)
-                                            && thread.agent_name.is_none()
-                                        {
-                                            thread.agent_name = Some(agent.name.clone());
-                                        }
+                                        // Don't lock the thread to this agent here - that happens
+                                        // when the first message is sent. This allows users to
+                                        // change their agent selection before sending a message.
                                         state
                                             .agent_capabilities
                                             .insert(agent.name.clone(), capabilities.clone());
