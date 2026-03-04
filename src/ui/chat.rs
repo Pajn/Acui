@@ -223,6 +223,56 @@ impl VirtualizedListState {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct NestedScrollGestureState {
+    started_in_block: bool,
+    capture_block: bool,
+}
+
+impl NestedScrollGestureState {
+    fn on_wheel(
+        &mut self,
+        touch_phase: TouchPhase,
+        pointer_over_block: bool,
+        can_scroll_in_direction: bool,
+    ) -> bool {
+        match touch_phase {
+            TouchPhase::Started => {
+                self.started_in_block = pointer_over_block;
+                self.capture_block = pointer_over_block && can_scroll_in_direction;
+                self.capture_block
+            }
+            TouchPhase::Moved => {
+                if !self.started_in_block {
+                    return false;
+                }
+                if !pointer_over_block {
+                    self.started_in_block = false;
+                    self.capture_block = false;
+                    return false;
+                }
+                if self.capture_block && !can_scroll_in_direction {
+                    // Once the inner block hits the edge, hand the remaining
+                    // gesture (including momentum) to the outer thread scroll.
+                    self.started_in_block = false;
+                    self.capture_block = false;
+                }
+                self.capture_block
+            }
+            TouchPhase::Ended => {
+                if self.started_in_block && self.capture_block && pointer_over_block {
+                    // Trackpad momentum often arrives as subsequent Moved events
+                    // after Ended. Keep capture armed until we hit an edge.
+                    return true;
+                }
+                self.started_in_block = false;
+                self.capture_block = false;
+                false
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct MessageContentCache {
     signature: Option<MessageTailSignature>,
@@ -715,6 +765,57 @@ impl ChatView {
         list_state.read(cx).list_state.clone()
     }
 
+    fn can_scroll_for_delta(
+        current_offset_y: Pixels,
+        max_offset_y: Pixels,
+        delta_y: Pixels,
+    ) -> bool {
+        let next_offset = Self::next_scroll_offset_y(current_offset_y, max_offset_y, delta_y);
+        (next_offset - current_offset_y).abs() > px(0.5)
+    }
+
+    fn next_scroll_offset_y(
+        current_offset_y: Pixels,
+        max_offset_y: Pixels,
+        delta_y: Pixels,
+    ) -> Pixels {
+        if max_offset_y <= px(0.0) {
+            return px(0.0);
+        }
+        if delta_y == px(0.0) {
+            return current_offset_y;
+        }
+        let min_offset = -max_offset_y;
+        (current_offset_y + delta_y).max(min_offset).min(px(0.0))
+    }
+
+    fn scroll_delta_y(event: &ScrollWheelEvent) -> Pixels {
+        event.delta.pixel_delta(px(20.0)).y
+    }
+
+    fn apply_scroll_delta(scroll_handle: &ScrollHandle, delta_y: Pixels) -> bool {
+        let current_offset = scroll_handle.offset();
+        let next_offset_y = Self::next_scroll_offset_y(
+            current_offset.y,
+            scroll_handle.max_offset().height,
+            delta_y,
+        );
+        if (next_offset_y - current_offset.y).abs() <= px(0.5) {
+            return false;
+        }
+        scroll_handle.set_offset(point(current_offset.x, next_offset_y));
+        true
+    }
+
+    fn should_capture_nested_scroll(
+        state: &mut NestedScrollGestureState,
+        event: &ScrollWheelEvent,
+        started_in_block: bool,
+        can_scroll_in_direction: bool,
+    ) -> bool {
+        state.on_wheel(event.touch_phase, started_in_block, can_scroll_in_direction)
+    }
+
     fn render_readonly_code(
         message_id: Uuid,
         key_suffix: &str,
@@ -1039,37 +1140,115 @@ impl ChatView {
         let chunks_for_render = chunks.clone();
 
         if !options.inner_scroll {
-            let render_chunks = if use_editor {
-                build_non_scrolling_render_chunks(chunks_for_render.as_ref())
-            } else {
-                chunks_for_render.as_ref().to_vec()
-            };
+            let render_chunks = build_non_scrolling_render_chunks(chunks_for_render.as_ref());
+            let scroll_handle = window
+                .use_keyed_state(
+                    SharedString::from(format!("chat-code-block-scroll-{message_id}-{block_key}")),
+                    cx,
+                    |_window, _cx| ScrollHandle::new(),
+                )
+                .read(cx)
+                .clone();
+            let capture_state = window.use_keyed_state(
+                SharedString::from(format!(
+                    "chat-code-block-scroll-capture-{message_id}-{block_key}"
+                )),
+                cx,
+                |_window, _cx| NestedScrollGestureState::default(),
+            );
+            let scroll_handle_for_capture = scroll_handle.clone();
+            let capture_state_for_event = capture_state.clone();
+            let scroll_area_id = SharedString::from(format!(
+                "chat-code-block-scroll-area-{message_id}-{block_key}"
+            ));
             return div()
                 .w_full()
                 .rounded_md()
                 .border_1()
                 .border_color(rgb(0x3c3c3c))
                 .bg(rgb(0x1e1e1e))
-                .overflow_hidden()
-                .children(
-                    render_chunks
-                        .iter()
-                        .enumerate()
-                        .map(|(chunk_index, chunk)| {
-                            if use_editor {
-                                ChatView::render_virtualized_code_chunk_highlighted(
-                                    message_id,
-                                    &block_key,
-                                    &language,
-                                    chunk_index,
-                                    chunk,
-                                    window,
-                                    cx,
-                                )
-                            } else {
-                                ChatView::render_virtualized_code_chunk_plain(chunk)
+                .relative()
+                .on_children_prepainted(move |children, window, _cx: &mut App| {
+                    let Some(scroll_bounds) = children.first().copied() else {
+                        return;
+                    };
+                    let scroll_handle = scroll_handle_for_capture.clone();
+                    let capture_state = capture_state_for_event.clone();
+                    let current_view = window.current_view();
+                    window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _window, cx| {
+                        if phase != DispatchPhase::Capture {
+                            return;
+                        }
+                        let started_in_block = scroll_bounds.contains(&event.position);
+                        let delta_y = ChatView::scroll_delta_y(event);
+                        let mut should_capture = false;
+                        let mut did_scroll = false;
+                        capture_state.update(cx, |state, _| {
+                            let can_scroll_in_direction = started_in_block
+                                && ChatView::can_scroll_for_delta(
+                                    scroll_handle.offset().y,
+                                    scroll_handle.max_offset().height,
+                                    delta_y,
+                                );
+                            should_capture = ChatView::should_capture_nested_scroll(
+                                state,
+                                event,
+                                started_in_block,
+                                can_scroll_in_direction,
+                            );
+                            if should_capture {
+                                did_scroll = ChatView::apply_scroll_delta(&scroll_handle, delta_y);
                             }
-                        }),
+                        });
+                        if should_capture {
+                            if did_scroll {
+                                cx.notify(current_view);
+                            }
+                            cx.stop_propagation();
+                        }
+                    });
+                })
+                .child(
+                    div()
+                        .id(scroll_area_id)
+                        .w_full()
+                        .max_h(px(VIRTUALIZED_BLOCK_HEIGHT))
+                        .overflow_y_scroll()
+                        .track_scroll(&scroll_handle)
+                        .child(
+                            div().w_full().flex().flex_col().children(
+                                render_chunks
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(chunk_index, chunk)| {
+                                        if use_editor {
+                                            ChatView::render_virtualized_code_chunk_highlighted(
+                                                message_id,
+                                                &block_key,
+                                                &language,
+                                                chunk_index,
+                                                chunk,
+                                                window,
+                                                cx,
+                                            )
+                                        } else {
+                                            ChatView::render_virtualized_code_chunk_plain(chunk)
+                                        }
+                                    }),
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .child(
+                            Scrollbar::vertical(&scroll_handle)
+                                .scrollbar_show(ScrollbarShow::Always),
+                        ),
                 )
                 .into_any_element();
         }
@@ -1083,14 +1262,14 @@ impl ChatView {
 
         div()
             .w_full()
-            .h(px(VIRTUALIZED_BLOCK_HEIGHT))
             .rounded_md()
             .border_1()
             .border_color(rgb(0x3c3c3c))
             .bg(rgb(0x1e1e1e))
             .overflow_hidden()
-            .child(
-                list(list_state, move |chunk_index, window, cx| -> AnyElement {
+            .child(list(
+                list_state,
+                move |chunk_index, window, cx| -> AnyElement {
                     let Some(chunk) = chunks_for_render.get(chunk_index) else {
                         return div().into_any_element();
                     };
@@ -1109,11 +1288,8 @@ impl ChatView {
                         let _ = cx;
                         ChatView::render_virtualized_code_chunk_plain(chunk)
                     }
-                })
-                .size_full()
-                .min_w(px(0.0))
-                .min_h(px(0.0)),
-            )
+                },
+            ))
             .into_any_element()
     }
 
@@ -1199,32 +1375,98 @@ impl ChatView {
             return div().into_any_element();
         }
 
-        let list_state = Self::virtualized_list_state(
-            SharedString::from(format!("chat-diff-list-{message_id}-{block_key}")),
-            chunks.len(),
-            window,
-            cx,
-        );
         let chunks_for_render = chunks.clone();
+        let scroll_handle = window
+            .use_keyed_state(
+                SharedString::from(format!("chat-diff-block-scroll-{message_id}-{block_key}")),
+                cx,
+                |_window, _cx| ScrollHandle::new(),
+            )
+            .read(cx)
+            .clone();
+        let capture_state = window.use_keyed_state(
+            SharedString::from(format!(
+                "chat-diff-block-scroll-capture-{message_id}-{block_key}"
+            )),
+            cx,
+            |_window, _cx| NestedScrollGestureState::default(),
+        );
+        let scroll_handle_for_capture = scroll_handle.clone();
+        let capture_state_for_event = capture_state.clone();
+        let scroll_area_id = SharedString::from(format!(
+            "chat-diff-block-scroll-area-{message_id}-{block_key}"
+        ));
 
         div()
             .w_full()
-            .h(px(VIRTUALIZED_BLOCK_HEIGHT))
             .rounded_md()
             .border_1()
             .border_color(rgb(0x3c3c3c))
             .bg(rgb(0x1e1e1e))
-            .overflow_hidden()
+            .relative()
+            .on_children_prepainted(move |children, window, _cx: &mut App| {
+                let Some(scroll_bounds) = children.first().copied() else {
+                    return;
+                };
+                let scroll_handle = scroll_handle_for_capture.clone();
+                let capture_state = capture_state_for_event.clone();
+                let current_view = window.current_view();
+                window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _window, cx| {
+                    if phase != DispatchPhase::Capture {
+                        return;
+                    }
+                    let started_in_block = scroll_bounds.contains(&event.position);
+                    let delta_y = ChatView::scroll_delta_y(event);
+                    let mut should_capture = false;
+                    let mut did_scroll = false;
+                    capture_state.update(cx, |state, _| {
+                        let can_scroll_in_direction = started_in_block
+                            && ChatView::can_scroll_for_delta(
+                                scroll_handle.offset().y,
+                                scroll_handle.max_offset().height,
+                                delta_y,
+                            );
+                        should_capture = ChatView::should_capture_nested_scroll(
+                            state,
+                            event,
+                            started_in_block,
+                            can_scroll_in_direction,
+                        );
+                        if should_capture {
+                            did_scroll = ChatView::apply_scroll_delta(&scroll_handle, delta_y);
+                        }
+                    });
+                    if should_capture {
+                        if did_scroll {
+                            cx.notify(current_view);
+                        }
+                        cx.stop_propagation();
+                    }
+                });
+            })
             .child(
-                list(list_state, move |chunk_index, _window, _cx| -> AnyElement {
-                    let Some(chunk) = chunks_for_render.get(chunk_index) else {
-                        return div().into_any_element();
-                    };
-                    ChatView::render_virtualized_diff_chunk(chunk.blocks.as_ref())
-                })
-                .size_full()
-                .min_w(px(0.0))
-                .min_h(px(0.0)),
+                div()
+                    .id(scroll_area_id)
+                    .w_full()
+                    .max_h(px(VIRTUALIZED_BLOCK_HEIGHT))
+                    .overflow_y_scroll()
+                    .track_scroll(&scroll_handle)
+                    .flex()
+                    .flex_col()
+                    .children(chunks_for_render.iter().map(|chunk| {
+                        ChatView::render_virtualized_diff_chunk(chunk.blocks.as_ref())
+                    })),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .child(
+                        Scrollbar::vertical(&scroll_handle).scrollbar_show(ScrollbarShow::Always),
+                    ),
             )
             .into_any_element()
     }
@@ -1485,7 +1727,7 @@ impl ChatView {
                                             VirtualizedCodeRenderOptions {
                                                 parse_numbered_lines: false,
                                                 prefer_editor: false,
-                                                inner_scroll: true,
+                                                inner_scroll: false,
                                             },
                                             window,
                                             cx,
@@ -1592,7 +1834,7 @@ impl ChatView {
                 VirtualizedCodeRenderOptions {
                     parse_numbered_lines: false,
                     prefer_editor: false,
-                    inner_scroll: true,
+                    inner_scroll: false,
                 },
                 window,
                 cx,
@@ -2113,8 +2355,7 @@ impl Render for ChatView {
                             ),
                     )
                     .child(
-                        Scrollbar::vertical(&self.list_state)
-                            .scrollbar_show(ScrollbarShow::Always),
+                        Scrollbar::vertical(&self.list_state).scrollbar_show(ScrollbarShow::Always),
                     )
                     .into_any_element()
             }
@@ -3238,6 +3479,96 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn nested_scroll_direction_check_handles_edges() {
+        assert!(ChatView::can_scroll_for_delta(
+            px(0.0),
+            px(120.0),
+            px(-10.0)
+        ));
+        assert!(!ChatView::can_scroll_for_delta(
+            px(-120.0),
+            px(120.0),
+            px(-10.0)
+        ));
+        assert!(!ChatView::can_scroll_for_delta(
+            px(0.0),
+            px(120.0),
+            px(10.0)
+        ));
+        assert!(ChatView::can_scroll_for_delta(
+            px(-60.0),
+            px(120.0),
+            px(10.0)
+        ));
+    }
+
+    #[::core::prelude::v1::test]
+    fn nested_scroll_capture_requires_started_in_block() {
+        let mut state = NestedScrollGestureState::default();
+        assert!(!state.on_wheel(TouchPhase::Started, false, true));
+        assert!(!state.on_wheel(TouchPhase::Moved, true, true));
+        assert!(!state.on_wheel(TouchPhase::Ended, true, true));
+    }
+
+    #[::core::prelude::v1::test]
+    fn nested_scroll_capture_starts_and_releases_correctly() {
+        let mut state = NestedScrollGestureState::default();
+        assert!(state.on_wheel(TouchPhase::Started, true, true));
+        assert!(state.on_wheel(TouchPhase::Moved, true, true));
+        assert!(state.on_wheel(TouchPhase::Ended, true, true));
+        assert!(state.on_wheel(TouchPhase::Moved, true, true));
+    }
+
+    #[::core::prelude::v1::test]
+    fn nested_scroll_capture_momentum_releases_at_edge() {
+        let mut state = NestedScrollGestureState::default();
+        assert!(state.on_wheel(TouchPhase::Started, true, true));
+        assert!(state.on_wheel(TouchPhase::Moved, true, true));
+        assert!(state.on_wheel(TouchPhase::Ended, true, true));
+        assert!(state.on_wheel(TouchPhase::Moved, true, true));
+        assert!(!state.on_wheel(TouchPhase::Moved, true, false));
+        assert!(!state.on_wheel(TouchPhase::Moved, true, true));
+        assert!(!state.on_wheel(TouchPhase::Ended, true, true));
+    }
+
+    #[::core::prelude::v1::test]
+    fn nested_scroll_capture_hands_off_when_block_hits_edge() {
+        let mut state = NestedScrollGestureState::default();
+        assert!(state.on_wheel(TouchPhase::Started, true, true));
+        assert!(!state.on_wheel(TouchPhase::Moved, true, false));
+        assert!(!state.on_wheel(TouchPhase::Moved, true, true));
+        assert!(!state.on_wheel(TouchPhase::Ended, true, true));
+    }
+
+    #[::core::prelude::v1::test]
+    fn nested_scroll_capture_does_not_start_if_gesture_begins_outside_block() {
+        let mut state = NestedScrollGestureState::default();
+        assert!(!state.on_wheel(TouchPhase::Started, false, false));
+        assert!(!state.on_wheel(TouchPhase::Moved, true, true));
+        assert!(!state.on_wheel(TouchPhase::Ended, true, true));
+    }
+
+    #[::core::prelude::v1::test]
+    fn nested_scroll_next_offset_clamps_to_bounds() {
+        assert_eq!(
+            ChatView::next_scroll_offset_y(px(0.0), px(120.0), px(-15.0)),
+            px(-15.0)
+        );
+        assert_eq!(
+            ChatView::next_scroll_offset_y(px(-120.0), px(120.0), px(-15.0)),
+            px(-120.0)
+        );
+        assert_eq!(
+            ChatView::next_scroll_offset_y(px(0.0), px(120.0), px(20.0)),
+            px(0.0)
+        );
+        assert_eq!(
+            ChatView::next_scroll_offset_y(px(-60.0), px(120.0), px(20.0)),
+            px(-40.0)
+        );
+    }
+
+    #[::core::prelude::v1::test]
     fn parse_numbered_code_lines_extracts_gutter_number() {
         let parsed = parse_numbered_code_line("   42 | fn answer() {}").expect("should parse");
         assert_eq!(parsed.0, 42);
@@ -3300,7 +3631,13 @@ mod tests {
         let base_chunks = build_virtualized_code_chunks(&payload, true);
         let render_chunks = build_non_scrolling_render_chunks(&base_chunks);
         assert!(base_chunks.len() > render_chunks.len());
-        assert_eq!(render_chunks.iter().map(|chunk| chunk.line_count).sum::<usize>(), 451);
+        assert_eq!(
+            render_chunks
+                .iter()
+                .map(|chunk| chunk.line_count)
+                .sum::<usize>(),
+            451
+        );
         assert!(
             render_chunks
                 .iter()
