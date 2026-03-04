@@ -13,6 +13,20 @@ pub struct SidebarView {
     rename_input: Option<Entity<InputState>>,
 }
 
+struct SidebarThreadEntry {
+    id: uuid::Uuid,
+    name: String,
+    updated_at: DateTime<Utc>,
+    can_fork: bool,
+    has_unread_stop: bool,
+}
+
+struct SidebarWorkspaceEntry {
+    id: uuid::Uuid,
+    name: String,
+    threads: Vec<SidebarThreadEntry>,
+}
+
 #[derive(Clone)]
 enum SidebarDragItem {
     Workspace(uuid::Uuid),
@@ -117,7 +131,31 @@ impl Render for SidebarView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (workspaces, active_thread_id) = {
             let state = self.app_state.read(cx);
-            (state.workspaces.clone(), state.active_thread_id)
+            let active_thread_id = state.active_thread_id;
+            let workspaces: Vec<SidebarWorkspaceEntry> = state
+                .workspaces
+                .iter()
+                .map(|workspace| SidebarWorkspaceEntry {
+                    id: workspace.id,
+                    name: workspace.name.clone(),
+                    threads: workspace
+                        .threads
+                        .iter()
+                        .map(|thread| {
+                            let thread_id = thread.id;
+                            SidebarThreadEntry {
+                                id: thread_id,
+                                name: thread.name.clone(),
+                                updated_at: thread.updated_at,
+                                can_fork: state.thread_can_fork(thread_id),
+                                has_unread_stop: active_thread_id != Some(thread_id)
+                                    && state.thread_has_unread_stop(thread_id),
+                            }
+                        })
+                        .collect(),
+                })
+                .collect();
+            (workspaces, active_thread_id)
         };
 
         div()
@@ -248,15 +286,14 @@ impl Render for SidebarView {
                             |(thread_index, thread)| {
                                 let thread_id = thread.id;
                                 let is_active = active_thread_id == Some(thread_id);
-                                let has_unread_stop = !is_active
-                                    && self.app_state.read(cx).thread_has_unread_stop(thread_id);
+                                let has_unread_stop = thread.has_unread_stop;
                                 let thread_dom_id = ws_index * 1000 + thread_index;
                                 let thread_name = thread.name.clone();
                                 let thread_drag_name = thread_name.clone();
                                 let rename_thread_name = thread.name.clone();
                                 let is_renaming = self.renaming_thread_id == Some(thread_id);
                                 let rename_input = self.rename_input.clone();
-                                let can_fork = self.app_state.read(cx).thread_can_fork(thread_id);
+                                let can_fork = thread.can_fork;
                                 let sidebar = cx.entity();
                                 let trailing = if has_unread_stop {
                                     div()
@@ -276,6 +313,7 @@ impl Render for SidebarView {
                                 let row = div()
                                     .id(("thread-item", thread_dom_id))
                                     .w_full()
+                                    .min_w_0()
                                     .pl_4()
                                     .pr_2()
                                     .py_1()
@@ -339,20 +377,25 @@ impl Render for SidebarView {
                                     }))
                                     .child(
                                         div()
-                                            .flex_1()
+                                            .w_full()
+                                            .min_w_0()
                                             .flex()
                                             .items_center()
-                                            .justify_between()
                                             .gap_2()
                                             .child(if is_renaming {
                                                 if let Some(input) = rename_input {
                                                     div()
                                                         .flex_1()
+                                                        .min_w_0()
                                                         .child(Input::new(&input))
                                                         .into_any_element()
                                                 } else {
                                                     div()
                                                         .flex_1()
+                                                        .min_w_0()
+                                                        .overflow_hidden()
+                                                        .whitespace_nowrap()
+                                                        .text_ellipsis()
                                                         .child(thread_name.clone())
                                                         .into_any_element()
                                                 }
@@ -360,16 +403,13 @@ impl Render for SidebarView {
                                                 div()
                                                     .flex_1()
                                                     .min_w_0()
-                                                    .child(
-                                                        div()
-                                                            .w_full()
-                                                            .overflow_hidden()
-                                                            .text_ellipsis()
-                                                            .child(thread_name.clone()),
-                                                    )
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .child(thread_name.clone())
                                                     .into_any_element()
                                             })
-                                            .child(trailing),
+                                            .child(div().flex_shrink_0().child(trailing)),
                                     );
 
                                 if is_renaming {
