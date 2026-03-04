@@ -6,6 +6,7 @@ use agent_client_protocol::{
 use gpui::prelude::*;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState, RopeExt};
+use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use gpui_component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_component::skeleton::Skeleton;
 use gpui_component::text::TextView;
@@ -2064,6 +2065,7 @@ impl Render for ChatView {
             } else {
                 div()
                     .relative()
+                    .flex()
                     .flex_1()
                     .w_full()
                     .min_w(px(0.0))
@@ -2071,7 +2073,7 @@ impl Render for ChatView {
                     .debug_selector(|| "chat-message-list-container".to_string())
                     .child(
                         div()
-                            .size_full()
+                            .flex_1()
                             .min_w(px(0.0))
                             .min_h(px(0.0))
                             .debug_selector(|| "chat-message-list-scrollable".to_string())
@@ -2109,6 +2111,10 @@ impl Render for ChatView {
                                 .min_w(px(0.0))
                                 .min_h(px(0.0)),
                             ),
+                    )
+                    .child(
+                        Scrollbar::vertical(&self.list_state)
+                            .scrollbar_show(ScrollbarShow::Always),
                     )
                     .into_any_element()
             }
