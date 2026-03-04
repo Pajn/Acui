@@ -105,6 +105,22 @@ pub struct AppState {
     persistence: Option<AppPersistence>,
     agents: Vec<crate::config::AgentConfig>,
     enable_mock_agent: bool,
+    /// Pre-connected agents at the app level.
+    /// All agents are connected when a new thread is created, and threads
+    /// just reference which pre-connected agent to use.
+    preconnected_agents: HashMap<String, PreconnectedAgent>,
+}
+
+/// A fully connected agent with active session.
+struct PreconnectedAgent {
+    controller: Rc<AcpController>,
+    session_id: SessionId,
+    process: std::process::Child,
+    rx: mpsc::UnboundedReceiver<AgentEvent>,
+    config_options: Vec<SessionConfigOption>,
+    mode: Option<SessionModeState>,
+    model: Option<SessionModelState>,
+    capabilities: Option<AgentCapabilities>,
 }
 
 impl Default for AppState {
@@ -162,10 +178,102 @@ impl AppState {
             persistence,
             agents,
             enable_mock_agent,
+            preconnected_agents: HashMap::new(),
+        }
+    }
+
+    /// Pre-connect to all agents in the background.
+    /// This is called when a new thread is created to make agent switching instant.
+    pub fn preconnect_all_agents(&mut self, cx: &mut Context<Self>) {
+        for agent in &self.agents {
+            if self.preconnected_agents.contains_key(&agent.name) {
+                continue; // Already connected
+            }
+
+            let agent = agent.clone();
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+            cx.spawn(
+                move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
+                    let mut cx = cx.clone();
+                    async move {
+                        let (event_tx, event_rx) = mpsc::unbounded_channel();
+
+                        let result =
+                            AcpController::connect_from_agent_config(&agent, event_tx).await;
+                        let (controller, process) = match result {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                eprintln!("preconnect: failed to connect to {}: {}", agent.name, e);
+                                return;
+                            }
+                        };
+
+                        // Initialize and create session
+                        let capabilities = match controller.initialize().await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("preconnect: failed to initialize {}: {}", agent.name, e);
+                                return;
+                            }
+                        };
+
+                        let session = match controller.new_session(cwd).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!(
+                                    "preconnect: failed to create session for {}: {}",
+                                    agent.name, e
+                                );
+                                return;
+                            }
+                        };
+
+                        eprintln!("preconnect: successfully pre-connected to {}", agent.name);
+
+                        // Store the pre-connected agent
+                        let preconnected = PreconnectedAgent {
+                            controller: Rc::new(controller),
+                            session_id: session.session_id.clone(),
+                            process,
+                            rx: event_rx,
+                            config_options: session.config_options.clone(),
+                            mode: session.modes,
+                            model: session.models,
+                            capabilities: Some(capabilities),
+                        };
+
+                        let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                            state
+                                .preconnected_agents
+                                .insert(agent.name.clone(), preconnected);
+
+                            // Propagate to threads that have this agent selected but no connection yet.
+                            for ts in state.thread_state.values_mut() {
+                                if ts.selected_agent_name.as_ref() == Some(&agent.name)
+                                    && ts.connection.is_none()
+                                {
+                                    let p = state.preconnected_agents.get(&agent.name).unwrap();
+                                    ts.config_options = p.config_options.clone();
+                                    ts.mode = p.mode.clone();
+                                    ts.model = p.model.clone();
+                                    ts.capabilities = p.capabilities.clone();
+                                }
+                            }
+                            cx.notify();
+                        });
+                    }
+                },
+            )
+            .detach();
         }
     }
 
     pub fn restore_persisted_state(&mut self, cx: &mut Context<Self>) -> anyhow::Result<()> {
+        // Pre-connect to all agents in the background for instant agent switching
+        // This runs regardless of whether we have persisted state
+        self.preconnect_all_agents(cx);
+
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
@@ -308,13 +416,25 @@ impl AppState {
             self.ts_mut(thread_id).mock_event_sender = Some(tx);
         }
 
-        // Pre-select the first configured agent for the thread and connect immediately
-        // so session options (modes, models) are available before the first message.
+        // Pre-connect to all agents so switching is instant
+        self.preconnect_all_agents(cx);
+
+        // Pre-select the first configured agent for the thread
+        // The connection is already established via preconnect_all_agents
         let first_agent = self.agents.first().cloned();
         if let Some(agent) = first_agent {
-            self.ts_mut(thread_id).selected_agent_name = Some(agent.name.clone());
-            // Connect immediately to get session options available
-            self.connect_thread_to_agent(cx, thread_id, agent);
+            let preconnected = self.preconnected_agents.get(&agent.name);
+            let config_options = preconnected.map(|p| p.config_options.clone());
+            let mode = preconnected.map(|p| p.mode.clone());
+            let model = preconnected.map(|p| p.model.clone());
+            let capabilities = preconnected.map(|p| p.capabilities.clone());
+
+            let ts = self.ts_mut(thread_id);
+            ts.selected_agent_name = Some(agent.name.clone());
+            ts.config_options = config_options.unwrap_or_default();
+            ts.mode = mode.flatten();
+            ts.model = model.flatten();
+            ts.capabilities = capabilities.flatten();
         }
 
         self.persist_state();
@@ -531,51 +651,70 @@ impl AppState {
         &self.agents
     }
 
+    /// Check if a named agent is pre-connected.
+    pub fn agent_is_preconnected(&self, agent_name: &str) -> bool {
+        self.preconnected_agents.contains_key(agent_name)
+    }
+
+    /// Take a pre-connected agent by name, if available.
+    fn take_preconnected_agent(&mut self, agent_name: &str) -> Option<PreconnectedAgent> {
+        self.preconnected_agents.remove(agent_name)
+    }
+
     /// Select a named agent for the active thread (before first message).
-    /// Immediately connects to the selected agent so session options are available.
+    /// Uses pre-connected agents for instant switching.
     pub fn select_agent_for_thread(
         &mut self,
         cx: &mut Context<Self>,
         thread_id: Uuid,
         agent_name: String,
     ) {
+        // Check if already selected
+        let already_selected = self
+            .ts(thread_id)
+            .map(|ts| ts.selected_agent_name.as_ref() == Some(&agent_name))
+            .unwrap_or(false);
+
+        if already_selected {
+            return;
+        }
+
+        // Now update the thread state
         let ts = self.ts_mut(thread_id);
-
-        // Check if we're already connected to this agent - don't reconnect if so
-        let already_connected = ts.connection.is_some()
-            && ts
-                .selected_agent_name
-                .as_ref()
-                .is_some_and(|n| n == &agent_name);
-
-        // Check if we're switching to a different agent
-        let switching_agents = ts
-            .selected_agent_name
-            .as_ref()
-            .is_some_and(|n| n != &agent_name);
-
         ts.selected_agent_name = Some(agent_name.clone());
 
-        // Only disconnect if changing agents or not yet connected
-        // Note: We don't eagerly connect here - that happens lazily when the first
-        // message is sent via connect_and_send in send_user_message.
-        // This avoids race conditions between eager and lazy connection attempts.
-        if !already_connected {
-            // Disconnect from current agent if connected (to abandon empty session)
-            ts.connection = None;
-            ts.agent_task = None;
-            ts.config_options.clear();
-            ts.mode = None;
-            ts.model = None;
-            ts.capabilities = None;
+        // Clear existing state
+        ts.config_options.clear();
+        ts.mode = None;
+        ts.model = None;
+        ts.capabilities = None;
 
-            // When switching to a different agent, clear the session_id so we don't
-            // try to load the previous agent's session. We'll create a fresh one
-            // when the first message is sent.
-            if switching_agents && let Some(thread) = self.find_thread_mut(thread_id) {
-                thread.session_id = None;
-            }
+        // If we have a pre-connected agent, take it and attach it immediately.
+        if let Some(preconnected) = self.take_preconnected_agent(&agent_name) {
+            let session = crate::client::SessionBootstrap {
+                session_id: preconnected.session_id.clone(),
+                config_options: preconnected.config_options.clone(),
+                modes: preconnected.mode.clone(),
+                models: preconnected.model.clone(),
+            };
+            let controller = preconnected.controller.clone();
+            self.attach_connection_rc(
+                cx,
+                thread_id,
+                controller,
+                session,
+                preconnected.capabilities.clone().unwrap_or_default(),
+                Some(preconnected.process),
+                preconnected.rx,
+            );
+            // Re-fill the pre-connect cache for other threads
+            self.preconnect_all_agents(cx);
+        } else {
+            // No pre-connection ready, wait for preconnect_all_agents to propagate it
+            // or for first message to connect.
+            self.preconnect_all_agents(cx);
         }
+
         cx.notify();
     }
 
@@ -1153,7 +1292,7 @@ impl AppState {
             .ts(thread_id)
             .and_then(|ts| ts.connection.as_ref())
             .map(|c| (Rc::clone(&c.controller), c.session_id.clone()));
-        let mock_tx = self
+        let _mock_tx = self
             .ts(thread_id)
             .and_then(|ts| ts.mock_event_sender.as_ref())
             .cloned();
@@ -1184,33 +1323,89 @@ impl AppState {
             )
             .detach();
         } else {
-            // No connection yet — try to lazily connect to the selected/locked agent.
-            let agent = self
+            // Try to use a pre-connected agent
+            let agent_name = self
                 .ts(thread_id)
-                .and_then(|ts| ts.selected_agent_name.as_ref())
+                .and_then(|ts| ts.selected_agent_name.clone())
                 .or_else(|| {
                     self.find_thread(thread_id)
-                        .and_then(|t| t.agent_name.as_ref())
-                })
-                .and_then(|name| self.agents.iter().find(|a| a.name == *name))
-                .cloned();
+                        .and_then(|t| t.agent_name.clone())
+                });
 
-            if let Some(agent) = agent {
-                let content = content.to_owned();
-                self.ts_mut(thread_id).prompt_started_at = Some(Instant::now());
-                self.connect_and_send(cx, thread_id, agent, content);
-            } else if let Some(event_tx) = mock_tx {
-                let content = content.to_owned();
-                let chunks = ["Mock reply: ", &content];
-                for chunk in chunks {
-                    let update = SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                        ContentBlock::from(chunk.to_owned()),
-                    ));
-                    let notification =
-                        SessionNotification::new(SessionId::new("mock-session"), update);
-                    let _ = event_tx.send(AgentEvent::Notification(notification));
+            if let Some(agent_name) = agent_name {
+                if let Some(preconnected) = self.take_preconnected_agent(&agent_name) {
+                    // Consume the pre-connected agent
+                    let controller = preconnected.controller.clone();
+                    let session_id = preconnected.session_id.clone();
+                    let session = crate::client::SessionBootstrap {
+                        session_id: session_id.clone(),
+                        config_options: preconnected.config_options.clone(),
+                        modes: preconnected.mode.clone(),
+                        models: preconnected.model.clone(),
+                    };
+                    let capabilities = preconnected.capabilities.clone().unwrap_or_default();
+                    let process = preconnected.process;
+                    let event_rx = preconnected.rx;
+
+                    // Attach it to the thread first
+                    self.attach_connection_rc(
+                        cx,
+                        thread_id,
+                        controller.clone(),
+                        session,
+                        capabilities,
+                        Some(process),
+                        event_rx,
+                    );
+                    // Re-fill cache
+                    self.preconnect_all_agents(cx);
+
+                    let content = content.to_owned();
+                    self.ts_mut(thread_id).prompt_started_at = Some(Instant::now());
+                    cx.spawn(
+                        move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
+                            let mut cx = cx.clone();
+                            async move {
+                                match controller.send_prompt(session_id, content).await {
+                                    Ok(stop_reason) => {
+                                        let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                            state.apply_prompt_stop_reason(
+                                                cx,
+                                                thread_id,
+                                                stop_reason,
+                                            );
+                                        });
+                                    }
+                                    Err(err) => {
+                                        let message = format!("Prompt failed: {err}");
+                                        let _ = this.update(&mut cx, |state: &mut AppState, cx| {
+                                            state.ts_mut(thread_id).prompt_started_at = None;
+                                            state.push_system_message(cx, thread_id, message);
+                                        });
+                                    }
+                                }
+                            }
+                        },
+                    )
+                    .detach();
+                } else {
+                    // No pre-connected agent ready - fall back to connecting on demand
+                    let agent = self
+                        .ts(thread_id)
+                        .and_then(|ts| ts.selected_agent_name.clone())
+                        .or_else(|| {
+                            self.find_thread(thread_id)
+                                .and_then(|t| t.agent_name.clone())
+                        })
+                        .and_then(|name| self.agents.iter().find(|a| a.name == *name))
+                        .cloned();
+
+                    if let Some(agent) = agent {
+                        let content = content.to_owned();
+                        self.ts_mut(thread_id).prompt_started_at = Some(Instant::now());
+                        self.connect_and_send(cx, thread_id, agent, content);
+                    }
                 }
-                let _ = event_tx.send(AgentEvent::Disconnected);
             }
         }
 
@@ -1218,7 +1413,7 @@ impl AppState {
     }
 
     /// Connect to an agent and send a prompt in a single async task.
-    /// Used for the first message on an unlocked thread (lazy connect).
+    /// This is a fallback for when pre-connected agents aren't available.
     fn connect_and_send(
         &mut self,
         cx: &mut Context<Self>,
@@ -1227,6 +1422,7 @@ impl AppState {
         content: String,
     ) {
         self.append_log_line("to_agent.connect_and_send", thread_id, &agent.name);
+
         cx.spawn(
             move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
                 let mut cx = cx.clone();
@@ -1234,7 +1430,7 @@ impl AppState {
                     let (event_tx, event_rx) = mpsc::unbounded_channel();
                     let connect_result =
                         AcpController::connect_from_agent_config(&agent, event_tx).await;
-                    let (controller, process) = match connect_result {
+                    let (controller, process): (AcpController, _) = match connect_result {
                         Ok(pair) => pair,
                         Err(err) => {
                             let message = format!("Failed to connect ACP controller: {err}");
@@ -1356,6 +1552,7 @@ impl AppState {
     ) {
         self.append_log_line("to_agent.connect", thread_id, &agent.name);
         self.ts_mut(thread_id).connecting = true;
+
         cx.spawn(
             move |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
                 let mut cx = cx.clone();
@@ -1564,6 +1761,27 @@ impl AppState {
         process: Option<std::process::Child>,
         rx: mpsc::UnboundedReceiver<AgentEvent>,
     ) {
+        self.attach_connection_rc(
+            cx,
+            thread_id,
+            Rc::new(controller),
+            session,
+            capabilities,
+            process,
+            rx,
+        );
+    }
+
+    fn attach_connection_rc(
+        &mut self,
+        cx: &mut Context<Self>,
+        thread_id: Uuid,
+        controller: Rc<AcpController>,
+        session: crate::client::SessionBootstrap,
+        capabilities: AgentCapabilities,
+        process: Option<std::process::Child>,
+        rx: mpsc::UnboundedReceiver<AgentEvent>,
+    ) {
         self.listen_to_agent_events(cx, thread_id, rx);
         let session_id = session.session_id.clone();
         if let Some(thread) = self.find_thread_mut(thread_id) {
@@ -1571,7 +1789,7 @@ impl AppState {
         }
         let ts = self.ts_mut(thread_id);
         ts.connection = Some(ThreadAgentConnection {
-            controller: Rc::new(controller),
+            controller,
             session_id,
             _process: process,
         });

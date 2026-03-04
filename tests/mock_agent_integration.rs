@@ -456,3 +456,189 @@ async fn fork_session_creates_new_thread(cx: &mut TestAppContext) {
 
     let _ = fs::remove_dir_all(temp_dir);
 }
+
+/// Test that pre-connected agents are populated when a new thread is created.
+/// The pre-connected agents should be available asynchronously after thread creation.
+#[gpui::test]
+async fn preconnected_agents_populated_on_thread_creation(cx: &mut TestAppContext) {
+    let temp_dir =
+        std::env::temp_dir().join(format!("acui-mock-preconnect-{}", uuid::Uuid::new_v4()));
+    let workspace = temp_dir.join("workspace");
+    let data_dir = temp_dir.join("data");
+    fs::create_dir_all(&workspace).expect("should create workspace");
+    fs::create_dir_all(&data_dir).expect("should create data dir");
+
+    let agent = make_agent_config(&workspace);
+    let state = create_state_entity(cx, data_dir.clone(), agent.clone());
+
+    // Create a new thread - this should trigger pre-connection of all agents
+    let _thread_id = state.update(cx, |state, cx| {
+        let workspace_id = state.add_workspace_from_path(cx, workspace.clone());
+        state.add_thread(cx, workspace_id, "Thread 1")
+    });
+
+    // Wait for pre-connected agents to be populated (async background task)
+    wait_for_state(cx, &state, |state| {
+        state.agent_is_preconnected("mock-agent")
+    });
+
+    // The thread should have config options available from the pre-connected agent
+    wait_for_state(cx, &state, |state| {
+        state
+            .active_thread_config_options()
+            .map(|opts| !opts.is_empty())
+            .unwrap_or(false)
+    });
+
+    let has_config = state.update(cx, |state, _| {
+        state
+            .active_thread_config_options()
+            .is_some_and(|opts| !opts.is_empty())
+    });
+    assert!(
+        has_config,
+        "Thread should have config options from pre-connected agent"
+    );
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+/// Test that agent switching is instant - config options should be available immediately
+/// after selecting a different agent (copied from pre-connected agent).
+#[gpui::test]
+async fn agent_switching_is_instant(cx: &mut TestAppContext) {
+    let temp_dir = std::env::temp_dir().join(format!("acui-mock-switch-{}", uuid::Uuid::new_v4()));
+    let workspace = temp_dir.join("workspace");
+    let data_dir = temp_dir.join("data");
+    fs::create_dir_all(&workspace).expect("should create workspace");
+    fs::create_dir_all(&data_dir).expect("should create data dir");
+
+    let agent1 = AgentConfig {
+        name: "agent-1".to_string(),
+        command: env!("CARGO_BIN_EXE_acui_mock_agent").to_string(),
+        args: vec![],
+        cwd: Some(workspace.clone()),
+    };
+
+    let agent2 = AgentConfig {
+        name: "agent-2".to_string(),
+        command: env!("CARGO_BIN_EXE_acui_mock_agent").to_string(),
+        args: vec![],
+        cwd: Some(workspace.clone()),
+    };
+
+    let state = cx.update(|cx| {
+        cx.new(|_| {
+            AppState::new_with_config(AppConfig {
+                data_dir,
+                agents: vec![agent1.clone(), agent2],
+                enable_mock_agent: false,
+                log_file: None,
+            })
+        })
+    });
+
+    // Create a thread to trigger pre-connection logic and give us something to switch on
+    state.update(cx, |state, cx| {
+        let workspace_id = state.add_workspace_from_path(cx, workspace.clone());
+        state.add_thread(cx, workspace_id, "Thread 1");
+    });
+
+    // Wait for pre-connected agents to be ready
+    wait_for_state(cx, &state, |state| {
+        state.agent_is_preconnected("agent-1") && state.agent_is_preconnected("agent-2")
+    });
+
+    // Config for agent-1 should already be available because it was the first agent
+    wait_for_state(cx, &state, |state| {
+        state
+            .active_thread_config_options()
+            .is_some_and(|opts| !opts.is_empty())
+    });
+
+    // Switch to agent-2 - this should be instant (just copying from pre-connected)
+    let switched = state.update(cx, |state, cx| {
+        if let Some(thread_id) = state.active_thread_id {
+            state.select_agent_for_thread(cx, thread_id, "agent-2".to_string());
+            true
+        } else {
+            false
+        }
+    });
+    assert!(switched);
+
+    // Config should be available immediately after switching (synchronous copy)
+    let has_config_after_switch = state.update(cx, |state, _| {
+        state
+            .active_thread_config_options()
+            .is_some_and(|opts| !opts.is_empty())
+    });
+    assert!(
+        has_config_after_switch,
+        "Config should be available immediately after agent switch"
+    );
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+/// Test that messages are sent through the pre-connected agent connection.
+#[gpui::test]
+async fn message_uses_preconnected_agent(cx: &mut TestAppContext) {
+    let temp_dir = std::env::temp_dir().join(format!("acui-mock-msg-{}", uuid::Uuid::new_v4()));
+    let workspace = temp_dir.join("workspace");
+    let data_dir = temp_dir.join("data");
+    fs::create_dir_all(&workspace).expect("should create workspace");
+    fs::create_dir_all(&data_dir).expect("should create data dir");
+
+    let agent = make_agent_config(&workspace);
+    let state = cx.update(|cx| {
+        cx.new(|_| {
+            AppState::new_with_config(AppConfig {
+                data_dir,
+                agents: vec![agent.clone()],
+                enable_mock_agent: false,
+                log_file: None,
+            })
+        })
+    });
+
+    let thread_id = state.update(cx, |state, cx| {
+        let workspace_id = state.add_workspace_from_path(cx, workspace.clone());
+
+        state
+            .add_thread(cx, workspace_id, "Thread 1")
+            .expect("thread")
+    });
+
+    // Wait for pre-connection to be ready
+    wait_for_state(cx, &state, |state| {
+        state.agent_is_preconnected("mock-agent")
+    });
+
+    // Send a message - should use the pre-connected agent
+    state.update(cx, |state, cx| {
+        state.send_user_message(cx, thread_id, "cwd");
+    });
+
+    // Verify the message was processed
+    let expected_cwd = workspace.display().to_string();
+    wait_for_state(cx, &state, |state| {
+        state
+            .active_thread_messages()
+            .iter()
+            .any(|msg| msg.content.to_string().contains(&expected_cwd))
+    });
+
+    let message_received = state.update(cx, |state, _| {
+        state
+            .active_thread_messages()
+            .iter()
+            .any(|msg| msg.content.to_string().contains(&expected_cwd))
+    });
+    assert!(
+        message_received,
+        "Message should be processed via pre-connected agent"
+    );
+
+    let _ = fs::remove_dir_all(temp_dir);
+}

@@ -689,9 +689,20 @@ impl AcpController {
         let controller = Self::connect(incoming, outgoing, event_tx).await?;
         Ok((controller, child))
     }
+
+    /// Connect using pre-warmed process streams (faster than spawning a new process).
+    pub async fn connect_from_streams(
+        stdout: ChildStdout,
+        stdin: ChildStdin,
+        event_tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> anyhow::Result<Self> {
+        let (incoming, outgoing) = bridge_stdio(stdout, stdin);
+        let controller = Self::connect(incoming, outgoing, event_tx).await?;
+        Ok(controller)
+    }
 }
 
-fn spawn_agent_process(
+pub fn spawn_agent_process(
     config: &AgentProcessConfig,
 ) -> anyhow::Result<(Child, ChildStdout, ChildStdin)> {
     let mut cmd = std::process::Command::new(&config.command);
