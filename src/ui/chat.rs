@@ -114,6 +114,7 @@ const VIRTUALIZE_CHAR_THRESHOLD: usize = 16_384;
 const VIRTUALIZED_CHUNK_LINES: usize = 12;
 const VIRTUALIZED_BLOCK_HEIGHT: f32 = 200.0;
 const VIRTUALIZED_CODE_LINE_HEIGHT: f32 = 16.0;
+const NON_SCROLL_RENDER_CHUNK_LINES: usize = 200;
 const EDITOR_HIGHLIGHT_MAX_LINES: usize = 1_200;
 const EDITOR_HIGHLIGHT_MAX_CHARS: usize = 256_000;
 
@@ -916,6 +917,76 @@ impl ChatView {
             .into_any_element()
     }
 
+    fn render_virtualized_code_chunk_highlighted(
+        message_id: Uuid,
+        block_key: &str,
+        language: &str,
+        chunk_index: usize,
+        chunk: &VirtualizedCodeChunk,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let row_bg = if chunk.has_added && !chunk.has_removed {
+            rgb(0x173221)
+        } else if chunk.has_removed && !chunk.has_added {
+            rgb(0x3a1f24)
+        } else {
+            rgb(0x1e1e1e)
+        };
+        let has_signs = chunk.has_added || chunk.has_removed;
+        let sign_color = if chunk.has_added && !chunk.has_removed {
+            rgb(0x82dca7)
+        } else if chunk.has_removed && !chunk.has_added {
+            rgb(0xf2a2a2)
+        } else {
+            rgb(0x909090)
+        };
+        let chunk_fingerprint = text_fingerprint(&chunk.code_text);
+        let markdown = format!("```{language}\n{}\n```", chunk.code_text);
+        let markdown_key = SharedString::from(format!(
+            "chat-code-highlighted-{message_id}-{block_key}-{chunk_index}-{}-{}-{}",
+            chunk_fingerprint.len, chunk_fingerprint.head, chunk_fingerprint.tail
+        ));
+
+        div()
+            .w_full()
+            .min_w(px(0.0))
+            .flex()
+            .items_start()
+            .border_b_1()
+            .border_color(rgb(0x2d2d30))
+            .bg(row_bg)
+            .when(has_signs, |this| {
+                this.child(
+                    div()
+                        .w(px(18.0))
+                        .px_1()
+                        .py_1()
+                        .text_xs()
+                        .text_color(sign_color)
+                        .whitespace_nowrap()
+                        .child(chunk.signs.clone()),
+                )
+            })
+            .child(
+                div()
+                    .w(px(64.0))
+                    .px_1()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(0x8a8a8a))
+                    .whitespace_nowrap()
+                    .child(chunk.line_numbers.clone()),
+            )
+            .child(
+                div().flex_1().min_w(px(0.0)).px_1().py_1().child(
+                    TextView::markdown(markdown_key, SharedString::from(markdown), window, cx)
+                        .selectable(true),
+                ),
+            )
+            .into_any_element()
+    }
+
     fn render_virtualized_code_block(
         message_id: Uuid,
         block_key: &str,
@@ -967,6 +1038,11 @@ impl ChatView {
         let chunks_for_render = chunks.clone();
 
         if !options.inner_scroll {
+            let render_chunks = if use_editor {
+                build_non_scrolling_render_chunks(chunks_for_render.as_ref())
+            } else {
+                chunks_for_render.as_ref().to_vec()
+            };
             return div()
                 .w_full()
                 .rounded_md()
@@ -975,12 +1051,12 @@ impl ChatView {
                 .bg(rgb(0x1e1e1e))
                 .overflow_hidden()
                 .children(
-                    chunks_for_render
+                    render_chunks
                         .iter()
                         .enumerate()
                         .map(|(chunk_index, chunk)| {
                             if use_editor {
-                                ChatView::render_virtualized_code_chunk_editor(
+                                ChatView::render_virtualized_code_chunk_highlighted(
                                     message_id,
                                     &block_key,
                                     &language,
@@ -1393,7 +1469,7 @@ impl ChatView {
                                             text,
                                             VirtualizedCodeRenderOptions {
                                                 parse_numbered_lines: true,
-                                                prefer_editor: !is_read_tool,
+                                                prefer_editor: true,
                                                 inner_scroll: !is_read_tool,
                                             },
                                             window,
@@ -2678,6 +2754,61 @@ fn push_virtualized_code_chunk(chunks: &mut Vec<VirtualizedCodeChunk>, lines: &[
     });
 }
 
+fn merge_virtualized_code_chunks(chunks: &[VirtualizedCodeChunk]) -> VirtualizedCodeChunk {
+    let mut code_text = String::new();
+    let mut line_numbers = String::new();
+    let mut signs = String::new();
+    let mut line_count = 0usize;
+    let mut has_added = false;
+    let mut has_removed = false;
+
+    for (index, chunk) in chunks.iter().enumerate() {
+        if index > 0 {
+            code_text.push('\n');
+            line_numbers.push('\n');
+            signs.push('\n');
+        }
+        code_text.push_str(&chunk.code_text);
+        line_numbers.push_str(&chunk.line_numbers);
+        signs.push_str(&chunk.signs);
+        line_count += chunk.line_count;
+        has_added |= chunk.has_added;
+        has_removed |= chunk.has_removed;
+    }
+
+    VirtualizedCodeChunk {
+        code_text,
+        line_numbers,
+        signs,
+        line_count,
+        has_added,
+        has_removed,
+    }
+}
+
+fn build_non_scrolling_render_chunks(chunks: &[VirtualizedCodeChunk]) -> Vec<VirtualizedCodeChunk> {
+    let mut merged = Vec::new();
+    let mut current = Vec::new();
+    let mut current_line_count = 0usize;
+
+    for chunk in chunks {
+        if current_line_count > 0
+            && current_line_count + chunk.line_count > NON_SCROLL_RENDER_CHUNK_LINES
+        {
+            merged.push(merge_virtualized_code_chunks(&current));
+            current.clear();
+            current_line_count = 0;
+        }
+        current.push(chunk.clone());
+        current_line_count += chunk.line_count;
+    }
+
+    if !current.is_empty() {
+        merged.push(merge_virtualized_code_chunks(&current));
+    }
+    merged
+}
+
 fn build_virtualized_code_chunks(
     text: &str,
     parse_numbered_lines: bool,
@@ -3151,6 +3282,23 @@ mod tests {
                 .next()
                 .expect("expected first line number in second chunk"),
             format!("{:>6}", 183 + VIRTUALIZED_CHUNK_LINES)
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn non_scrolling_render_chunk_builder_merges_small_chunks() {
+        let mut payload = String::new();
+        for index in 1..=450 {
+            let _ = writeln!(payload, "{index:>6}: let value_{index} = {index};");
+        }
+        let base_chunks = build_virtualized_code_chunks(&payload, true);
+        let render_chunks = build_non_scrolling_render_chunks(&base_chunks);
+        assert!(base_chunks.len() > render_chunks.len());
+        assert_eq!(render_chunks.iter().map(|chunk| chunk.line_count).sum::<usize>(), 451);
+        assert!(
+            render_chunks
+                .iter()
+                .all(|chunk| chunk.line_count <= NON_SCROLL_RENDER_CHUNK_LINES + 1)
         );
     }
 
