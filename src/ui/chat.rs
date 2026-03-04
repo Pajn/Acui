@@ -18,9 +18,6 @@ use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 use uuid::Uuid;
 
-mod support;
-use support::render_config_option_row;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SuggestionKind {
     Slash,
@@ -254,6 +251,7 @@ pub struct ChatView {
     input_state: Entity<InputState>,
     mode_select_state: Entity<SelectState<Vec<PickerOption>>>,
     model_select_state: Entity<SelectState<Vec<PickerOption>>>,
+    config_select_states: Vec<Entity<SelectState<Vec<PickerOption>>>>,
     locked_to_bottom: bool,
     render_pending: bool,
     // Set by the list scroll_handler (fired while list_state is borrow_mut'd)
@@ -279,6 +277,38 @@ impl ChatView {
             cx.new(|cx| SelectState::new(Vec::<PickerOption>::new(), None, window, cx));
         let model_select_state =
             cx.new(|cx| SelectState::new(Vec::<PickerOption>::new(), None, window, cx));
+        let config_select_states: Vec<_> = (0..4)
+            .map(|_| cx.new(|cx| SelectState::new(Vec::<PickerOption>::new(), None, window, cx)))
+            .collect();
+
+        for (idx, select_state) in config_select_states.iter().enumerate() {
+            let idx_clone = idx;
+            cx.subscribe(
+                select_state,
+                move |this, _state, event: &SelectEvent<Vec<PickerOption>>, cx| {
+                    let SelectEvent::Confirm(Some(value)) = event else {
+                        return;
+                    };
+                    if let Some(thread_id) = this.app_state.read(cx).active_thread_id
+                        && let Some(option_id) = this
+                            .app_state
+                            .read(cx)
+                            .active_thread_config_options()
+                            .and_then(|opts| opts.get(idx_clone).map(|o| o.id.to_string()))
+                    {
+                        this.app_state.update(cx, |state, cx| {
+                            state.set_session_config_option(
+                                cx,
+                                thread_id,
+                                option_id,
+                                value.clone(),
+                            );
+                        });
+                    }
+                },
+            )
+            .detach();
+        }
 
         cx.observe(&app_state, |this, _, cx| {
             if this.locked_to_bottom {
@@ -442,6 +472,7 @@ impl ChatView {
             input_state,
             mode_select_state,
             model_select_state,
+            config_select_states,
             locked_to_bottom: true,
             render_pending: false,
             user_scrolled: false,
@@ -2166,13 +2197,64 @@ impl Render for ChatView {
             _ => div(),
         };
 
+        let has_config_options = config_options
+            .as_ref()
+            .map(|opts| !opts.is_empty())
+            .unwrap_or(false);
+
         let config_panel = match (active_thread_id, config_options) {
-            (Some(thread_id), Some(options)) if !options.is_empty() => {
+            (Some(_thread_id), Some(options)) if !options.is_empty() => {
                 let option_rows = options
                     .into_iter()
                     .enumerate()
                     .map(|(option_index, option)| {
-                        render_config_option_row(cx, thread_id, option_index, option)
+                        let _option_id = option.id.to_string();
+                        let title = div().text_color(rgb(0xdddddd)).child(option.name);
+                        match option.kind {
+                            agent_client_protocol::SessionConfigKind::Select(select) => {
+                                let entries = match select.options {
+                                    agent_client_protocol::SessionConfigSelectOptions::Ungrouped(values) => values
+                                        .into_iter()
+                                        .map(|entry| PickerOption::new(entry.value.to_string(), entry.name))
+                                        .collect::<Vec<_>>(),
+                                    agent_client_protocol::SessionConfigSelectOptions::Grouped(groups) => groups
+                                        .into_iter()
+                                        .flat_map(|group| {
+                                            group.options.into_iter().map(move |entry| {
+                                                PickerOption::new(
+                                                    entry.value.to_string(),
+                                                    format!("{} / {}", group.group, entry.name),
+                                                )
+                                            })
+                                        })
+                                        .collect::<Vec<_>>(),
+                                    _ => Vec::new(),
+                                };
+                                let current_value = select.current_value.to_string();
+                                if option_index < self.config_select_states.len() {
+                                    let select_state = &self.config_select_states[option_index];
+                                    select_state.update(cx, |state, cx| {
+                                        state.set_items(entries, _window, cx);
+                                        state.set_selected_value(&current_value, _window, cx);
+                                        cx.notify();
+                                    });
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(title)
+                                        .child(
+                                            div()
+                                                .id(("session-config-select", option_index))
+                                                .child(Select::new(select_state).menu_width(px(220.0)).max_h(px(300.0))),
+                                        )
+                                } else {
+                                    div().w_full().child(title)
+                                }
+                            }
+                            _ => div().w_full().child(title),
+                        }
                     });
                 div()
                     .w_full()
@@ -2189,7 +2271,7 @@ impl Render for ChatView {
             _ => div(),
         };
 
-        let model_panel = match (active_thread_id, models) {
+        let model_panel = match (active_thread_id, models, has_config_options) {
             (
                 Some(_thread_id),
                 Some(SessionModelState {
@@ -2197,6 +2279,7 @@ impl Render for ChatView {
                     available_models,
                     ..
                 }),
+                false,
             ) if !available_models.is_empty() => {
                 let options = available_models
                     .into_iter()
@@ -2226,7 +2309,7 @@ impl Render for ChatView {
             _ => div(),
         };
 
-        let mode_panel = match (active_thread_id, modes) {
+        let mode_panel = match (active_thread_id, modes, has_config_options) {
             (
                 Some(_thread_id),
                 Some(SessionModeState {
@@ -2234,6 +2317,7 @@ impl Render for ChatView {
                     available_modes,
                     ..
                 }),
+                false,
             ) if !available_modes.is_empty() => {
                 let options = available_modes
                     .into_iter()

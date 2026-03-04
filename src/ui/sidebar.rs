@@ -275,6 +275,7 @@ impl Render for SidebarView {
 
                                 let row = div()
                                     .id(("thread-item", thread_dom_id))
+                                    .w_full()
                                     .pl_4()
                                     .pr_2()
                                     .py_1()
@@ -338,6 +339,7 @@ impl Render for SidebarView {
                                     }))
                                     .child(
                                         div()
+                                            .flex_1()
                                             .flex()
                                             .items_center()
                                             .justify_between()
@@ -357,7 +359,14 @@ impl Render for SidebarView {
                                             } else {
                                                 div()
                                                     .flex_1()
-                                                    .child(thread_name.clone())
+                                                    .min_w_0()
+                                                    .child(
+                                                        div()
+                                                            .w_full()
+                                                            .overflow_hidden()
+                                                            .text_ellipsis()
+                                                            .child(thread_name.clone()),
+                                                    )
                                                     .into_any_element()
                                             })
                                             .child(trailing),
