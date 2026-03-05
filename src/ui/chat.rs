@@ -5,11 +5,14 @@ use agent_client_protocol::{
 };
 use gpui::prelude::*;
 use gpui::*;
+use gpui_component::Sizable;
 use gpui_component::input::{Input, InputEvent, InputState, RopeExt};
 use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use gpui_component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_component::skeleton::Skeleton;
+use gpui_component::spinner::Spinner;
 use gpui_component::text::TextView;
+use gpui_component::{Icon, IconName};
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -118,6 +121,15 @@ const VIRTUALIZED_CODE_LINE_HEIGHT: f32 = 16.0;
 const NON_SCROLL_RENDER_CHUNK_LINES: usize = 200;
 const EDITOR_HIGHLIGHT_MAX_LINES: usize = 1_200;
 const EDITOR_HIGHLIGHT_MAX_CHARS: usize = 256_000;
+const CHAT_BG_COLOR: u32 = 0x111319;
+const CHAT_PANEL_COLOR: u32 = 0x171a20;
+const CHAT_CARD_COLOR: u32 = 0x1c212a;
+const CHAT_BORDER_COLOR: u32 = 0x2a2f38;
+const CHAT_TEXT_COLOR: u32 = 0xe5e9f0;
+const CHAT_MUTED_TEXT_COLOR: u32 = 0x8b94a6;
+const CHAT_SECONDARY_TEXT_COLOR: u32 = 0xb7becd;
+const CHAT_ACCENT_COLOR: u32 = 0x2f6feb;
+const CHAT_DANGER_COLOR: u32 = 0xa44949;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct TextFingerprint {
@@ -279,11 +291,12 @@ struct MessageContentCache {
     content: Option<Arc<MessageContent>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct VirtualizedCodeRenderOptions {
     parse_numbered_lines: bool,
     prefer_editor: bool,
     inner_scroll: bool,
+    copy_output: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -316,6 +329,7 @@ pub struct ChatView {
     history_cursor: Option<usize>,
     history_draft: String,
     expanded_messages: HashSet<Uuid>,
+    expanded_tool_calls: HashSet<Uuid>,
 }
 
 impl ChatView {
@@ -535,6 +549,7 @@ impl ChatView {
             history_cursor: None,
             history_draft: String::new(),
             expanded_messages: HashSet::new(),
+            expanded_tool_calls: HashSet::new(),
         }
     }
 
@@ -906,7 +921,7 @@ impl ChatView {
         } else if chunk.has_removed && !chunk.has_added {
             rgb(0x3a1f24)
         } else {
-            rgb(0x1e1e1e)
+            rgb(CHAT_PANEL_COLOR)
         };
         let has_signs = chunk.has_added || chunk.has_removed;
         let sign_color = if chunk.has_added && !chunk.has_removed {
@@ -923,7 +938,7 @@ impl ChatView {
             .flex()
             .items_start()
             .border_b_1()
-            .border_color(rgb(0x2d2d30))
+            .border_color(rgb(CHAT_BORDER_COLOR))
             .bg(row_bg)
             .when(has_signs, |this| {
                 this.child(
@@ -964,7 +979,7 @@ impl ChatView {
         } else if chunk.has_removed && !chunk.has_added {
             rgb(0x3a1f24)
         } else {
-            rgb(0x1e1e1e)
+            rgb(CHAT_PANEL_COLOR)
         };
         let has_signs = chunk.has_added || chunk.has_removed;
         let sign_color = if chunk.has_added && !chunk.has_removed {
@@ -981,7 +996,7 @@ impl ChatView {
             .flex()
             .items_start()
             .border_b_1()
-            .border_color(rgb(0x2d2d30))
+            .border_color(rgb(CHAT_BORDER_COLOR))
             .bg(row_bg)
             .when(has_signs, |this| {
                 this.child(
@@ -1012,7 +1027,7 @@ impl ChatView {
                     .px_1()
                     .py_1()
                     .text_xs()
-                    .text_color(rgb(0xd6d6d6))
+                    .text_color(rgb(CHAT_SECONDARY_TEXT_COLOR))
                     .whitespace_nowrap()
                     .child(chunk.code_text.clone()),
             )
@@ -1028,12 +1043,39 @@ impl ChatView {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
+        let language = SharedString::from(language.to_string());
+        let chunk_rows = chunk.line_count.max(1);
+        let initial_value = chunk.code_text.clone();
+        let chunk_fingerprint = text_fingerprint(&chunk.code_text);
+        let input_state = window
+            .use_keyed_state(
+                SharedString::from(format!(
+                    "chat-code-highlight-input-{message_id}-{block_key}-{chunk_index}-{}-{}-{}",
+                    chunk_fingerprint.len, chunk_fingerprint.head, chunk_fingerprint.tail
+                )),
+                cx,
+                |window, cx| {
+                    cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .multi_line(true)
+                            .code_editor(language)
+                            .line_number(false)
+                            .rows(chunk_rows)
+                            .searchable(false)
+                            .soft_wrap(false)
+                            .default_value(initial_value.clone())
+                    })
+                },
+            )
+            .read(cx)
+            .clone();
+        let content_height = px((chunk_rows as f32 * VIRTUALIZED_CODE_LINE_HEIGHT).max(16.0));
         let row_bg = if chunk.has_added && !chunk.has_removed {
             rgb(0x173221)
         } else if chunk.has_removed && !chunk.has_added {
             rgb(0x3a1f24)
         } else {
-            rgb(0x1e1e1e)
+            rgb(CHAT_PANEL_COLOR)
         };
         let has_signs = chunk.has_added || chunk.has_removed;
         let sign_color = if chunk.has_added && !chunk.has_removed {
@@ -1043,12 +1085,6 @@ impl ChatView {
         } else {
             rgb(0x909090)
         };
-        let chunk_fingerprint = text_fingerprint(&chunk.code_text);
-        let markdown = format!("```{language}\n{}\n```", chunk.code_text);
-        let markdown_key = SharedString::from(format!(
-            "chat-code-highlighted-{message_id}-{block_key}-{chunk_index}-{}-{}-{}",
-            chunk_fingerprint.len, chunk_fingerprint.head, chunk_fingerprint.tail
-        ));
 
         div()
             .w_full()
@@ -1056,7 +1092,7 @@ impl ChatView {
             .flex()
             .items_start()
             .border_b_1()
-            .border_color(rgb(0x2d2d30))
+            .border_color(rgb(CHAT_BORDER_COLOR))
             .bg(row_bg)
             .when(has_signs, |this| {
                 this.child(
@@ -1081,9 +1117,11 @@ impl ChatView {
                     .child(chunk.line_numbers.clone()),
             )
             .child(
-                div().flex_1().min_w(px(0.0)).px_1().py_1().child(
-                    TextView::markdown(markdown_key, SharedString::from(markdown), window, cx)
-                        .selectable(true),
+                div().flex_1().min_w(px(0.0)).h(content_height).child(
+                    Input::new(&input_state)
+                        .disabled(true)
+                        .appearance(false)
+                        .h_full(),
                 ),
             )
             .into_any_element()
@@ -1099,6 +1137,8 @@ impl ChatView {
         cx: &mut App,
     ) -> AnyElement {
         let fingerprint = text_fingerprint(text);
+        let hover_group = format!("code-block-hover-{message_id}-{block_key}");
+        let copy_button_id = fingerprint.head ^ fingerprint.tail;
         let cache = window.use_keyed_state(
             SharedString::from(format!("chat-code-cache-{message_id}-{block_key}")),
             cx,
@@ -1163,10 +1203,11 @@ impl ChatView {
             ));
             return div()
                 .w_full()
+                .group(hover_group.clone())
                 .rounded_md()
                 .border_1()
-                .border_color(rgb(0x3c3c3c))
-                .bg(rgb(0x1e1e1e))
+                .border_color(rgb(CHAT_BORDER_COLOR))
+                .bg(rgb(CHAT_PANEL_COLOR))
                 .relative()
                 .on_children_prepainted(move |children, window, _cx: &mut App| {
                     let Some(scroll_bounds) = children.first().copied() else {
@@ -1250,6 +1291,40 @@ impl ChatView {
                                 .scrollbar_show(ScrollbarShow::Always),
                         ),
                 )
+                .when_some(options.copy_output.clone(), |this, output| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .top_2()
+                            .right_2()
+                            .invisible()
+                            .group_hover(hover_group, |this| this.visible())
+                            .child(
+                                div()
+                                    .id(("code-copy-button", copy_button_id))
+                                    .w(px(26.0))
+                                    .h(px(26.0))
+                                    .rounded_md()
+                                    .bg(rgb(CHAT_CARD_COLOR))
+                                    .border_1()
+                                    .border_color(rgb(CHAT_BORDER_COLOR))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            output.clone(),
+                                        ));
+                                    })
+                                    .child(
+                                        Icon::new(IconName::Copy)
+                                            .xsmall()
+                                            .text_color(rgb(CHAT_MUTED_TEXT_COLOR)),
+                                    ),
+                            ),
+                    )
+                })
                 .into_any_element();
         }
 
@@ -1262,10 +1337,12 @@ impl ChatView {
 
         div()
             .w_full()
+            .group(hover_group.clone())
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x3c3c3c))
-            .bg(rgb(0x1e1e1e))
+            .border_color(rgb(CHAT_BORDER_COLOR))
+            .bg(rgb(CHAT_PANEL_COLOR))
+            .relative()
             .overflow_hidden()
             .child(list(
                 list_state,
@@ -1290,6 +1367,40 @@ impl ChatView {
                     }
                 },
             ))
+            .when_some(options.copy_output, |this, output| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_2()
+                        .right_2()
+                        .invisible()
+                        .group_hover(hover_group, |this| this.visible())
+                        .child(
+                            div()
+                                .id(("code-copy-button", copy_button_id))
+                                .w(px(26.0))
+                                .h(px(26.0))
+                                .rounded_md()
+                                .bg(rgb(CHAT_CARD_COLOR))
+                                .border_1()
+                                .border_color(rgb(CHAT_BORDER_COLOR))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        output.clone(),
+                                    ));
+                                })
+                                .child(
+                                    Icon::new(IconName::Copy)
+                                        .xsmall()
+                                        .text_color(rgb(CHAT_MUTED_TEXT_COLOR)),
+                                ),
+                        ),
+                )
+            })
             .into_any_element()
     }
 
@@ -1301,7 +1412,11 @@ impl ChatView {
             .flex_col()
             .children(blocks.iter().map(move |block| {
                 let (bg, sign_color, text_color) = match block.kind {
-                    DiffRowKind::Context => (rgb(0x1e1e1e), rgb(0x8f8f8f), rgb(0xd6d6d6)),
+                    DiffRowKind::Context => (
+                        rgb(CHAT_PANEL_COLOR),
+                        rgb(CHAT_MUTED_TEXT_COLOR),
+                        rgb(CHAT_SECONDARY_TEXT_COLOR),
+                    ),
                     DiffRowKind::Added => (rgb(0x173221), rgb(0x82dca7), rgb(0xdaf4e3)),
                     DiffRowKind::Removed => (rgb(0x3a1f24), rgb(0xf2a2a2), rgb(0xf7dddd)),
                 };
@@ -1401,8 +1516,8 @@ impl ChatView {
             .w_full()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x3c3c3c))
-            .bg(rgb(0x1e1e1e))
+            .border_color(rgb(CHAT_BORDER_COLOR))
+            .bg(rgb(CHAT_PANEL_COLOR))
             .relative()
             .on_children_prepainted(move |children, window, _cx: &mut App| {
                 let Some(scroll_bounds) = children.first().copied() else {
@@ -1508,8 +1623,8 @@ impl ChatView {
             .h(px(VIRTUALIZED_BLOCK_HEIGHT))
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x3c3c3c))
-            .bg(rgb(0x1e1e1e))
+            .border_color(rgb(CHAT_BORDER_COLOR))
+            .bg(rgb(CHAT_PANEL_COLOR))
             .overflow_hidden()
             .child(
                 list(list_state, move |chunk_index, window, cx| -> AnyElement {
@@ -1575,8 +1690,8 @@ impl ChatView {
             .h(px(VIRTUALIZED_BLOCK_HEIGHT))
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x3c3c3c))
-            .bg(rgb(0x1e1e1e))
+            .border_color(rgb(CHAT_BORDER_COLOR))
+            .bg(rgb(CHAT_PANEL_COLOR))
             .overflow_hidden()
             .child(
                 list(list_state, move |chunk_index, _window, _cx| -> AnyElement {
@@ -1616,6 +1731,7 @@ impl ChatView {
 
     fn render_message_content(
         app_state: &Entity<AppState>,
+        chat_view: &Entity<ChatView>,
         thread_id: Uuid,
         message_id: Uuid,
         content: &MessageContent,
@@ -1665,36 +1781,24 @@ impl ChatView {
                 let is_read_tool = matches!(tool_call.kind, agent_client_protocol::ToolKind::Read);
                 let is_execute_tool =
                     matches!(tool_call.kind, agent_client_protocol::ToolKind::Execute);
-                let mut lines = vec![
-                    format!("Tool: {}", tool_call.title),
-                    format!(
-                        "Kind: {}",
-                        match tool_call.kind {
-                            agent_client_protocol::ToolKind::Read => "read",
-                            agent_client_protocol::ToolKind::Edit => "edit",
-                            agent_client_protocol::ToolKind::Delete => "delete",
-                            agent_client_protocol::ToolKind::Move => "move",
-                            agent_client_protocol::ToolKind::Search => "search",
-                            agent_client_protocol::ToolKind::Execute => "execute",
-                            agent_client_protocol::ToolKind::Think => "think",
-                            agent_client_protocol::ToolKind::Fetch => "fetch",
-                            agent_client_protocol::ToolKind::SwitchMode => "switch_mode",
-                            _ => "other",
-                        }
-                    ),
-                    format!(
-                        "Status: {}",
-                        match tool_call.status {
-                            agent_client_protocol::ToolCallStatus::Pending => "pending",
-                            agent_client_protocol::ToolCallStatus::InProgress => "in_progress",
-                            agent_client_protocol::ToolCallStatus::Completed => "completed",
-                            agent_client_protocol::ToolCallStatus::Failed => "failed",
-                            _ => "unknown",
-                        }
-                    ),
-                ];
-
+                let is_search_tool =
+                    matches!(tool_call.kind, agent_client_protocol::ToolKind::Search);
+                let is_failed = matches!(
+                    tool_call.status,
+                    agent_client_protocol::ToolCallStatus::Failed
+                );
+                let is_completed = matches!(
+                    tool_call.status,
+                    agent_client_protocol::ToolCallStatus::Completed
+                );
+                let show_spinner = !is_completed && !is_failed;
+                let default_expanded = is_failed || is_execute_tool;
+                let is_expanded = default_expanded
+                    || chat_view.read(cx).expanded_tool_calls.contains(&message_id);
                 let language_hint = language_from_tool_title(&tool_call.title);
+                let header_label = tool_call_header_label(tool_call.kind, &tool_call.title);
+                let execute_style_text_blocks =
+                    is_execute_tool || is_search_tool || tool_kind_is_other(tool_call.kind);
                 let mut content_blocks: Vec<AnyElement> = Vec::new();
 
                 for (content_index, content) in tool_call.content.iter().enumerate() {
@@ -1713,12 +1817,15 @@ impl ChatView {
                                             VirtualizedCodeRenderOptions {
                                                 parse_numbered_lines: true,
                                                 prefer_editor: true,
-                                                inner_scroll: !is_read_tool,
+                                                inner_scroll: false,
+                                                copy_output: None,
                                             },
                                             window,
                                             cx,
                                         )
-                                    } else if is_execute_tool || looks_like_terminal_output(text) {
+                                    } else if execute_style_text_blocks
+                                        || looks_like_terminal_output(text)
+                                    {
                                         Self::render_virtualized_code_block(
                                             message_id,
                                             &block_key,
@@ -1728,6 +1835,7 @@ impl ChatView {
                                                 parse_numbered_lines: false,
                                                 prefer_editor: false,
                                                 inner_scroll: false,
+                                                copy_output: Some(text.to_string()),
                                             },
                                             window,
                                             cx,
@@ -1758,7 +1866,6 @@ impl ChatView {
                         }
                         agent_client_protocol::ToolCallContent::Diff(d) => {
                             let path = d.path.display().to_string();
-                            lines.push(format!("Diff: {path}"));
                             content_blocks.push(Self::render_virtualized_diff(
                                 message_id,
                                 &format!("diff-{path}"),
@@ -1786,20 +1893,45 @@ impl ChatView {
                     }
                 }
 
+                let chevron = if is_expanded { "v" } else { ">" };
+                let header_text = format!("{header_label} {chevron}");
+                let header_color = if is_failed {
+                    rgb(CHAT_DANGER_COLOR)
+                } else {
+                    rgb(CHAT_MUTED_TEXT_COLOR)
+                };
+                let header_dom_id = ("tool-call-toggle", message_id.as_u128() as u64);
+
                 div()
+                    .id(header_dom_id)
                     .flex()
                     .flex_col()
                     .gap_2()
+                    .on_click({
+                        let chat_view = chat_view.clone();
+                        move |_, _, cx| {
+                            chat_view.update(cx, |view, cx| {
+                                if view.expanded_tool_calls.contains(&message_id) {
+                                    view.expanded_tool_calls.remove(&message_id);
+                                } else {
+                                    view.expanded_tool_calls.insert(message_id);
+                                }
+                                cx.notify();
+                            });
+                        }
+                    })
                     .child(
-                        TextView::markdown(
-                            SharedString::from(format!("chat-tool-meta-{}", message_id)),
-                            SharedString::from(lines.join("\n")),
-                            window,
-                            cx,
-                        )
-                        .selectable(true),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .cursor_pointer()
+                            .child(div().text_sm().text_color(header_color).child(header_text))
+                            .when(show_spinner, |this| this.child(Spinner::new().xsmall())),
                     )
-                    .children(content_blocks)
+                    .when(is_expanded, |this| {
+                        this.child(div().flex().flex_col().gap_2().children(content_blocks))
+                    })
                     .into_any_element()
             }
         }
@@ -1835,6 +1967,7 @@ impl ChatView {
                     parse_numbered_lines: false,
                     prefer_editor: false,
                     inner_scroll: false,
+                    copy_output: None,
                 },
                 window,
                 cx,
@@ -1896,15 +2029,14 @@ impl ChatView {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        let (
-            bg,
-            text_color,
-            thread_id,
-            message_id,
-            is_collapsible,
-            is_expanded,
-            collapsed_preview,
-        ): (Rgba, Rgba, Uuid, Uuid, bool, bool, Option<String>) = {
+        let (text_color, thread_id, message_id, is_collapsible, is_expanded, collapsed_preview): (
+            Rgba,
+            Uuid,
+            Uuid,
+            bool,
+            bool,
+            Option<String>,
+        ) = {
             let state = app_state.read(cx);
             let Some(thread) = state.active_thread() else {
                 return div().into_any_element();
@@ -1913,16 +2045,10 @@ impl ChatView {
                 return div().into_any_element();
             };
 
-            let bg = match message.role {
-                Role::User => rgb(0x0e639c),
-                Role::Agent => rgb(0x3c3c3c),
-                Role::Thought => rgb(0x2d2d30),
-                Role::System => rgb(0x6b2f2f),
-            };
             let text_color = if message.role == Role::Thought {
-                rgb(0xaaaaaa)
+                rgb(CHAT_SECONDARY_TEXT_COLOR)
             } else {
-                rgb(0xffffff)
+                rgb(CHAT_TEXT_COLOR)
             };
 
             // For now, we only collapse Text messages.
@@ -1942,7 +2068,6 @@ impl ChatView {
             }
 
             (
-                bg,
                 text_color,
                 message.thread_id,
                 message.id,
@@ -1984,6 +2109,7 @@ impl ChatView {
             };
             Self::render_message_content(
                 app_state,
+                this,
                 thread_id,
                 message_id,
                 message_content.as_ref(),
@@ -2001,7 +2127,8 @@ impl ChatView {
             })
             .w_full()
             .min_w(px(0.0))
-            .p_2()
+            .px_4()
+            .py_2()
             .cursor_text()
             .on_click(move |_, _, cx| {
                 let copied = app_state_for_copy
@@ -2023,10 +2150,9 @@ impl ChatView {
                     .w_full()
                     .min_w(px(0.0))
                     .max_w_full()
-                    .p_2()
-                    .rounded_md()
-                    .bg(bg)
+                    .py_1()
                     .text_color(text_color)
+                    .text_sm()
                     .whitespace_normal()
                     .child(content_el)
                     .when(is_collapsible, |this| {
@@ -2035,7 +2161,7 @@ impl ChatView {
                                 .id(("message-expand-toggle", index))
                                 .mt_2()
                                 .text_xs()
-                                .text_color(rgb(0xbdbdbd))
+                                .text_color(rgb(CHAT_MUTED_TEXT_COLOR))
                                 .cursor_pointer()
                                 .child(if is_expanded {
                                     "Show less"
@@ -2240,6 +2366,7 @@ impl Render for ChatView {
                     .and_then(|id| self.app_state.read(cx).thread_draft(id))
                     .unwrap_or_default();
                 self.set_input_value(draft, _window, cx);
+                self.expanded_tool_calls.clear();
 
                 let (scroll_offset, _saved_locked) = active_thread_id
                     .map(|id| self.app_state.read(cx).thread_scroll_state(id))
@@ -2301,7 +2428,7 @@ impl Render for ChatView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_color(rgb(0x888888))
+                    .text_color(rgb(CHAT_MUTED_TEXT_COLOR))
                     .child("Send a message to start")
                     .into_any_element()
             } else {
@@ -2334,7 +2461,9 @@ impl Render for ChatView {
                                                     div()
                                                         .p_3()
                                                         .rounded_md()
-                                                        .bg(rgb(0x2d2d30))
+                                                        .bg(rgb(CHAT_CARD_COLOR))
+                                                        .border_1()
+                                                        .border_color(rgb(CHAT_BORDER_COLOR))
                                                         .child(Skeleton::new()),
                                                 )
                                                 .into_any_element();
@@ -2365,7 +2494,7 @@ impl Render for ChatView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(rgb(0x888888))
+                .text_color(rgb(CHAT_MUTED_TEXT_COLOR))
                 .child("Select or create a thread to begin")
                 .into_any_element()
         };
@@ -2374,9 +2503,9 @@ impl Render for ChatView {
             .debug_selector(|| "chat-input-box".to_string())
             .w_full()
             .p_3()
-            .bg(rgb(0x1e1e1e))
+            .bg(rgb(CHAT_PANEL_COLOR))
             .border_t_1()
-            .border_color(rgb(0x3c3c3c))
+            .border_color(rgb(CHAT_BORDER_COLOR))
             .flex()
             .flex_col()
             .gap_2()
@@ -2397,7 +2526,7 @@ impl Render for ChatView {
                         div()
                             .id("send-button")
                             .debug_selector(|| "chat-send-button".to_string())
-                            .bg(rgb(0x0e639c))
+                            .bg(rgb(CHAT_ACCENT_COLOR))
                             .text_color(white())
                             .rounded_md()
                             .px_3()
@@ -2424,11 +2553,11 @@ impl Render for ChatView {
                         .py_1()
                         .rounded_sm()
                         .bg(if index == suggestions.selected {
-                            rgb(0x0e639c)
+                            rgb(CHAT_ACCENT_COLOR)
                         } else {
                             rgba(0x00000000)
                         })
-                        .text_color(white())
+                        .text_color(rgb(CHAT_TEXT_COLOR))
                         .child(item.display.clone())
                         .into_any_element()
                 })
@@ -2440,9 +2569,9 @@ impl Render for ChatView {
                 .track_scroll(&self.suggestion_scroll_handle)
                 .max_h(px(180.0))
                 .p_2()
-                .bg(rgb(0x252526))
+                .bg(rgb(CHAT_PANEL_COLOR))
                 .border_t_1()
-                .border_color(rgb(0x3c3c3c))
+                .border_color(rgb(CHAT_BORDER_COLOR))
                 .children(rows)
         } else {
             div().id("chat-suggestion-empty")
@@ -2454,7 +2583,7 @@ impl Render for ChatView {
                     let option_id = option.option_id.to_string();
                     div()
                         .id(("permission-option", index))
-                        .bg(rgb(0x0e639c))
+                        .bg(rgb(CHAT_ACCENT_COLOR))
                         .text_color(white())
                         .rounded_md()
                         .px_3()
@@ -2470,18 +2599,22 @@ impl Render for ChatView {
                 div()
                     .w_full()
                     .p_2()
-                    .bg(rgb(0x2d2d30))
+                    .bg(rgb(CHAT_PANEL_COLOR))
                     .border_t_1()
-                    .border_color(rgb(0x3c3c3c))
+                    .border_color(rgb(CHAT_BORDER_COLOR))
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child(div().text_color(rgb(0xdddddd)).child("Permission required"))
+                    .child(
+                        div()
+                            .text_color(rgb(CHAT_TEXT_COLOR))
+                            .child("Permission required"),
+                    )
                     .children(option_buttons)
                     .child(
                         div()
                             .id("permission-cancel-button")
-                            .bg(rgb(0x6b2f2f))
+                            .bg(rgb(CHAT_DANGER_COLOR))
                             .text_color(white())
                             .rounded_md()
                             .px_3()
@@ -2519,7 +2652,7 @@ impl Render for ChatView {
                     .to_string();
                 div()
                     .text_xs()
-                    .text_color(rgb(0xdddddd))
+                    .text_color(rgb(CHAT_TEXT_COLOR))
                     .child(label)
                     .into_any_element()
             } else {
@@ -2532,9 +2665,9 @@ impl Render for ChatView {
                         div()
                             .id(("agent-selector", index))
                             .bg(if is_selected {
-                                rgb(0x0e639c)
+                                rgb(CHAT_ACCENT_COLOR)
                             } else {
-                                rgb(0x3c3c3c)
+                                rgb(CHAT_CARD_COLOR)
                             })
                             .text_color(white())
                             .rounded_md()
@@ -2565,7 +2698,12 @@ impl Render for ChatView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_xs().text_color(rgb(0x888888)).child("Agent"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(CHAT_MUTED_TEXT_COLOR))
+                            .child("Agent"),
+                    )
                     .child(agent_content)
                     .into_any_element(),
             );
@@ -2597,7 +2735,12 @@ impl Render for ChatView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_xs().text_color(rgb(0x888888)).child("Model"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(CHAT_MUTED_TEXT_COLOR))
+                            .child("Model"),
+                    )
                     .child(
                         div()
                             .id("chat-model-select")
@@ -2633,7 +2776,12 @@ impl Render for ChatView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_xs().text_color(rgb(0x888888)).child("Mode"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(CHAT_MUTED_TEXT_COLOR))
+                            .child("Mode"),
+                    )
                     .child(
                         div()
                             .id("chat-mode-select")
@@ -2647,7 +2795,10 @@ impl Render for ChatView {
         if let (Some(_thread_id), Some(options)) = (active_thread_id, config_options) {
             for (option_index, option) in options.into_iter().enumerate() {
                 let _option_id = option.id.to_string();
-                let label = div().text_xs().text_color(rgb(0x888888)).child(option.name);
+                let label = div()
+                    .text_xs()
+                    .text_color(rgb(CHAT_MUTED_TEXT_COLOR))
+                    .child(option.name);
                 let control: AnyElement = match option.kind {
                     agent_client_protocol::SessionConfigKind::Select(select) => {
                         let entries = match select.options {
@@ -2713,7 +2864,7 @@ impl Render for ChatView {
             } else if percent >= 75.0 {
                 rgb(0xd9ad6b)
             } else {
-                rgb(0x0e639c)
+                rgb(CHAT_ACCENT_COLOR)
             };
             let percent_label = format!("{percent:.0}%");
             div()
@@ -2724,7 +2875,7 @@ impl Render for ChatView {
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0x8f8f8f))
+                        .text_color(rgb(CHAT_MUTED_TEXT_COLOR))
                         .child(format!("{} / {}", usage.used, usage.size)),
                 )
                 .when_some(format_cost_label(usage.cost.as_ref()), |this, label| {
@@ -2732,7 +2883,7 @@ impl Render for ChatView {
                         div()
                             .id("chat-usage-cost")
                             .text_xs()
-                            .text_color(rgb(0xb8b8b8))
+                            .text_color(rgb(CHAT_SECONDARY_TEXT_COLOR))
                             .child(label),
                     )
                 })
@@ -2744,7 +2895,7 @@ impl Render for ChatView {
                         .rounded_full()
                         .border_2()
                         .border_color(progress_color)
-                        .bg(rgb(0x252526))
+                        .bg(rgb(CHAT_PANEL_COLOR))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -2759,6 +2910,9 @@ impl Render for ChatView {
             .w_full()
             .px_3()
             .py_1()
+            .bg(rgb(CHAT_PANEL_COLOR))
+            .border_t_1()
+            .border_color(rgb(CHAT_BORDER_COLOR))
             .flex()
             .items_end()
             .child(
@@ -2780,6 +2934,7 @@ impl Render for ChatView {
             .min_w(px(0.0))
             .min_h(px(0.0))
             .overflow_hidden()
+            .bg(rgb(CHAT_BG_COLOR))
             .child(chat_content)
             .child(permission_panel)
             .child(suggestion_panel)
@@ -3119,6 +3274,40 @@ fn looks_like_terminal_output(text: &str) -> bool {
             || line.starts_with('$')
             || line.starts_with('>')
     })
+}
+
+fn tool_kind_is_other(kind: agent_client_protocol::ToolKind) -> bool {
+    !matches!(
+        kind,
+        agent_client_protocol::ToolKind::Read
+            | agent_client_protocol::ToolKind::Edit
+            | agent_client_protocol::ToolKind::Delete
+            | agent_client_protocol::ToolKind::Move
+            | agent_client_protocol::ToolKind::Search
+            | agent_client_protocol::ToolKind::Execute
+            | agent_client_protocol::ToolKind::Think
+            | agent_client_protocol::ToolKind::Fetch
+            | agent_client_protocol::ToolKind::SwitchMode
+    )
+}
+
+fn tool_call_header_label(kind: agent_client_protocol::ToolKind, title: &str) -> String {
+    let title = title.trim();
+    match kind {
+        agent_client_protocol::ToolKind::Read => {
+            let path = title.strip_prefix("read ").unwrap_or(title);
+            format!("Read {path}")
+        }
+        agent_client_protocol::ToolKind::Execute => format!("Ran {title}"),
+        agent_client_protocol::ToolKind::Search => format!("Searched {title}"),
+        agent_client_protocol::ToolKind::Edit => format!("Edited {title}"),
+        agent_client_protocol::ToolKind::Delete => format!("Deleted {title}"),
+        agent_client_protocol::ToolKind::Move => format!("Moved {title}"),
+        agent_client_protocol::ToolKind::Fetch => format!("Fetched {title}"),
+        agent_client_protocol::ToolKind::Think => format!("Thought {title}"),
+        agent_client_protocol::ToolKind::SwitchMode => format!("Switched {title}"),
+        _ => format!("Ran {title}"),
+    }
 }
 
 fn parse_diff_hunk_header(line: &str) -> Option<(usize, usize)> {

@@ -56,7 +56,7 @@ impl Render for WorkspaceLayout {
             .flex()
             .flex_row()
             .size_full()
-            .bg(rgb(0x1e1e1e))
+            .bg(rgb(0x111319))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, window, _cx| {

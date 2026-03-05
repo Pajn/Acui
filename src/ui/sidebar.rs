@@ -8,13 +8,21 @@ use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-const THREAD_DROP_GAP_HEIGHT: f32 = 30.0;
+const THREAD_DROP_GAP_HEIGHT: f32 = 32.0;
 const THREAD_DROP_GAP_MARGIN_BOTTOM: f32 = 0.0;
 const WORKSPACE_HEADER_HEIGHT: f32 = 34.0;
 const WORKSPACE_TOP_MARGIN_HEIGHT: f32 = 8.0;
-const WORKSPACE_NEW_THREAD_HEIGHT: f32 = 22.0;
+const WORKSPACE_NEW_THREAD_HEIGHT: f32 = 24.0;
 const SIDEBAR_EDGE_AUTOSCROLL_THRESHOLD: f32 = 44.0;
 const SIDEBAR_EDGE_AUTOSCROLL_MAX_STEP: f32 = 18.0;
+const SIDEBAR_BG_COLOR: u32 = 0x171a20;
+const SIDEBAR_BORDER_COLOR: u32 = 0x2a2f38;
+const SIDEBAR_SURFACE_COLOR: u32 = 0x20252e;
+const SIDEBAR_TEXT_COLOR: u32 = 0xd8dde6;
+const SIDEBAR_MUTED_TEXT_COLOR: u32 = 0x8b94a6;
+const SIDEBAR_ACCENT_COLOR: u32 = 0x2f6feb;
+const SIDEBAR_ACTIVE_ROW_COLOR: u32 = 0x2a303b;
+const SIDEBAR_UNREAD_COLOR: u32 = 0xf0b35a;
 
 pub struct SidebarView {
     app_state: Entity<AppState>,
@@ -432,11 +440,11 @@ impl Render for SidebarView {
             .flex_col()
             .w_full()
             .h_full()
-            .bg(rgb(0x252526))
+            .bg(rgb(SIDEBAR_BG_COLOR))
             .border_r_1()
-            .border_color(rgb(0x3c3c3c))
-            .p_3()
-            .gap_2()
+            .border_color(rgb(SIDEBAR_BORDER_COLOR))
+            .p_2()
+            .gap_3()
             .on_drop(cx.listener(|this, _: &SidebarDragItem, _, cx| {
                 this.commit_pending_drop(cx);
             }))
@@ -449,9 +457,11 @@ impl Render for SidebarView {
             .child(
                 div()
                     .id("new-workspace-button")
-                    .bg(rgb(0x0e639c))
+                    .bg(rgb(SIDEBAR_ACCENT_COLOR))
                     .text_color(white())
-                    .p_2()
+                    .text_sm()
+                    .px_3()
+                    .py_2()
                     .rounded_md()
                     .cursor_pointer()
                     .child("New Workspace")
@@ -553,8 +563,9 @@ impl Render for SidebarView {
                         .flex()
                         .items_center()
                         .rounded_md()
-                        .bg(rgb(0x2d2d30))
-                        .text_color(rgb(0xcccccc))
+                        .text_sm()
+                        .bg(rgb(SIDEBAR_SURFACE_COLOR))
+                        .text_color(rgb(SIDEBAR_TEXT_COLOR))
                         .cursor_pointer()
                         .child(if is_collapsed {
                             format!("▶ {}", workspace.name)
@@ -623,7 +634,7 @@ impl Render for SidebarView {
                             .h(px(WORKSPACE_NEW_THREAD_HEIGHT))
                             .flex()
                             .items_center()
-                            .text_color(rgb(0x8f8f8f))
+                            .text_color(rgb(SIDEBAR_MUTED_TEXT_COLOR))
                             .text_sm()
                             .cursor_pointer()
                             .pl_2()
@@ -697,12 +708,12 @@ impl Render for SidebarView {
                                     .w(px(8.0))
                                     .h(px(8.0))
                                     .rounded_full()
-                                    .bg(rgb(0xff9d00))
+                                    .bg(rgb(SIDEBAR_UNREAD_COLOR))
                                     .into_any_element()
                             } else {
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(0x8f8f8f))
+                                    .text_color(rgb(SIDEBAR_MUTED_TEXT_COLOR))
                                     .child(relative_time_short(thread.updated_at))
                                     .into_any_element()
                             };
@@ -718,14 +729,15 @@ impl Render for SidebarView {
                                 .items_center()
                                 .rounded_sm()
                                 .bg(if is_active {
-                                    rgb(0x37373d)
+                                    rgb(SIDEBAR_ACTIVE_ROW_COLOR)
                                 } else {
                                     rgba(0x00000000)
                                 })
                                 .when(thread_dom_id == 0, |this| {
                                     this.debug_selector(|| "sidebar-thread-row-0".to_string())
                                 })
-                                .text_color(rgb(0xcccccc))
+                                .text_color(rgb(SIDEBAR_TEXT_COLOR))
+                                .text_sm()
                                 .cursor_pointer()
                                 .when(!is_renaming, |this| {
                                     this.on_drag(
@@ -1104,7 +1116,7 @@ fn render_floating_preview(cursor: Point<Pixels>, preview: &FloatingDragPreview)
     let content = match preview {
         FloatingDragPreview::Thread { name } => div()
             .w(px(240.0))
-            .text_color(rgb(0xcccccc))
+            .text_color(rgb(SIDEBAR_TEXT_COLOR))
             .child(
                 div()
                     .w_full()
@@ -1129,7 +1141,7 @@ fn render_floating_preview(cursor: Point<Pixels>, preview: &FloatingDragPreview)
             thread_names,
         } => div()
             .w(px(260.0))
-            .text_color(rgb(0xcccccc))
+            .text_color(rgb(SIDEBAR_TEXT_COLOR))
             .child(if *is_collapsed {
                 format!("▶ {name}")
             } else {
@@ -1138,14 +1150,14 @@ fn render_floating_preview(cursor: Point<Pixels>, preview: &FloatingDragPreview)
             .when(!is_collapsed, |this| {
                 this.child(
                     div()
-                        .text_color(rgb(0x8f8f8f))
+                        .text_color(rgb(SIDEBAR_MUTED_TEXT_COLOR))
                         .text_sm()
                         .pt_1()
                         .child("+ New Thread"),
                 )
                 .children(thread_names.iter().take(6).map(|thread_name| {
                     div()
-                        .text_color(rgb(0xcccccc))
+                        .text_color(rgb(SIDEBAR_TEXT_COLOR))
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis()

@@ -41,15 +41,15 @@ impl Render for PlanSidebarView {
                 .id(("plan-entry", index))
                 .p_2()
                 .rounded_md()
-                .bg(rgb(0x2d2d30))
+                .bg(rgb(0x20252e))
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(div().text_color(white()).child(entry.content))
+                .child(div().text_color(rgb(0xd8dde6)).child(entry.content))
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0xa0a0a0))
+                        .text_color(rgb(0x8b94a6))
                         .child(format!("{priority} • {status}")),
                 )
         });
@@ -61,12 +61,12 @@ impl Render for PlanSidebarView {
             .w(px(300.0))
             .h_full()
             .overflow_y_scroll()
-            .bg(rgb(0x202225))
+            .bg(rgb(0x171a20))
             .border_l_1()
-            .border_color(rgb(0x3c3c3c))
+            .border_color(rgb(0x2a2f38))
             .p_3()
             .gap_2()
-            .child(div().text_color(rgb(0xdddddd)).child("Plan"))
+            .child(div().text_color(rgb(0xd8dde6)).child("Plan"))
             .children(rows)
     }
 }
