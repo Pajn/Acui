@@ -2,16 +2,19 @@ use crate::state::AppState;
 use chrono::{DateTime, Utc};
 use gpui::prelude::*;
 use gpui::*;
+use gpui_component::PixelsExt as _;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 const THREAD_DROP_GAP_HEIGHT: f32 = 30.0;
-const THREAD_DROP_GAP_MARGIN_BOTTOM: f32 = 4.0;
+const THREAD_DROP_GAP_MARGIN_BOTTOM: f32 = 0.0;
 const WORKSPACE_HEADER_HEIGHT: f32 = 34.0;
 const WORKSPACE_TOP_MARGIN_HEIGHT: f32 = 8.0;
 const WORKSPACE_NEW_THREAD_HEIGHT: f32 = 22.0;
+const SIDEBAR_EDGE_AUTOSCROLL_THRESHOLD: f32 = 44.0;
+const SIDEBAR_EDGE_AUTOSCROLL_MAX_STEP: f32 = 18.0;
 
 pub struct SidebarView {
     app_state: Entity<AppState>,
@@ -19,7 +22,11 @@ pub struct SidebarView {
     renaming_thread_id: Option<uuid::Uuid>,
     rename_input: Option<Entity<InputState>>,
     dragging_item: Option<SidebarDragItem>,
+    drag_cursor: Option<Point<Pixels>>,
+    floating_preview: Option<FloatingDragPreview>,
     drag_placeholder: Option<SidebarDropPlaceholder>,
+    drag_reflow_nonce: u64,
+    sidebar_scroll_handle: ScrollHandle,
     drop_animation: Option<SidebarDropAnimation>,
     drop_animation_nonce: u64,
 }
@@ -70,10 +77,15 @@ enum SidebarDropAnimation {
 }
 
 struct DragPreview {
-    kind: DragPreviewKind,
+    _kind: DragPreviewKind,
 }
 
 enum DragPreviewKind {
+    Hidden,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum FloatingDragPreview {
     Thread {
         name: SharedString,
     },
@@ -85,77 +97,16 @@ enum DragPreviewKind {
 }
 
 impl DragPreview {
-    fn thread(name: impl Into<SharedString>) -> Self {
+    fn hidden() -> Self {
         Self {
-            kind: DragPreviewKind::Thread { name: name.into() },
-        }
-    }
-
-    fn workspace(
-        name: impl Into<SharedString>,
-        is_collapsed: bool,
-        thread_names: Vec<SharedString>,
-    ) -> Self {
-        Self {
-            kind: DragPreviewKind::Workspace {
-                name: name.into(),
-                is_collapsed,
-                thread_names,
-            },
+            _kind: DragPreviewKind::Hidden,
         }
     }
 }
 
 impl Render for DragPreview {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        match &self.kind {
-            DragPreviewKind::Thread { name } => div().w(px(240.0)).text_color(rgb(0xcccccc)).child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(name.clone()),
-                    ),
-            ),
-            DragPreviewKind::Workspace {
-                name,
-                is_collapsed,
-                thread_names,
-            } => div()
-                .w(px(260.0))
-                .text_color(rgb(0xcccccc))
-                .child(if *is_collapsed {
-                    format!("▶ {name}")
-                } else {
-                    format!("▼ {name}")
-                })
-                .when(!is_collapsed, |this| {
-                    this.child(
-                        div()
-                            .text_color(rgb(0x8f8f8f))
-                            .text_sm()
-                            .pt_1()
-                            .child("+ New Thread"),
-                    )
-                    .children(thread_names.iter().take(6).map(|thread_name| {
-                        div()
-                            .text_color(rgb(0xcccccc))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(thread_name.clone())
-                    }))
-                }),
-        }
+        div().w(px(1.0)).h(px(1.0)).opacity(0.0).into_any_element()
     }
 }
 
@@ -175,7 +126,11 @@ impl SidebarView {
             renaming_thread_id: None,
             rename_input: None,
             dragging_item: None,
+            drag_cursor: None,
+            floating_preview: None,
             drag_placeholder: None,
+            drag_reflow_nonce: 0,
+            sidebar_scroll_handle: ScrollHandle::new(),
             drop_animation: None,
             drop_animation_nonce: 0,
         }
@@ -188,6 +143,7 @@ impl SidebarView {
     ) {
         if self.drag_placeholder != placeholder {
             self.drag_placeholder = placeholder;
+            self.drag_reflow_nonce = self.drag_reflow_nonce.wrapping_add(1);
             cx.notify();
         }
     }
@@ -196,6 +152,8 @@ impl SidebarView {
         &mut self,
         dragged_item: SidebarDragItem,
         placeholder: Option<SidebarDropPlaceholder>,
+        cursor: Option<Point<Pixels>>,
+        floating_preview: Option<FloatingDragPreview>,
         cx: &mut Context<Self>,
     ) {
         let mut changed = false;
@@ -203,8 +161,17 @@ impl SidebarView {
             self.dragging_item = Some(dragged_item);
             changed = true;
         }
+        if self.drag_cursor != cursor {
+            self.drag_cursor = cursor;
+            changed = true;
+        }
+        if self.floating_preview != floating_preview {
+            self.floating_preview = floating_preview;
+            changed = true;
+        }
         if self.drag_placeholder != placeholder {
             self.drag_placeholder = placeholder;
+            self.drag_reflow_nonce = self.drag_reflow_nonce.wrapping_add(1);
             changed = true;
         }
         if changed {
@@ -212,19 +179,102 @@ impl SidebarView {
         }
     }
 
-    pub fn clear_drag_feedback(&mut self, cx: &mut Context<Self>) {
-        if self.dragging_item.is_some() || self.drag_placeholder.is_some() {
-            self.dragging_item = None;
-            self.drag_placeholder = None;
+    fn update_drag_cursor(&mut self, cursor: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.drag_cursor != Some(cursor) {
+            self.drag_cursor = Some(cursor);
             cx.notify();
         }
     }
 
-    fn prepare_drop_feedback(&mut self, animation_target: SidebarDropAnimation) {
+    fn next_scroll_offset_y(
+        current_offset_y: Pixels,
+        max_offset_y: Pixels,
+        delta_y: Pixels,
+    ) -> Pixels {
+        if max_offset_y <= px(0.0) {
+            return px(0.0);
+        }
+        if delta_y == px(0.0) {
+            return current_offset_y;
+        }
+        let min_offset = -max_offset_y;
+        (current_offset_y + delta_y).max(min_offset).min(px(0.0))
+    }
+
+    fn apply_sidebar_scroll_delta(&self, delta_y: Pixels) -> bool {
+        let current_offset = self.sidebar_scroll_handle.offset();
+        let next_offset_y = Self::next_scroll_offset_y(
+            current_offset.y,
+            self.sidebar_scroll_handle.max_offset().height,
+            delta_y,
+        );
+        if (next_offset_y - current_offset.y).abs() <= px(0.5) {
+            return false;
+        }
+        self.sidebar_scroll_handle
+            .set_offset(point(current_offset.x, next_offset_y));
+        true
+    }
+
+    fn autoscroll_sidebar_from_drag(
+        &self,
+        bounds: Bounds<Pixels>,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dragging_item.is_none() {
+            return;
+        }
+
+        let threshold = px(SIDEBAR_EDGE_AUTOSCROLL_THRESHOLD);
+        let max_step = SIDEBAR_EDGE_AUTOSCROLL_MAX_STEP;
+        let top_zone_end = bounds.origin.y + threshold;
+        let bottom_zone_start = bounds.origin.y + bounds.size.height - threshold;
+
+        let delta_y = if position.y < top_zone_end {
+            let intensity = ((top_zone_end - position.y).as_f32() / threshold.as_f32()).min(1.0);
+            px(max_step * intensity)
+        } else if position.y > bottom_zone_start {
+            let intensity =
+                ((position.y - bottom_zone_start).as_f32() / threshold.as_f32()).min(1.0);
+            px(-max_step * intensity)
+        } else {
+            px(0.0)
+        };
+
+        if delta_y != px(0.0) && self.apply_sidebar_scroll_delta(delta_y) {
+            cx.notify();
+        }
+    }
+
+    pub fn clear_drag_feedback(&mut self, cx: &mut Context<Self>) {
+        if self.dragging_item.is_some()
+            || self.drag_placeholder.is_some()
+            || self.drag_cursor.is_some()
+            || self.floating_preview.is_some()
+        {
+            self.dragging_item = None;
+            self.drag_cursor = None;
+            self.floating_preview = None;
+            self.drag_placeholder = None;
+            self.drag_reflow_nonce = self.drag_reflow_nonce.wrapping_add(1);
+            cx.notify();
+        }
+    }
+
+    fn prepare_drop_feedback(
+        &mut self,
+        animation_target: SidebarDropAnimation,
+        cx: &mut Context<Self>,
+    ) {
         self.dragging_item = None;
+        self.drag_cursor = None;
+        self.floating_preview = None;
         self.drag_placeholder = None;
+        self.drag_reflow_nonce = self.drag_reflow_nonce.wrapping_add(1);
         self.drop_animation = Some(animation_target);
         self.drop_animation_nonce = self.drop_animation_nonce.wrapping_add(1);
+        cx.notify();
     }
 
     fn commit_pending_drop(&mut self, cx: &mut Context<Self>) {
@@ -236,7 +286,10 @@ impl SidebarView {
                     insertion_index,
                 }),
             ) if placeholder_dragged_workspace_id == dragged_workspace_id => {
-                self.prepare_drop_feedback(SidebarDropAnimation::Workspace(dragged_workspace_id));
+                self.prepare_drop_feedback(
+                    SidebarDropAnimation::Workspace(dragged_workspace_id),
+                    cx,
+                );
                 self.app_state.update(cx, |state, cx| {
                     state.reorder_workspaces_to_index(cx, dragged_workspace_id, insertion_index);
                 });
@@ -254,10 +307,13 @@ impl SidebarView {
             ) if placeholder_workspace_id == workspace_id
                 && placeholder_dragged_thread_id == dragged_thread_id =>
             {
-                self.prepare_drop_feedback(SidebarDropAnimation::Thread {
-                    workspace_id,
-                    thread_id: dragged_thread_id,
-                });
+                self.prepare_drop_feedback(
+                    SidebarDropAnimation::Thread {
+                        workspace_id,
+                        thread_id: dragged_thread_id,
+                    },
+                    cx,
+                );
                 self.app_state.update(cx, |state, cx| {
                     state.reorder_threads_to_index(
                         cx,
@@ -371,11 +427,11 @@ impl Render for SidebarView {
 
         div()
             .id("sidebar-root")
+            .relative()
             .flex()
             .flex_col()
             .w_full()
             .h_full()
-            .overflow_y_scroll()
             .bg(rgb(0x252526))
             .border_r_1()
             .border_color(rgb(0x3c3c3c))
@@ -384,6 +440,12 @@ impl Render for SidebarView {
             .on_drop(cx.listener(|this, _: &SidebarDragItem, _, cx| {
                 this.commit_pending_drop(cx);
             }))
+            .on_drag_move::<SidebarDragItem>(cx.listener(
+                |this, event: &DragMoveEvent<SidebarDragItem>, _, cx| {
+                    this.update_drag_cursor(event.event.position, cx);
+                    this.autoscroll_sidebar_from_drag(event.bounds, event.event.position, cx);
+                },
+            ))
             .child(
                 div()
                     .id("new-workspace-button")
@@ -425,12 +487,13 @@ impl Render for SidebarView {
                         .detach();
                     })),
             )
-            .children({
+            .child({
                 let sidebar = cx.entity();
                 let dragging_workspace_id = match self.dragging_item {
                     Some(SidebarDragItem::Workspace(workspace_id)) => Some(workspace_id),
                     _ => None,
                 };
+                let is_dragging_workspace = dragging_workspace_id.is_some();
                 let workspace_insertion_index = match self.drag_placeholder {
                     Some(SidebarDropPlaceholder::Workspace {
                         insertion_index, ..
@@ -484,8 +547,11 @@ impl Render for SidebarView {
 
                     let header = div()
                         .id(("workspace-header", ws_index))
-                        .mt_2()
-                        .p_2()
+                        .mt(px(WORKSPACE_TOP_MARGIN_HEIGHT))
+                        .h(px(WORKSPACE_HEADER_HEIGHT))
+                        .px_2()
+                        .flex()
+                        .items_center()
                         .rounded_md()
                         .bg(rgb(0x2d2d30))
                         .text_color(rgb(0xcccccc))
@@ -505,7 +571,7 @@ impl Render for SidebarView {
                         }))
                         .on_drag(SidebarDragItem::Workspace(ws_id), {
                             let sidebar = sidebar.clone();
-                            move |_dragged, _, _, cx| {
+                            move |_dragged, position, _, cx| {
                                 sidebar.update(cx, |this, cx| {
                                     let insertion_index = {
                                         let state = this.app_state.read(cx);
@@ -521,20 +587,16 @@ impl Render for SidebarView {
                                             dragged_workspace_id: ws_id,
                                             insertion_index,
                                         }),
+                                        Some(position),
+                                        Some(FloatingDragPreview::Workspace {
+                                            name: workspace_name.clone().into(),
+                                            is_collapsed,
+                                            thread_names: workspace_preview_threads.clone(),
+                                        }),
                                         cx,
                                     );
                                 });
-
-                                let preview_name = workspace_name.clone();
-                                let preview_is_collapsed = is_collapsed;
-                                let preview_threads = workspace_preview_threads.clone();
-                                cx.new(|_| {
-                                    DragPreview::workspace(
-                                        preview_name,
-                                        preview_is_collapsed,
-                                        preview_threads,
-                                    )
-                                })
+                                cx.new(|_| DragPreview::hidden())
                             }
                         });
 
@@ -558,6 +620,9 @@ impl Render for SidebarView {
                         };
                         let new_thread_button = div()
                             .id(("workspace-new-thread", ws_index))
+                            .h(px(WORKSPACE_NEW_THREAD_HEIGHT))
+                            .flex()
+                            .items_center()
                             .text_color(rgb(0x8f8f8f))
                             .text_sm()
                             .cursor_pointer()
@@ -645,10 +710,12 @@ impl Render for SidebarView {
                             let row = div()
                                 .id(("thread-item", thread_dom_id))
                                 .w_full()
+                                .h_full()
                                 .min_w_0()
                                 .pl_4()
                                 .pr_2()
-                                .py_1()
+                                .flex()
+                                .items_center()
                                 .rounded_sm()
                                 .bg(if is_active {
                                     rgb(0x37373d)
@@ -668,7 +735,7 @@ impl Render for SidebarView {
                                         },
                                         {
                                             let sidebar = sidebar.clone();
-                                            move |_dragged, _, _, cx| {
+                                            move |_dragged, position, _, cx| {
                                                 sidebar.update(cx, |this, cx| {
                                                     let insertion_index = {
                                                         let state = this.app_state.read(cx);
@@ -693,12 +760,14 @@ impl Render for SidebarView {
                                                             dragged_thread_id: thread_id,
                                                             insertion_index,
                                                         }),
+                                                        Some(position),
+                                                        Some(FloatingDragPreview::Thread {
+                                                            name: thread_drag_name.clone().into(),
+                                                        }),
                                                         cx,
                                                     );
                                                 });
-
-                                                let preview_name = thread_drag_name.clone();
-                                                cx.new(|_| DragPreview::thread(preview_name))
+                                                cx.new(|_| DragPreview::hidden())
                                             }
                                         },
                                     )
@@ -813,8 +882,10 @@ impl Render for SidebarView {
 
                             let row_target = div()
                                 .w_full()
+                                .h(px(THREAD_DROP_GAP_HEIGHT))
                                 .on_drag_move::<SidebarDragItem>(cx.listener(
                                     move |this, event: &DragMoveEvent<SidebarDragItem>, _, cx| {
+                                        this.update_drag_cursor(event.event.position, cx);
                                         if !event.bounds.contains(&event.event.position) {
                                             return;
                                         }
@@ -858,9 +929,31 @@ impl Render for SidebarView {
                                     row_target
                                         .with_animation(
                                             ("sidebar-drop-thread", drop_animation_nonce),
-                                            Animation::new(Duration::from_millis(110))
+                                            Animation::new(Duration::from_millis(170))
                                                 .with_easing(ease_in_out),
-                                            |this, delta| this.opacity(0.7 + 0.3 * delta),
+                                            |this, delta| {
+                                                let offset = px((1.0 - delta) * 5.0);
+                                                this.opacity(0.45 + 0.55 * delta).top(offset)
+                                            },
+                                        )
+                                        .into_any_element(),
+                                );
+                            } else if matches!(
+                                self.dragging_item,
+                                Some(SidebarDragItem::Thread { workspace_id, .. }) if workspace_id == ws_id
+                            ) {
+                                let reflow_key =
+                                    ((thread_dom_id as u64) << 32) ^ self.drag_reflow_nonce;
+                                thread_elements.push(
+                                    row_target
+                                        .with_animation(
+                                            ("sidebar-drag-reflow-thread", reflow_key),
+                                            Animation::new(Duration::from_millis(95))
+                                                .with_easing(ease_in_out),
+                                            |this, delta| {
+                                                let offset = px((1.0 - delta) * 0.8);
+                                                this.top(offset)
+                                            },
                                         )
                                         .into_any_element(),
                                 );
@@ -899,6 +992,7 @@ impl Render for SidebarView {
                         .w_full()
                         .on_drag_move::<SidebarDragItem>(cx.listener(
                             move |this, event: &DragMoveEvent<SidebarDragItem>, _, cx| {
+                                this.update_drag_cursor(event.event.position, cx);
                                 if !event.bounds.contains(&event.event.position) {
                                     return;
                                 }
@@ -938,9 +1032,27 @@ impl Render for SidebarView {
                             workspace_target
                                 .with_animation(
                                     ("sidebar-drop-workspace", drop_animation_nonce),
-                                    Animation::new(Duration::from_millis(130))
+                                    Animation::new(Duration::from_millis(190))
                                         .with_easing(ease_in_out),
-                                    |this, delta| this.opacity(0.7 + 0.3 * delta),
+                                    |this, delta| {
+                                        let offset = px((1.0 - delta) * 7.0);
+                                        this.opacity(0.45 + 0.55 * delta).top(offset)
+                                    },
+                                )
+                                .into_any_element(),
+                        );
+                    } else if is_dragging_workspace {
+                        let reflow_key = ((ws_index as u64) << 32) ^ self.drag_reflow_nonce;
+                        workspace_elements.push(
+                            workspace_target
+                                .with_animation(
+                                    ("sidebar-drag-reflow-workspace", reflow_key),
+                                    Animation::new(Duration::from_millis(105))
+                                        .with_easing(ease_in_out),
+                                    |this, delta| {
+                                        let offset = px((1.0 - delta) * 1.1);
+                                        this.top(offset)
+                                    },
                                 )
                                 .into_any_element(),
                         );
@@ -963,8 +1075,20 @@ impl Render for SidebarView {
                     );
                 }
 
-                workspace_elements
+                div()
+                    .id("sidebar-scroll-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.sidebar_scroll_handle)
+                    .children(workspace_elements)
             })
+            .when_some(
+                self.drag_cursor
+                    .zip(self.floating_preview.as_ref())
+                    .map(|(cursor, preview)| (cursor, preview.clone())),
+                |this, (cursor, preview)| this.child(render_floating_preview(cursor, &preview)),
+            )
     }
 }
 
@@ -973,19 +1097,78 @@ fn render_drop_gap(height: Pixels, margin_bottom: Pixels) -> AnyElement {
         .w_full()
         .h(height)
         .mb(margin_bottom)
-        .rounded_sm()
-        .border_1()
-        .border_color(hsla(0.56, 0.82, 0.34, 0.6))
-        .bg(hsla(0.56, 0.82, 0.34, 0.12))
-        .with_animation(
-            "sidebar-drop-gap-pulse",
-            Animation::new(Duration::from_millis(850))
-                .repeat()
-                .with_easing(ease_in_out),
-            |this, delta| {
-                let pulse = 0.10 + 0.14 * (1.0 - (2.0 * delta - 1.0).abs());
-                this.bg(hsla(0.56, 0.82, 0.34, pulse))
-            },
+        .into_any_element()
+}
+
+fn render_floating_preview(cursor: Point<Pixels>, preview: &FloatingDragPreview) -> AnyElement {
+    let content = match preview {
+        FloatingDragPreview::Thread { name } => div()
+            .w(px(240.0))
+            .text_color(rgb(0xcccccc))
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(name.clone()),
+                    ),
+            )
+            .into_any_element(),
+        FloatingDragPreview::Workspace {
+            name,
+            is_collapsed,
+            thread_names,
+        } => div()
+            .w(px(260.0))
+            .text_color(rgb(0xcccccc))
+            .child(if *is_collapsed {
+                format!("▶ {name}")
+            } else {
+                format!("▼ {name}")
+            })
+            .when(!is_collapsed, |this| {
+                this.child(
+                    div()
+                        .text_color(rgb(0x8f8f8f))
+                        .text_sm()
+                        .pt_1()
+                        .child("+ New Thread"),
+                )
+                .children(thread_names.iter().take(6).map(|thread_name| {
+                    div()
+                        .text_color(rgb(0xcccccc))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(thread_name.clone())
+                }))
+            })
+            .into_any_element(),
+    };
+
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .ml(cursor.x - px(14.0))
+                .mt(cursor.y - px(10.0))
+                .child(content),
         )
         .into_any_element()
 }
