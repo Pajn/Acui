@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use crate::ui::chat::ChatView;
 use crate::ui::plan_sidebar::PlanSidebarView;
-use crate::ui::sidebar::SidebarView;
+use crate::ui::sidebar::{SidebarDragItem, SidebarView};
 use gpui::prelude::*;
 use gpui::*;
 use gpui_component::resizable::{h_resizable, resizable_panel};
@@ -57,6 +57,25 @@ impl Render for WorkspaceLayout {
             .flex_row()
             .size_full()
             .bg(rgb(0x1e1e1e))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, window, _cx| {
+                    let sidebar = this.sidebar.clone();
+                    window.on_next_frame(move |_, cx| {
+                        sidebar.update(cx, |sidebar, cx| {
+                            sidebar.clear_drag_feedback(cx);
+                        });
+                    });
+                }),
+            )
+            .on_drop(cx.listener(|this, _: &SidebarDragItem, window, _cx| {
+                let sidebar = this.sidebar.clone();
+                window.on_next_frame(move |_, cx| {
+                    sidebar.update(cx, |sidebar, cx| {
+                        sidebar.clear_drag_feedback(cx);
+                    });
+                });
+            }))
             .child(main_area);
         if show_plan {
             root.child(self.plan_sidebar.clone())

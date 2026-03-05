@@ -433,8 +433,29 @@ impl AppState {
             return;
         }
         move_vec_item(&mut self.workspaces, from_index, to_index);
-        self.persist_state();
         cx.notify();
+        self.persist_state_deferred(cx);
+    }
+
+    pub fn reorder_workspaces_to_index(
+        &mut self,
+        cx: &mut Context<Self>,
+        dragged_workspace_id: Uuid,
+        insertion_index: usize,
+    ) {
+        let Some(from_index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == dragged_workspace_id)
+        else {
+            return;
+        };
+
+        let item = self.workspaces.remove(from_index);
+        let target_index = insertion_index.min(self.workspaces.len());
+        self.workspaces.insert(target_index, item);
+        cx.notify();
+        self.persist_state_deferred(cx);
     }
 
     pub fn reorder_threads(
@@ -469,8 +490,37 @@ impl AppState {
             return;
         }
         move_vec_item(&mut workspace.threads, from_index, to_index);
-        self.persist_state();
         cx.notify();
+        self.persist_state_deferred(cx);
+    }
+
+    pub fn reorder_threads_to_index(
+        &mut self,
+        cx: &mut Context<Self>,
+        workspace_id: Uuid,
+        dragged_thread_id: Uuid,
+        insertion_index: usize,
+    ) {
+        let Some(workspace) = self
+            .workspaces
+            .iter_mut()
+            .find(|item| item.id == workspace_id)
+        else {
+            return;
+        };
+        let Some(from_index) = workspace
+            .threads
+            .iter()
+            .position(|thread| thread.id == dragged_thread_id)
+        else {
+            return;
+        };
+
+        let item = workspace.threads.remove(from_index);
+        let target_index = insertion_index.min(workspace.threads.len());
+        workspace.threads.insert(target_index, item);
+        cx.notify();
+        self.persist_state_deferred(cx);
     }
 
     pub fn add_thread(
@@ -2399,6 +2449,20 @@ impl AppState {
         {
             eprintln!("failed to persist app state: {err}");
         }
+    }
+
+    fn persist_state_deferred(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(
+            |this: gpui::WeakEntity<AppState>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let _ = this.update(&mut cx, |state: &mut AppState, _| {
+                        state.persist_state();
+                    });
+                }
+            },
+        )
+        .detach();
     }
 
     fn resolve_permission_choice(&mut self, thread_id: Uuid, option_id: Option<String>) -> bool {
